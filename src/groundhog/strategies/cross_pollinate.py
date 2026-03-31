@@ -99,6 +99,10 @@ class CrossPollinate(Strategy):
     def _prepare_workspace(self, toolkit, ws, prior):
         (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get())
         (ws.path / "solution.py").write_text(prior.code)
+        # Copy approach from parent if it exists
+        prior_approach = prior.path / "approach.md" if hasattr(prior, 'path') else None
+        if prior_approach and prior_approach.exists():
+            (ws.path / "approach.md").write_text(prior_approach.read_text())
 
     # --- Core work ---
 

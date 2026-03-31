@@ -43,6 +43,9 @@ class FreshApproach(Strategy):
         self.log.inline("generating... ")
         self._do_work(toolkit, ws)
         self.log.tock()
+        self.log.inline("approach... ")
+        self._generate_approach(toolkit, ws)
+        self.log.tock()
         self.log.inline("evaluating... ")
         result = self._evaluate_with_retries(toolkit, ws)
         self.log.tock()
@@ -142,6 +145,27 @@ Write complete, runnable code in a ```python block."""
         code = extract_code(response.text)
         if code:
             (ws.path / "solution.py").write_text(code)
+
+    # --- Approach description ---
+
+    def _generate_approach(self, toolkit, ws):
+        """Ask LLM to describe the approach in 2-3 sentences. Written as attempt metadata."""
+        code_path = ws.path / "solution.py"
+        if not code_path.exists() or not hasattr(toolkit, 'llm'):
+            return
+
+        code = code_path.read_text()
+        prompt = (
+            f"Describe the core approach of this code in 2-3 sentences. "
+            f"Focus on the algorithm and technique, not implementation details.\n\n"
+            f"```python\n{code}\n```"
+        )
+        response = toolkit.llm.get("default").generate(
+            prompt=prompt,
+            system_prompt="Write a brief, factual description of the algorithm. No preamble."
+        )
+        self.cost += response.cost
+        (ws.path / "approach.md").write_text(response.text.strip())
 
     # --- Evaluation with retries ---
 

@@ -4,25 +4,38 @@
 
 LLM-powered function optimization. Define how to score your code, and the groundhog iterates overnight. Wake up to a better solution.
 
-## Install
-
-```bash
-pip install groundhog-researcher
-```
-
-Requires an LLM API key in `.env`:
-```
-GEMINI_API_KEY=...
-```
-
 ## Quick start
 
-One file — task definition and entry point:
+Scaffold a task folder:
+
+```bash
+uv add groundhog-researcher
+groundhog init minimal my_task
+cd my_task
+echo "GEMINI_API_KEY=your-key-here" > .env
+# edit task.py with your task logic
+uv run task.py 10
+```
+
+Check status anytime:
+
+```bash
+uv run task.py status
+```
+
+Or write a task from scratch — one file is everything:
 
 ```python
+# /// script
+# dependencies = ["groundhog-researcher", "python-dotenv"]
+# ///
+
+from dotenv import load_dotenv
+load_dotenv()
+
 from groundhog import (
     Task, Data, Context, Evaluator, EvalStage, StageResult,
-    SimpleOptimizer, Improve, FreshApproach, GeminiBackend, BackendRegistry,
+    SimpleOptimizer, Improve, GeminiBackend, BackendRegistry,
 )
 
 
@@ -44,7 +57,6 @@ class MyContext(Context):
 
 class MyEvaluator(Evaluator):
     def evaluate(self, code, data):
-        # Run code, return StageResult with metrics
         return StageResult(metrics={"score": 0.85, "time": 1.2})
 
     def get_stages(self, data):
@@ -64,16 +76,23 @@ optimizer.toolkit.llm = BackendRegistry(
 optimizer.run(n=100)
 ```
 
+Create a `.env` file with your API key and run:
+
 ```bash
-uv run python my_task.py
+echo "GEMINI_API_KEY=..." > .env
+uv run task.py
 ```
+
+No install, no venv — `uv` handles dependencies from the inline metadata.
 
 ## What happens
 
-The optimizer creates a workspace:
+The optimizer works in the current directory:
 
 ```
-MyTask/
+my_task/
+    task.py                 # your task definition + entry point
+    .env                    # API keys
     learnings.md            # what the optimizer has learned
     attempts/               # every candidate
         001_none/           # first attempt (no parent)
@@ -84,7 +103,7 @@ MyTask/
             ...
 ```
 
-Then it loops:
+The loop:
 1. Selects a **prior** (best attempt, weighted by potential)
 2. Runs a **strategy** (improve, explore, combine ideas)
 3. Evaluates — raw results stored, scored via stage scorers
@@ -94,11 +113,19 @@ Then it loops:
 
 Every attempt is kept. Nothing discarded. Change what "good" means later — the history is reinterpretable.
 
+Check status anytime:
+
+```bash
+uv run task.py status
+```
+
 ## Multi-strategy optimizer
 
 Run multiple strategies in a weighted rotation:
 
 ```python
+from groundhog import Improve, FreshApproach, CrossPollinate
+
 optimizer = SimpleOptimizer(
     task,
     strategies=[
@@ -182,11 +209,19 @@ optimizers/     # SimpleOptimizer
 histories/      # FolderAttemptHistory
 backends/       # GeminiBackend, MockBackend
 learnings/      # MarkdownLearnings
-tools/          # conversation_log, cost_estimate, StrategyLog
+tools/          # conversation_log, cost_estimate, StrategyLog, queue
 utils/          # codegen, subprocess_runner, selection
 ```
 
 `base/` defines interfaces. Everything else is implementations. Build your own by subclassing the interfaces.
+
+## Install
+
+```bash
+uv add groundhog-researcher
+# or
+pip install groundhog-researcher
+```
 
 ## License
 

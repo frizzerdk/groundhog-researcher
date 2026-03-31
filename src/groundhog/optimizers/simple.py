@@ -14,6 +14,7 @@ from groundhog.base.toolkit import Toolkit
 from groundhog.base.learnings import Learnings
 from groundhog.learnings.markdown import MarkdownLearnings
 from groundhog.tools.log import StrategyLog
+from groundhog.tools.queue import read_next as read_queue
 from groundhog.utils.selection import select_prior
 
 
@@ -35,6 +36,7 @@ class SimpleOptimizer(Optimizer):
                  strategy: Union[Strategy, None] = None,
                  strategies: Optional[List[Tuple[Strategy, int]]] = None,
                  seed: int = 42,
+                 path: Optional[Path] = None,
                  history: Optional[AttemptHistory] = None,
                  learnings: Optional[Learnings] = None,
                  through: Optional[str] = None,
@@ -43,8 +45,9 @@ class SimpleOptimizer(Optimizer):
         self.task = task
         self.seed = seed
         self.through = through
-        self.history = history or FolderAttemptHistory(Path(task.name))
-        self.learnings = learnings or MarkdownLearnings(Path(task.name))
+        self.path = Path(path) if path else Path(".")
+        self.history = history or FolderAttemptHistory(self.path)
+        self.learnings = learnings or MarkdownLearnings(self.path)
         self.seed_strategy = FreshApproach() if seed_strategy == "default" else seed_strategy
 
         # Build rotation schedule from strategies or single strategy
@@ -57,6 +60,17 @@ class SimpleOptimizer(Optimizer):
         else:
             from groundhog.strategies.improve import Improve
             self._schedule = [Improve()]
+
+        # Build strategy registry for queue resolution
+        self._strategy_registry = {}
+        for s in self._schedule:
+            name = s.__class__.__name__.lower()
+            # e.g. "improve", "freshapproach", "crosspollinate", "analyse"
+            self._strategy_registry[name] = s
+            # Also register with underscores: "fresh_approach", "cross_pollinate"
+            import re
+            snake = re.sub(r'(?<!^)(?=[A-Z])', '_', s.__class__.__name__).lower()
+            self._strategy_registry[snake] = s
 
         # Build toolkit
         self.toolkit = Toolkit(task=self.task, history=self.history)
@@ -137,6 +151,36 @@ class SimpleOptimizer(Optimizer):
         print(self._format_metrics(last))
         print()
 
+    def status(self):
+        """Print current optimization status — best score, attempt count, trunks."""
+        scorer = self._get_scorer()
+        attempts = self.history.list()
+        best = self.history.best(scorer)
+
+        print(f"{self.task.name} | {len(attempts)} attempts")
+        if best:
+            best_score = self._score_attempt(best, scorer)
+            print(f"Best: {best_score:.4f} (#{best.number})")
+        else:
+            print("No successful attempts")
+
+        # Total cost from metadata
+        total_cost = sum(self._get_attempt_cost(a) for a in attempts)
+        if total_cost > 0:
+            print(f"Total cost: ${total_cost:.4f}")
+
+        # Strategy counts
+        strategy_counts = {}
+        for a in attempts:
+            s = a.metadata.get("strategy", "unknown")
+            strategy_counts[s] = strategy_counts.get(s, 0) + 1
+        if strategy_counts:
+            counts = ", ".join(f"{v} {k}" for k, v in strategy_counts.items())
+            print(f"Strategies: {counts}")
+
+        print()
+        self._print_trunks(scorer)
+
     def _print_trunks(self, scorer):
         trunks = self.history.derive_trunks(scorer)
         if not trunks:
@@ -152,7 +196,15 @@ class SimpleOptimizer(Optimizer):
         print("Trunks:")
         for trunk, best_score in scored_trunks:
             chain = " → ".join(f"#{a.number}" for a in trunk)
-            print(f"  {chain} (best: {best_score:.4f}, {len(trunk)} attempts)")
+            # Read approach from root attempt if available
+            root = trunk[0]
+            approach = ""
+            if hasattr(root, 'path'):
+                approach_path = root.path / "approach.md"
+                if approach_path.exists():
+                    approach = approach_path.read_text().strip().split('\n')[0][:80]
+            approach_str = f" | {approach}" if approach else ""
+            print(f"  {chain} (best: {best_score:.4f}, {len(trunk)} attempts){approach_str}")
         print()
 
     def run(self, n: int = 10):
@@ -191,11 +243,28 @@ class SimpleOptimizer(Optimizer):
 
         # Rotation: cycle through schedule
         rotation = cycle(self._schedule)
+        queue_path = self.path
 
         for i in range(n):
-            strategy = next(rotation)
-            count_before = len(self.history.list())
-            strategy(self.toolkit)
+            # Check queue first — override rotation if there's a queued item
+            queue_item = read_queue(queue_path)
+            if queue_item:
+                strategy_name = queue_item.get("strategy", "")
+                strategy = self._strategy_registry.get(strategy_name)
+                if strategy:
+                    config = queue_item.get("config")
+                    self.toolkit.log.info(f"[queue] {strategy_name} from {queue_item.get('source', '?')}")
+                    count_before = len(self.history.list())
+                    strategy(self.toolkit, config=config)
+                else:
+                    self.toolkit.log.info(f"[queue] unknown strategy: {strategy_name}, skipping")
+                    strategy = next(rotation)
+                    count_before = len(self.history.list())
+                    strategy(self.toolkit)
+            else:
+                strategy = next(rotation)
+                count_before = len(self.history.list())
+                strategy(self.toolkit)
             self.toolkit.log.end()
 
             # Some strategies (Analyse) don't create attempts

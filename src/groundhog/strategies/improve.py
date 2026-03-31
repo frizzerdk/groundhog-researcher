@@ -80,6 +80,10 @@ class Improve(Strategy):
     def _prepare_workspace(self, toolkit, ws, prior):
         (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get())
         (ws.path / "solution.py").write_text(prior.code)
+        # Copy approach from parent if it exists
+        prior_approach = prior.path / "approach.md" if hasattr(prior, 'path') else None
+        if prior_approach and prior_approach.exists():
+            (ws.path / "approach.md").write_text(prior_approach.read_text())
         if hasattr(toolkit, 'learnings'):
             learnings_text = toolkit.learnings.get(last=self.cfg.learnings_last, random=self.cfg.learnings_random)
             if learnings_text:
@@ -115,6 +119,11 @@ class Improve(Strategy):
             mode="diff",
         )
         prompt += f"\n\n{prior_results}"
+
+        # Include approach description if available
+        approach_path = ws.path / "approach.md"
+        if approach_path.exists():
+            prompt += f"\n\n## Current approach\n{approach_path.read_text()}"
 
         if not hasattr(toolkit, 'llm'):
             return
