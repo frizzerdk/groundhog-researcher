@@ -1,5 +1,9 @@
 # Groundhog Researcher
 
+<p align="center">
+  <img src="docs/grindhog.jpg" width="300" alt="The Grindhog - Just One More Iteration">
+</p>
+
 *Just one more iteration...*
 
 LLM-powered function optimization. Define how to score your code, and the groundhog iterates overnight. Wake up to a better solution.
