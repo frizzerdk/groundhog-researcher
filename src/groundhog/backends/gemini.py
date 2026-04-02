@@ -10,6 +10,7 @@ from groundhog.base.backend import (
     LLMBackend, LLMResponse, Prompt,
     PromptPart, TextPart, ImagePart, AudioPart,
 )
+from groundhog.backends._http import _urlopen_with_warnings
 
 
     # Pricing per million tokens (input, output — thinking included in output)
@@ -74,7 +75,7 @@ class GeminiBackend(LLMBackend):
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
 
         try:
-            with urllib.request.urlopen(req) as resp:
+            with _urlopen_with_warnings(req, label=f"Gemini ({self.model})") as resp:
                 result = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             error_body = e.read().decode() if e.fp else ""

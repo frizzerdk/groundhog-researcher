@@ -33,8 +33,16 @@ class MockContext(Context):
         return "def solve() -> float: return a number. Closer to the hidden target is better."
 
 
+def _read_code(code_or_path):
+    from pathlib import Path
+    if isinstance(code_or_path, (str, bytes)):
+        return code_or_path
+    return (Path(code_or_path) / "solution.py").read_text(encoding="utf-8")
+
+
 class MockEvaluator(Evaluator):
-    def evaluate(self, code, data):
+    def evaluate(self, code_or_path, data):
+        code = _read_code(code_or_path)
         namespace = {}
         exec(code, namespace)
         result = namespace["solve"]()
@@ -61,17 +69,18 @@ class MockEvaluator(Evaluator):
     def get_stages(self, data):
         return [
             EvalStage("smoke", "Check code parses and solve() exists",
-                      lambda code: self._smoke(code),
+                      lambda cp: self._smoke(cp),
                       scorer=self._smoke_scorer),
             EvalStage("validate", "Quick eval on rounded target",
-                      lambda code, d=data: self._validate(code, d),
+                      lambda cp, d=data: self._validate(cp, d),
                       scorer=self._distance_scorer),
             EvalStage("evaluate", "Full evaluation",
-                      lambda code, d=data: self.evaluate(code, d),
+                      lambda cp, d=data: self.evaluate(cp, d),
                       scorer=self._distance_scorer),
         ]
 
-    def _smoke(self, code):
+    def _smoke(self, code_or_path):
+        code = _read_code(code_or_path)
         try:
             namespace = {}
             exec(code, namespace)
@@ -84,7 +93,8 @@ class MockEvaluator(Evaluator):
         except Exception as e:
             return StageResult(errors={"syntax": str(e)})
 
-    def _validate(self, code, data):
+    def _validate(self, code_or_path, data):
+        code = _read_code(code_or_path)
         namespace = {}
         exec(code, namespace)
         result = namespace["solve"]()

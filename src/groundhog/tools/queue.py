@@ -21,7 +21,7 @@ def read_next(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        items = json.loads(queue_path.read_text())
+        items = json.loads(queue_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, ValueError):
         return None
 
@@ -30,7 +30,7 @@ def read_next(path: Path) -> Optional[Dict[str, Any]]:
 
     item = items.pop(0)
     if items:
-        queue_path.write_text(json.dumps(items, indent=2))
+        queue_path.write_text(json.dumps(items, indent=2), encoding="utf-8")
     else:
         queue_path.unlink()
 
@@ -44,7 +44,7 @@ def add(path: Path, strategy: str, config: Optional[Dict] = None, source: str = 
     items = []
     if queue_path.exists():
         try:
-            items = json.loads(queue_path.read_text())
+            items = json.loads(queue_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, ValueError):
             items = []
 
@@ -54,4 +54,4 @@ def add(path: Path, strategy: str, config: Optional[Dict] = None, source: str = 
         "source": source,
     })
 
-    queue_path.write_text(json.dumps(items, indent=2))
+    queue_path.write_text(json.dumps(items, indent=2), encoding="utf-8")

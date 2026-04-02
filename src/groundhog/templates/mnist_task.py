@@ -91,11 +91,19 @@ Available in namespace: numpy as np, torch, sklearn
 No other imports allowed."""
 
 
+def _read_code(code_or_path):
+    from pathlib import Path
+    if isinstance(code_or_path, (str, bytes)):
+        return code_or_path
+    return (Path(code_or_path) / "solution.py").read_text(encoding="utf-8")
+
+
 class MNISTEvaluator(Evaluator):
 
     IMPORTS = {"np": "numpy", "sklearn": "sklearn", "torch": "torch"}
 
-    def _evaluate_on(self, code, data, max_samples, time_limit):
+    def _evaluate_on(self, code_or_path, data, max_samples, time_limit):
+        code = _read_code(code_or_path)
         """Run code in subprocess with timeout, score predictions."""
         X_test, y_test = data.get_test()
         if max_samples and len(X_test) > max_samples:
@@ -145,8 +153,8 @@ def _evaluate(train_data, X_test, time_limit):
             },
         )
 
-    def evaluate(self, code, data):
-        return self._evaluate_on(code, data, max_samples=None, time_limit=60)
+    def evaluate(self, code_or_path, data):
+        return self._evaluate_on(code_or_path, data, max_samples=None, time_limit=60)
 
     @staticmethod
     def _accuracy_scorer(result):
@@ -161,23 +169,24 @@ def _evaluate(train_data, X_test, time_limit):
     def get_stages(self, data):
         return [
             EvalStage("smoke", "Compiles and defines run()",
-                      lambda code: self._smoke(code),
+                      lambda cp: self._smoke(cp),
                       scorer=self._smoke_scorer),
             EvalStage("validate", "1k samples, 15s",
-                      lambda code, d=data: self._evaluate_on(code, d, max_samples=1000, time_limit=15),
+                      lambda cp, d=data: self._evaluate_on(cp, d, max_samples=1000, time_limit=15),
                       scorer=self._accuracy_scorer),
             EvalStage("evaluate", "10k samples, 60s",
-                      lambda code, d=data: self._evaluate_on(code, d, max_samples=None, time_limit=60),
+                      lambda cp, d=data: self._evaluate_on(cp, d, max_samples=None, time_limit=60),
                       scorer=self._accuracy_scorer),
             EvalStage("deep", "10k samples, 10min",
-                      lambda code, d=data: self._evaluate_on(code, d, max_samples=None, time_limit=600),
+                      lambda cp, d=data: self._evaluate_on(cp, d, max_samples=None, time_limit=600),
                       scorer=self._accuracy_scorer),
             EvalStage("full", "10k samples, 100min",
-                      lambda code, d=data: self._evaluate_on(code, d, max_samples=None, time_limit=6000),
+                      lambda cp, d=data: self._evaluate_on(cp, d, max_samples=None, time_limit=6000),
                       scorer=self._accuracy_scorer),
         ]
 
-    def _smoke(self, code):
+    def _smoke(self, code_or_path):
+        code = _read_code(code_or_path)
         try:
             ns = {}
             exec(code, ns)
@@ -205,8 +214,8 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
     from groundhog import (
-        SimpleOptimizer, Improve, FreshApproach, CrossPollinate, Analyse,
-        GeminiBackend, BackendRegistry,
+        SimpleOptimizer, Improve, FreshApproach, CrossPollinate,
+        auto_registry,
     )
 
     task = MNISTTask()
@@ -223,13 +232,15 @@ if __name__ == "__main__":
         seed_strategy=FreshApproach(mode="blank"),
         through="evaluate",
     )
-    optimizer.toolkit.llm = BackendRegistry(
-        max=GeminiBackend(model="gemini-3.1-pro-preview"),
-        high=GeminiBackend(model="gemini-3-flash-preview"),
-        default=GeminiBackend(model="gemini-3.1-flash-lite-preview"),
-        budget=GeminiBackend(model="gemini-3.1-flash-lite-preview", thinking_level="MINIMAL"),
-        cheap=GeminiBackend(model="gemini-2.5-flash-lite"),
-    )
+    # Auto-discovers available backends (CLI tools, API keys, local servers)
+    # Run "groundhog backends" to see what's available on your machine
+    optimizer.toolkit.llm = auto_registry()
+
+    # See what's available with command: 'groundhog backends'
+    # Override specific tiers after auto-discovery:
+    # from groundhog import GeminiBackend, AnthropicBackend, OpenAICompatibleBackend
+    # optimizer.toolkit.llm.set("high", AnthropicBackend(model="claude-opus-4-6-20260205"))
+    # optimizer.toolkit.llm.set("cheap", OpenAICompatibleBackend.ollama(model="llama3"))
 
     if len(sys.argv) > 1 and sys.argv[1] == "status":
         optimizer.status()

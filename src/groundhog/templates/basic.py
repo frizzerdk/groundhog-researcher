@@ -9,7 +9,7 @@ load_dotenv()
 from groundhog import (
     Task, Data, Context, Evaluator, EvalStage, StageResult,
     SimpleOptimizer, Improve, FreshApproach, CrossPollinate,
-    GeminiBackend, BackendRegistry,
+    auto_registry,
 )
 
 
@@ -42,8 +42,17 @@ Rules:
 
 # --- Evaluator: how generated code is scored ---
 
+def _read_code(code_or_path):
+    """Accept code string or workspace Path, return code string."""
+    from pathlib import Path
+    if isinstance(code_or_path, (str, bytes)):
+        return code_or_path
+    return (Path(code_or_path) / "solution.py").read_text(encoding="utf-8")
+
+
 class MyEvaluator(Evaluator):
-    def evaluate(self, code, data):
+    def evaluate(self, code_or_path, data):
+        code = _read_code(code_or_path)
         # Execute code, measure performance, return metrics
         # Higher score = better. Metrics are flexible dicts.
         return StageResult(metrics={"score": 0.0})
@@ -51,12 +60,13 @@ class MyEvaluator(Evaluator):
     def get_stages(self, data):
         # Stages run cheapest first. Cascade stops on error.
         return [
-            EvalStage("smoke", "Syntax check", lambda code: self._smoke(code)),
+            EvalStage("smoke", "Syntax check", lambda cp: self._smoke(cp)),
             EvalStage("evaluate", "Full evaluation",
-                      lambda code: self.evaluate(code, data)),
+                      lambda cp: self.evaluate(cp, data)),
         ]
 
-    def _smoke(self, code):
+    def _smoke(self, code_or_path):
+        code = _read_code(code_or_path)
         try:
             compile(code, "<string>", "exec")
             return StageResult(metrics={"compiles": 1.0})
@@ -75,9 +85,18 @@ if __name__ == "__main__":
     import sys
 
     optimizer = SimpleOptimizer(task, strategy=Improve())
-    optimizer.toolkit.llm = BackendRegistry(
-        default=GeminiBackend(model="gemini-2.5-flash"),
-    )
+
+    # Auto-discovers available backends (CLI tools, API keys, local servers)
+    # Run "groundhog backends" to see what's available on your machine
+    optimizer.toolkit.llm = auto_registry()
+
+    # Or configure manually — uncomment and customize:
+    # from groundhog import BackendRegistry, GeminiBackend, AnthropicBackend, OpenAICompatibleBackend, ClaudeCodeBackend
+    # optimizer.toolkit.llm = BackendRegistry(
+    #     high=AnthropicBackend(model="claude-opus-4-6-20260205"),      # best reasoning
+    #     default=ClaudeCodeBackend(model="sonnet"),                     # via Claude Code CLI
+    #     cheap=OpenAICompatibleBackend.ollama(model="llama3"),          # free local model
+    # )
 
     if len(sys.argv) > 1 and sys.argv[1] == "status":
         optimizer.status()

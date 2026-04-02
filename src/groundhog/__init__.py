@@ -1,3 +1,5 @@
+__version__ = "0.1.19"
+
 # Base types and interfaces
 from groundhog.base import (
     Task, Data, Context, Evaluator,
@@ -10,8 +12,9 @@ from groundhog.base import (
 )
 
 # Utilities
-from groundhog.utils.codegen import extract_code, parse_diff, apply_diff, build_prompt
+from groundhog.utils.codegen import extract_code, Diff, build_prompt
 from groundhog.utils.subprocess_runner import run_code
+from groundhog.tools.cost_estimate import estimate_cost, estimate_total_cost
 
 # Default implementations
 from groundhog.optimizers.simple import SimpleOptimizer
@@ -20,6 +23,13 @@ from groundhog.learnings.markdown import MarkdownLearnings
 from groundhog.acceptance.default import DefaultAcceptance
 from groundhog.backends.mock import MockBackend
 from groundhog.backends.gemini import GeminiBackend
+from groundhog.backends.openai_compat import OpenAICompatibleBackend
+from groundhog.backends.anthropic import AnthropicBackend
+from groundhog.backends.claude_code import ClaudeCodeBackend
+from groundhog.backends.copilot import CopilotBackend
+from groundhog.backends.gemini_cli import GeminiCLIBackend
+from groundhog.backends.opencode import OpenCodeBackend
+from groundhog.backends.discover import discover_backends, auto_registry
 from groundhog.strategies.improve import Improve
 from groundhog.strategies.fresh import FreshApproach
 from groundhog.strategies.cross_pollinate import CrossPollinate

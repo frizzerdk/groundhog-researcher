@@ -40,7 +40,8 @@ load_dotenv()
 from groundhog import (
     Task, Data, Context, Evaluator, EvalStage, StageResult,
     SimpleOptimizer, Improve, FreshApproach, CrossPollinate, Analyse,
-    GeminiBackend, BackendRegistry,
+    auto_registry, BackendRegistry, GeminiBackend, OpenAICompatibleBackend,
+    AnthropicBackend, ClaudeCodeBackend,
 )
 
 
@@ -132,9 +133,23 @@ Example:
 #   from groundhog import run_code
 #   result = run_code(code, entry_point="solve", args=(data,), timeout=60)
 # This runs code in an isolated process with hard timeout.
+#
+# PATH OR STRING:
+# evaluate() receives either a code string or a Path to the workspace
+# directory. If Path, read whatever files you need (e.g. path / "solution.py").
+# If string, use it directly. Use _read_code() helper for the common case.
+
+def _read_code(code_or_path):
+    """Accept code string or workspace Path, return code string."""
+    from pathlib import Path
+    if isinstance(code_or_path, (str, bytes)):
+        return code_or_path
+    return (Path(code_or_path) / "solution.py").read_text(encoding="utf-8")
+
 
 class MyEvaluator(Evaluator):
-    def evaluate(self, code, data):
+    def evaluate(self, code_or_path, data):
+        code = _read_code(code_or_path)
         # TODO: execute code, measure performance
         # Option 1: exec() directly (simple but no isolation)
         # Option 2: run_code() for subprocess isolation with timeout
@@ -144,15 +159,16 @@ class MyEvaluator(Evaluator):
         return [
             # Stage 1: instant syntax check
             EvalStage("smoke", "Syntax check",
-                      lambda code: self._smoke(code)),
+                      lambda cp: self._smoke(cp)),
 
             # Stage 2: full evaluation (scored by "score" metric)
             EvalStage("evaluate", "Full evaluation",
-                      lambda code: self.evaluate(code, data),
+                      lambda cp: self.evaluate(cp, data),
                       scorer=lambda r: r.metrics.get("score", 0.0)),
         ]
 
-    def _smoke(self, code):
+    def _smoke(self, code_or_path):
+        code = _read_code(code_or_path)
         try:
             compile(code, "<string>", "exec")
             return StageResult(metrics={"compiles": 1.0})
@@ -185,12 +201,21 @@ task = Task(data=MyData(), context=MyContext(), evaluator=MyEvaluator(), name="M
 #   This cycles: 14 improve, 5 cross-pollinate, 1 fresh = 20 per cycle.
 #
 # BACKEND TIERS:
-#   Strategies request LLMs by tier (e.g. "default", "high", "cheap").
-#   Missing tiers fall back to "default". Register what you have:
+#   auto_registry() discovers what's available (CLI tools, API keys, local servers)
+#   and builds a registry automatically. Or configure manually:
 #     BackendRegistry(
-#         high=GeminiBackend(model="gemini-3-flash-preview"),
+#         high=AnthropicBackend(model="claude-opus-4-6-20260205"),
 #         default=GeminiBackend(model="gemini-2.5-flash"),
+#         cheap=OpenAICompatibleBackend.ollama(model="llama3"),
 #     )
+#
+#   Available backends:
+#     API:  AnthropicBackend, GeminiBackend, OpenAICompatibleBackend
+#           OpenAICompatibleBackend has factory methods: .openai(), .groq(),
+#           .deepseek(), .ollama(), .openrouter(), .together(), .cerebras(), etc.
+#     CLI:  ClaudeCodeBackend, CopilotBackend, GeminiCLIBackend, OpenCodeBackend
+#
+#   Strategies request tiers; missing tiers fall back to "default".
 #
 # STRATEGY CONFIG:
 #   Each strategy has configurable parameters:
@@ -219,9 +244,22 @@ if __name__ == "__main__":
         ],
         seed_strategy=FreshApproach(mode="blank"),
     )
-    optimizer.toolkit.llm = BackendRegistry(
-        default=GeminiBackend(model="gemini-2.5-flash"),
-    )
+    # Auto-discovers available backends (CLI tools, API keys, local servers)
+    # Run "groundhog backends" to see what's available on your machine
+    optimizer.toolkit.llm = auto_registry()
+
+    # Or configure manually — full control over which models power each tier:
+    # optimizer.toolkit.llm = BackendRegistry(
+    #     max=AnthropicBackend(model="claude-opus-4-6-20260205"),           # best reasoning ($5/$25 per MTok)
+    #     high=GeminiBackend(model="gemini-3-flash-preview"),               # strong + fast ($0.50/$3)
+    #     default=ClaudeCodeBackend(model="sonnet"),                        # via CLI, no API key needed
+    #     budget=OpenAICompatibleBackend.deepseek(model="deepseek-chat"),   # great value ($0.28/$0.42)
+    #     cheap=OpenAICompatibleBackend.ollama(model="llama3"),             # free local model
+    # )
+    #
+    # More providers: .openai(), .groq(), .cerebras(), .xai(), .together(),
+    #                 .fireworks(), .openrouter(), .mistral(), .perplexity()
+    # Missing tiers fall back to "default".
 
     if len(sys.argv) > 1 and sys.argv[1] == "status":
         optimizer.status()

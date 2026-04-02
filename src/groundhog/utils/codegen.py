@@ -1,71 +1,113 @@
 """Code generation utilities — extract code and apply diffs from LLM responses.
 
-Vault: Implementation Details — Diff-Based Generation.md
+Data flow:
+    response = backend.generate(prompt, system_prompt)   # raw LLM text
+    new_code, diff = extract_code(response.text, prior)  # valid Python or ""
 
-Two modes:
-- Full: LLM returns complete code in a fenced block
-- Diff: LLM returns SEARCH/REPLACE blocks applied to existing code
+extract_code tries in order:
+    1. SEARCH/REPLACE diffs applied to prior_code
+    2. Fenced ```python block
+    3. Fenced ``` block (no language tag)
+    4. Raw text with fence cleanup
+Each candidate validated with compile(). Returns ("", Diff("none")) if nothing valid.
 """
 
 import re
+from dataclasses import dataclass
 from typing import List, Tuple
 
 
-def extract_code(text: str) -> str:
-    """Extract code from an LLM response.
+@dataclass
+class Diff:
+    """Metadata about how code was extracted from an LLM response."""
+    method: str = "none"    # "search_replace", "fenced", "raw", "none"
+    blocks: int = 0         # number of diff blocks applied
 
-    Looks for fenced code blocks (```python or ```). Returns the last block
-    found (LLMs often refine across multiple blocks). If no blocks, returns
-    the full text stripped.
+
+def extract_code(text: str, prior_code: str = None) -> Tuple[str, Diff]:
+    """Extract valid Python code from an LLM response.
+
+    Args:
+        text: raw LLM response text
+        prior_code: existing code to apply diffs against (None or "" for fresh)
+
+    Returns:
+        (code, diff) — code is valid Python or "", diff has extraction metadata
     """
+    prior = prior_code or ""
+
+    # 1. SEARCH/REPLACE diffs (only if we have prior code to apply them to)
+    if prior:
+        diffs = _parse_diff(text)
+        if diffs:
+            try:
+                result = _apply_diff(prior, diffs)
+                compile(result, "<string>", "exec")
+                return result, Diff("search_replace", blocks=len(diffs))
+            except (ValueError, SyntaxError):
+                pass  # fall through to other methods
+
+    # 2. Fenced ```python block
     blocks = re.findall(r'```python\s*\n(.*?)```', text, re.DOTALL)
     if blocks:
-        return blocks[-1].strip()
+        candidate = blocks[-1].strip()
+        try:
+            compile(candidate, "<string>", "exec")
+            return candidate, Diff("fenced")
+        except SyntaxError:
+            pass
 
+    # 3. Fenced ``` block (no language tag)
     blocks = re.findall(r'```\s*\n(.*?)```', text, re.DOTALL)
     if blocks:
-        return blocks[-1].strip()
+        candidate = blocks[-1].strip()
+        try:
+            compile(candidate, "<string>", "exec")
+            return candidate, Diff("fenced")
+        except SyntaxError:
+            pass
 
-    return text.strip()
+    # 4. Raw text — strip stray fence markers, try compile
+    cleaned = re.sub(r'^```\w*\s*\n?', '', text)
+    cleaned = re.sub(r'\n?```\s*$', '', cleaned)
+    cleaned = cleaned.strip()
+    if cleaned:
+        try:
+            compile(cleaned, "<string>", "exec")
+            return cleaned, Diff("raw")
+        except SyntaxError:
+            pass
+
+    # 5. Nothing valid
+    return "", Diff("none")
 
 
-def parse_diff(text: str) -> List[Tuple[str, str]]:
-    """Parse SEARCH/REPLACE blocks from text.
+# --- Internal helpers (used by extract_code) ---
 
-    Format:
-        <<<<<<< SEARCH
-        old code
-        =======
-        new code
-        >>>>>>> REPLACE
-
-    Returns list of (search, replace) tuples.
-    """
+def _parse_diff(text: str) -> List[Tuple[str, str]]:
+    """Parse SEARCH/REPLACE blocks from text."""
     pattern = r'<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE'
     matches = re.findall(pattern, text, re.DOTALL)
     if matches:
         return matches
-
+    # Relaxed pattern (variable marker lengths)
     pattern = r'<{3,}\s*SEARCH\s*\n(.*?)\n={3,}\s*\n(.*?)\n>{3,}\s*REPLACE'
-    matches = re.findall(pattern, text, re.DOTALL)
-    return matches
+    return re.findall(pattern, text, re.DOTALL)
 
 
-def apply_diff(code: str, diffs: List[Tuple[str, str]]) -> str:
-    """Apply SEARCH/REPLACE blocks to code.
-
-    Each (search, replace) is applied in order. Raises ValueError if a
-    search string is not found in the code.
-    """
+def _apply_diff(code: str, diffs: List[Tuple[str, str]]) -> str:
+    """Apply SEARCH/REPLACE blocks to code. Raises ValueError if search not found."""
     for search, replace in diffs:
-        if search not in code:
-            search_stripped = "\n".join(line.rstrip() for line in search.split("\n"))
-            code_stripped = "\n".join(line.rstrip() for line in code.split("\n"))
-            if search_stripped in code_stripped:
-                code = code.replace(search_stripped, replace)
-                continue
-            raise ValueError(f"Search block not found in code:\n{search[:100]}...")
-        code = code.replace(search, replace, 1)
+        if search in code:
+            code = code.replace(search, replace, 1)
+            continue
+        # Try with trailing whitespace stripped
+        search_stripped = "\n".join(line.rstrip() for line in search.split("\n"))
+        code_stripped = "\n".join(line.rstrip() for line in code.split("\n"))
+        if search_stripped in code_stripped:
+            code = code.replace(search_stripped, replace)
+            continue
+        raise ValueError(f"Search block not found in code:\n{search[:100]}...")
     return code
 
 

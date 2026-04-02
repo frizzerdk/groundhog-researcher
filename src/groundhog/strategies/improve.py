@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from groundhog.base.strategy import Strategy, StrategyConfig, param
 from groundhog.tools.conversation_log import conversation_log
-from groundhog.utils.codegen import extract_code, parse_diff, apply_diff, build_prompt
+from groundhog.utils.codegen import extract_code, build_prompt
 
 
 @dataclass
@@ -26,7 +26,7 @@ class Improve(Strategy):
     """Refine existing code via LLM-generated diffs.
 
     Composed method pattern:
-        init → select prior → workspace → prepare → generate → evaluate+retry → commit
+        init ->select prior ->workspace ->prepare ->generate ->evaluate+retry ->commit
     """
 
     Config = ImproveConfig
@@ -78,16 +78,14 @@ class Improve(Strategy):
         return toolkit.history.workspace(parent=prior.number)
 
     def _prepare_workspace(self, toolkit, ws, prior):
-        (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get())
-        (ws.path / "solution.py").write_text(prior.code)
+        (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get(), encoding="utf-8")
+        (ws.path / "solution.py").write_text(prior.code, encoding="utf-8")
         # Copy approach from parent if it exists
         prior_approach = prior.path / "approach.md" if hasattr(prior, 'path') else None
         if prior_approach and prior_approach.exists():
-            (ws.path / "approach.md").write_text(prior_approach.read_text())
-        if hasattr(toolkit, 'learnings'):
-            learnings_text = toolkit.learnings.get(last=self.cfg.learnings_last, random=self.cfg.learnings_random)
-            if learnings_text:
-                (ws.path / "learnings.md").write_text(learnings_text)
+            (ws.path / "approach.md").write_text(prior_approach.read_text(encoding="utf-8"), encoding="utf-8")
+        # Learnings are included in the prompt via build_prompt(learnings=...),
+        # and logged in conversation.json — no need to duplicate as a file.
 
     # --- Prior results context ---
 
@@ -123,7 +121,8 @@ class Improve(Strategy):
         # Include approach description if available
         approach_path = ws.path / "approach.md"
         if approach_path.exists():
-            prompt += f"\n\n## Current approach\n{approach_path.read_text()}"
+            approach_text = approach_path.read_text(encoding="utf-8")
+            prompt += f"\n\n## Current approach\n{approach_text}"
 
         if not hasattr(toolkit, 'llm'):
             return
@@ -149,37 +148,25 @@ Output your changes as SEARCH/REPLACE blocks."""
         self.cost += response.cost
         self.log_conversation(ws.path, response)
 
-        new_code = self._apply_response(response.text, prior_code)
-        (ws.path / "solution.py").write_text(new_code)
-
-    def _apply_response(self, response_text, prior_code):
-        diffs = parse_diff(response_text)
-        if diffs:
-            try:
-                result = apply_diff(prior_code, diffs)
-                self.log.inline(f"diff ({len(diffs)} blocks)... ")
-                return result
-            except ValueError:
-                self.log.inline("diff failed, ")
-        extracted = extract_code(response_text)
-        if extracted and extracted != response_text.strip():
-            self.log.inline("full rewrite... ")
-            return extracted
-        self.log.inline("no changes... ")
-        return prior_code
+        new_code, diff = extract_code(response.text, prior_code)
+        if new_code:
+            self.log.inline(f"{diff.method} ({diff.blocks} blocks)... " if diff.blocks else f"{diff.method}... ")
+            (ws.path / "solution.py").write_text(new_code, encoding="utf-8")
+        else:
+            self.log.inline("no changes... ")
 
     # --- Evaluation with retries ---
 
     def _evaluate_with_retries(self, toolkit, ws, prior):
         for attempt_num in range(self.cfg.max_retries + 1):
-            code = (ws.path / "solution.py").read_text()
-            result = toolkit.task.evaluate(code, through=self.through)
+            result = toolkit.task.evaluate(ws.path, through=self.through)
 
             if result.completed:
                 return result
 
             if attempt_num < self.cfg.max_retries and hasattr(toolkit, 'llm'):
                 error_stage = result.stages[result.failed_stage]
+                code = (ws.path / "solution.py").read_text(encoding="utf-8")
                 self.log.inline(f"retry {attempt_num + 1}... ")
                 self._retry_fix(toolkit, ws, prior, code, error_stage, attempt_num + 1)
 
@@ -202,8 +189,9 @@ Output your changes as SEARCH/REPLACE blocks."""
         self.cost += response.cost
         self.log_conversation(ws.path, response, label=f"Retry {retry_num}")
 
-        fixed_code = self._apply_response(response.text, broken_code)
-        (ws.path / "solution.py").write_text(fixed_code)
+        fixed_code, diff = extract_code(response.text, broken_code)
+        if fixed_code:
+            (ws.path / "solution.py").write_text(fixed_code, encoding="utf-8")
 
     # --- Learnings ---
 
@@ -213,14 +201,14 @@ Output your changes as SEARCH/REPLACE blocks."""
 
         prior_score = self._score_result(prior.result, toolkit)
         new_score = self._score_result(result, toolkit)
-        new_code = (ws.path / "solution.py").read_text() if (ws.path / "solution.py").exists() else ""
+        new_code = (ws.path / "solution.py").read_text(encoding="utf-8") if (ws.path / "solution.py").exists() else ""
 
         prompt = (
             "Compare these two attempts at the same coding task.\n\n"
             f"PRIOR CODE (score {prior_score:.4f}):\n```\n{prior.code}\n```\n\n"
             f"NEW CODE (score {new_score:.4f}):\n```\n{new_code}\n```\n\n"
             f"The new attempt {'improved' if new_score > prior_score else 'regressed' if new_score < prior_score else 'matched'} "
-            f"({prior_score:.4f} → {new_score:.4f}).\n\n"
+            f"({prior_score:.4f} ->{new_score:.4f}).\n\n"
             "Write 1-2 bullet points about what was learned. Focus on what worked or didn't and why. "
             "Be specific about techniques (e.g. 'increasing augmentation from 5x to 20x hurt accuracy'). "
             "Keep it short — these notes guide future attempts."

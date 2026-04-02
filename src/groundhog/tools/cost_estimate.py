@@ -32,7 +32,7 @@ def estimate_cost(path: Path, pricing: Optional[Dict] = None) -> Dict[str, Any]:
         return {"total_cost": 0, "input_tokens": 0, "output_tokens": 0,
                 "thinking_tokens": 0, "calls": [], "unknown_models": []}
 
-    entries = json.loads(json_path.read_text())
+    entries = json.loads(json_path.read_text(encoding="utf-8"))
     total_cost = 0.0
     total_input = 0
     total_output = 0

@@ -33,11 +33,11 @@ class FolderAttempt(Attempt):
 
     @property
     def code(self) -> str:
-        return (self.path / "solution.py").read_text()
+        return (self.path / "solution.py").read_text(encoding="utf-8")
 
     @property
     def result(self) -> EvaluationResult:
-        data = json.loads((self.path / "result.json").read_text())
+        data = json.loads((self.path / "result.json").read_text(encoding="utf-8"))
         stages = {}
         for name, stage_data in data.get("stages", {}).items():
             stages[name] = StageResult(
@@ -53,7 +53,7 @@ class FolderAttempt(Attempt):
 
     @property
     def metadata(self) -> dict:
-        data = json.loads((self.path / "result.json").read_text())
+        data = json.loads((self.path / "result.json").read_text(encoding="utf-8"))
         return data.get("metadata", {})
 
     def __repr__(self):
@@ -89,14 +89,14 @@ class FolderWorkspace(Workspace):
                 if isinstance(artifact_data, bytes):
                     artifact_path.write_bytes(artifact_data)
                 elif isinstance(artifact_data, str):
-                    artifact_path.write_text(artifact_data)
+                    artifact_path.write_text(artifact_data, encoding="utf-8")
                 else:
-                    artifact_path.write_text(json.dumps(artifact_data, indent=2))
+                    artifact_path.write_text(json.dumps(artifact_data, indent=2), encoding="utf-8")
 
         if metadata:
             result_data["metadata"] = metadata
 
-        (self.path / "result.json").write_text(json.dumps(result_data, indent=2))
+        (self.path / "result.json").write_text(json.dumps(result_data, indent=2), encoding="utf-8")
         return FolderAttempt(number=self.number, parent=self.parent, path=self.path)
 
     def abort(self):

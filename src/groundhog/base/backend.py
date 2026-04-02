@@ -81,6 +81,10 @@ class BackendRegistry:
     def __init__(self, **tiers: LLMBackend):
         self._tiers = tiers
 
+    def set(self, tier: str, backend: LLMBackend):
+        """Set or override a tier's backend."""
+        self._tiers[tier] = backend
+
     def get(self, tier: str = "default") -> LLMBackend:
         if tier in self._tiers:
             return self._tiers[tier]

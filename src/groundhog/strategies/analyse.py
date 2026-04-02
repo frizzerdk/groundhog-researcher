@@ -23,7 +23,7 @@ class Analyse(Strategy):
     """Compress and reformat learnings based on recent attempt history.
 
     Composed method pattern:
-        init → gather context → ask LLM to compress → replace learnings
+        init ->gather context ->ask LLM to compress ->replace learnings
     """
 
     Config = AnalyseConfig
@@ -51,9 +51,9 @@ class Analyse(Strategy):
 
         if compressed:
             # Replace learnings entirely
-            toolkit.learnings._path.write_text(compressed.strip() + "\n")
+            toolkit.learnings._path.write_text(compressed.strip() + "\n", encoding="utf-8")
             entries_after = toolkit.learnings.count()
-            self.log.info(f"learnings: {entries_before} → {entries_after} entries")
+            self.log.info(f"learnings: {entries_before} ->{entries_after} entries")
         else:
             entries_after = entries_before
             self.log.info("no compression produced")

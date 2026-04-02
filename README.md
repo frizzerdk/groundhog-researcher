@@ -10,7 +10,7 @@ Scaffold a task folder:
 
 ```bash
 uv add groundhog-researcher
-groundhog init minimal my_task
+groundhog init my_task
 cd my_task
 echo "GEMINI_API_KEY=your-key-here" > .env
 # edit task.py with your task logic
@@ -35,7 +35,7 @@ load_dotenv()
 
 from groundhog import (
     Task, Data, Context, Evaluator, EvalStage, StageResult,
-    SimpleOptimizer, Improve, GeminiBackend, BackendRegistry,
+    SimpleOptimizer, Improve, auto_registry,
 )
 
 
@@ -56,34 +56,33 @@ class MyContext(Context):
 
 
 class MyEvaluator(Evaluator):
-    def evaluate(self, code, data):
+    def evaluate(self, code_or_path, data):
+        # Accepts a code string or a Path to the workspace directory
+        code = code_or_path if isinstance(code_or_path, str) else (code_or_path / "solution.py").read_text()
         return StageResult(metrics={"score": 0.85, "time": 1.2})
 
     def get_stages(self, data):
         return [
-            EvalStage("smoke", "Quick syntax check", lambda code: ...),
+            EvalStage("smoke", "Quick syntax check", lambda cp: ...),
             EvalStage("evaluate", "Full evaluation",
-                      lambda code: self.evaluate(code, data)),
+                      lambda cp: self.evaluate(cp, data)),
         ]
 
 
 task = Task(data=MyData(), context=MyContext(), evaluator=MyEvaluator(), name="MyTask")
 
 optimizer = SimpleOptimizer(task, strategy=Improve())
-optimizer.toolkit.llm = BackendRegistry(
-    default=GeminiBackend(model="gemini-2.5-flash"),
-)
+optimizer.toolkit.llm = auto_registry()  # uses whatever LLM you have available
 optimizer.run(n=100)
 ```
 
-Create a `.env` file with your API key and run:
+Works with whatever LLM you have — Claude Code, API keys, Ollama. Run:
 
 ```bash
-echo "GEMINI_API_KEY=..." > .env
-uv run task.py
+uv run task.py 10
+uv run task.py status         # check progress anytime
+groundhog backends            # see available LLM backends
 ```
-
-No install, no venv — `uv` handles dependencies from the inline metadata.
 
 ## What happens
 
@@ -141,13 +140,15 @@ The schedule cycles — 14 + 5 + 1 = 20 per cycle. FreshApproach creates new tru
 
 ## Backend tiers
 
-Register LLMs by purpose. Strategies request tiers; missing tiers fall back to "default":
+`auto_registry()` discovers what's available and assigns tiers automatically. Or configure manually — strategies request tiers, missing tiers fall back to "default":
 
 ```python
+from groundhog import BackendRegistry, AnthropicBackend, GeminiBackend, OpenAICompatibleBackend
+
 optimizer.toolkit.llm = BackendRegistry(
-    high=GeminiBackend(model="gemini-3-flash-preview"),        # reasoning tasks
-    default=GeminiBackend(model="gemini-3.1-flash-lite-preview"),  # bulk generation
-    cheap=GeminiBackend(model="gemini-2.5-flash-lite"),        # cheapest
+    high=AnthropicBackend(model="claude-opus-4-6-20260205"),
+    default=GeminiBackend(model="gemini-2.5-flash"),
+    cheap=OpenAICompatibleBackend.ollama(model="llama3"),
 )
 
 # In a strategy:
@@ -207,10 +208,12 @@ base/           # interfaces only — Task, Strategy, Optimizer, AttemptHistory,
 strategies/     # Improve, FreshApproach, CrossPollinate, Analyse
 optimizers/     # SimpleOptimizer
 histories/      # FolderAttemptHistory
-backends/       # GeminiBackend, MockBackend
+backends/       # Gemini, Anthropic, OpenAI-compatible, Claude Code CLI, + more
 learnings/      # MarkdownLearnings
+acceptance/     # DefaultAcceptance
 tools/          # conversation_log, cost_estimate, StrategyLog, queue
 utils/          # codegen, subprocess_runner, selection
+templates/      # task scaffolding templates (used by groundhog init)
 ```
 
 `base/` defines interfaces. Everything else is implementations. Build your own by subclassing the interfaces.

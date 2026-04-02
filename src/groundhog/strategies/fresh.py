@@ -72,11 +72,9 @@ class FreshApproach(Strategy):
         return toolkit.history.workspace(parent=None)
 
     def _prepare_workspace(self, toolkit, ws):
-        (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get())
-        if self.cfg.mode != "blank" and hasattr(toolkit, 'learnings'):
-            learnings_text = toolkit.learnings.get(last=self.cfg.learnings_last, random=self.cfg.learnings_random)
-            if learnings_text:
-                (ws.path / "learnings.md").write_text(learnings_text)
+        (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get(), encoding="utf-8")
+        # Learnings are included in the prompt via build_prompt(learnings=...),
+        # and logged in conversation.json — no need to duplicate as a file.
 
     # --- Core work ---
 
@@ -101,9 +99,9 @@ class FreshApproach(Strategy):
         self.cost += response.cost
         self.log_conversation(ws.path, response)
 
-        code = extract_code(response.text)
+        code, _ = extract_code(response.text)
         if code:
-            (ws.path / "solution.py").write_text(code)
+            (ws.path / "solution.py").write_text(code, encoding="utf-8")
 
     def _do_different(self, toolkit, ws):
         """Find a fundamentally different approach from existing trunks."""
@@ -142,9 +140,9 @@ Write complete, runnable code in a ```python block."""
         self.cost += response.cost
         self.log_conversation(ws.path, response)
 
-        code = extract_code(response.text)
+        code, _ = extract_code(response.text)
         if code:
-            (ws.path / "solution.py").write_text(code)
+            (ws.path / "solution.py").write_text(code, encoding="utf-8")
 
     # --- Approach description ---
 
@@ -154,7 +152,7 @@ Write complete, runnable code in a ```python block."""
         if not code_path.exists() or not hasattr(toolkit, 'llm'):
             return
 
-        code = code_path.read_text()
+        code = code_path.read_text(encoding="utf-8")
         prompt = (
             f"Describe the core approach of this code in 2-3 sentences. "
             f"Focus on the algorithm and technique, not implementation details.\n\n"
@@ -165,23 +163,22 @@ Write complete, runnable code in a ```python block."""
             system_prompt="Write a brief, factual description of the algorithm. No preamble."
         )
         self.cost += response.cost
-        (ws.path / "approach.md").write_text(response.text.strip())
+        (ws.path / "approach.md").write_text(response.text.strip(), encoding="utf-8")
 
     # --- Evaluation with retries ---
 
     def _evaluate_with_retries(self, toolkit, ws):
         for attempt_num in range(self.cfg.max_retries + 1):
-            code_path = ws.path / "solution.py"
-            if not code_path.exists():
-                return toolkit.task.evaluate("# no code generated", through=self.through)
-            code = code_path.read_text()
-            result = toolkit.task.evaluate(code, through=self.through)
+            if not (ws.path / "solution.py").exists():
+                (ws.path / "solution.py").write_text("# no code generated", encoding="utf-8")
+            result = toolkit.task.evaluate(ws.path, through=self.through)
 
             if result.completed:
                 return result
 
             if attempt_num < self.cfg.max_retries and hasattr(toolkit, 'llm'):
                 error_stage = result.stages[result.failed_stage]
+                code = (ws.path / "solution.py").read_text(encoding="utf-8")
                 self.log.inline(f"retry {attempt_num + 1}... ")
                 self._retry_fix(toolkit, ws, code, error_stage, attempt_num + 1)
 
@@ -204,21 +201,9 @@ Write complete, runnable code in a ```python block."""
         self.cost += response.cost
         self.log_conversation(ws.path, response, label=f"Retry {retry_num}")
 
-        new_code = self._apply_response(response.text, broken_code)
-        (ws.path / "solution.py").write_text(new_code)
-
-    def _apply_response(self, response_text, prior_code):
-        from groundhog.utils.codegen import parse_diff, apply_diff
-        diffs = parse_diff(response_text)
-        if diffs:
-            try:
-                return apply_diff(prior_code, diffs)
-            except ValueError:
-                pass
-        extracted = extract_code(response_text)
-        if extracted and extracted != response_text.strip():
-            return extracted
-        return prior_code
+        fixed_code, _ = extract_code(response.text, broken_code)
+        if fixed_code:
+            (ws.path / "solution.py").write_text(fixed_code, encoding="utf-8")
 
     # --- Scoring ---
 

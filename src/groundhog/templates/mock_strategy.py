@@ -44,11 +44,11 @@ class MockStrategy:
     def _prepare_workspace(self, toolkit, ws, prior):
         """Write context files to workspace before doing work."""
         # Write task context so an agent/LLM could read it
-        (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get())
+        (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get(), encoding="utf-8")
 
         # Write prior code if available
         if prior:
-            (ws.path / "solution.py").write_text(prior.code)
+            (ws.path / "solution.py").write_text(prior.code, encoding="utf-8")
 
     # --- Core work ---
 
@@ -57,13 +57,13 @@ class MockStrategy:
         rng = toolkit.rng if hasattr(toolkit, 'rng') else random.Random()
         value = rng.uniform(0, 100)
         code = f"def solve():\n    return {value}"
-        (ws.path / "solution.py").write_text(code)
+        (ws.path / "solution.py").write_text(code, encoding="utf-8")
 
     # --- Evaluation ---
 
     def _evaluate(self, toolkit, ws):
         """Read code from workspace and evaluate."""
-        code = (ws.path / "solution.py").read_text()
+        code = (ws.path / "solution.py").read_text(encoding="utf-8")
         through = toolkit.through if hasattr(toolkit, 'through') else None
         return toolkit.task.evaluate(code, through=through)
 

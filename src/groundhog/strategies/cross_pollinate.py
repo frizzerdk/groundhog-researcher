@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from groundhog.base.strategy import Strategy, StrategyConfig, param
 from groundhog.tools.conversation_log import conversation_log
-from groundhog.utils.codegen import extract_code, parse_diff, apply_diff, build_prompt
+from groundhog.utils.codegen import extract_code, build_prompt
 from groundhog.utils.selection import get_trunk_leaders
 
 
@@ -97,12 +97,12 @@ class CrossPollinate(Strategy):
         return toolkit.history.workspace(parent=prior.number)
 
     def _prepare_workspace(self, toolkit, ws, prior):
-        (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get())
-        (ws.path / "solution.py").write_text(prior.code)
+        (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get(), encoding="utf-8")
+        (ws.path / "solution.py").write_text(prior.code, encoding="utf-8")
         # Copy approach from parent if it exists
         prior_approach = prior.path / "approach.md" if hasattr(prior, 'path') else None
         if prior_approach and prior_approach.exists():
-            (ws.path / "approach.md").write_text(prior_approach.read_text())
+            (ws.path / "approach.md").write_text(prior_approach.read_text(encoding="utf-8"), encoding="utf-8")
 
     # --- Core work ---
 
@@ -139,40 +139,27 @@ Output SEARCH/REPLACE blocks modifying the base approach."""
         self.cost += response.cost
         self.log_conversation(ws.path, response)
 
-        new_code = self._apply_response(response.text, prior.code)
-        (ws.path / "solution.py").write_text(new_code)
-
-    def _apply_response(self, response_text, prior_code):
-        diffs = parse_diff(response_text)
-        if diffs:
-            try:
-                result = apply_diff(prior_code, diffs)
-                self.log.inline(f"diff ({len(diffs)} blocks)... ")
-                return result
-            except ValueError:
-                self.log.inline("diff failed, ")
-        extracted = extract_code(response_text)
-        if extracted and extracted != response_text.strip():
-            self.log.inline("full rewrite... ")
-            return extracted
-        self.log.inline("no changes... ")
-        return prior_code
+        new_code, diff = extract_code(response.text, prior.code)
+        if new_code:
+            self.log.inline(f"{diff.method} ({diff.blocks} blocks)... " if diff.blocks else f"{diff.method}... ")
+            (ws.path / "solution.py").write_text(new_code, encoding="utf-8")
+        else:
+            self.log.inline("no changes... ")
 
     # --- Evaluation with retries ---
 
     def _evaluate_with_retries(self, toolkit, ws):
         for attempt_num in range(self.cfg.max_retries + 1):
-            code_path = ws.path / "solution.py"
-            if not code_path.exists():
-                return toolkit.task.evaluate("# no code generated", through=self.through)
-            code = code_path.read_text()
-            result = toolkit.task.evaluate(code, through=self.through)
+            if not (ws.path / "solution.py").exists():
+                (ws.path / "solution.py").write_text("# no code generated", encoding="utf-8")
+            result = toolkit.task.evaluate(ws.path, through=self.through)
 
             if result.completed:
                 return result
 
             if attempt_num < self.cfg.max_retries and hasattr(toolkit, 'llm'):
                 error_stage = result.stages[result.failed_stage]
+                code = (ws.path / "solution.py").read_text(encoding="utf-8")
                 self.log.inline(f"retry {attempt_num + 1}... ")
                 self._retry_fix(toolkit, ws, code, error_stage, attempt_num + 1)
 
@@ -195,8 +182,9 @@ Output SEARCH/REPLACE blocks modifying the base approach."""
         self.cost += response.cost
         self.log_conversation(ws.path, response, label=f"Retry {retry_num}")
 
-        new_code = self._apply_response(response.text, broken_code)
-        (ws.path / "solution.py").write_text(new_code)
+        fixed_code, _ = extract_code(response.text, broken_code)
+        if fixed_code:
+            (ws.path / "solution.py").write_text(fixed_code, encoding="utf-8")
 
     # --- Scoring ---
 

@@ -22,11 +22,11 @@ class MarkdownLearnings(Learnings):
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
     def add(self, text: str):
-        existing = self._path.read_text() if self._path.exists() else ""
+        existing = self._path.read_text(encoding="utf-8") if self._path.exists() else ""
         if existing.strip():
-            self._path.write_text(existing.rstrip() + SEPARATOR + text.strip() + "\n")
+            self._path.write_text(existing.rstrip() + SEPARATOR + text.strip() + "\n", encoding="utf-8")
         else:
-            self._path.write_text(text.strip() + "\n")
+            self._path.write_text(text.strip() + "\n", encoding="utf-8")
 
     def get(self, last: int = 0, random: int = 0) -> str:
         if not self._path.exists():
@@ -45,13 +45,13 @@ class MarkdownLearnings(Learnings):
         return len(self._entries())
 
     def edit(self, search: str, replace: str):
-        content = self._path.read_text() if self._path.exists() else ""
+        content = self._path.read_text(encoding="utf-8") if self._path.exists() else ""
         if search not in content:
             raise ValueError(f"'{search}' not found in learnings")
-        self._path.write_text(content.replace(search, replace))
+        self._path.write_text(content.replace(search, replace), encoding="utf-8")
 
     def _entries(self):
-        content = self._path.read_text().strip()
+        content = self._path.read_text(encoding="utf-8").strip()
         if not content:
             return []
         return [e.strip() for e in content.split("---") if e.strip()]

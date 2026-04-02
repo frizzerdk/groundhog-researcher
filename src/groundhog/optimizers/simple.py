@@ -95,7 +95,24 @@ class SimpleOptimizer(Optimizer):
             strat_counts[name] = strat_counts.get(name, 0) + 1
         rotation = " + ".join(f"{count}x{name}" for name, count in strat_counts.items())
 
-        print(f"{self.task.name} | {rotation} | {' → '.join(stage_names)} | {existing} existing")
+        print(f"{self.task.name} | {rotation} | {' ->'.join(stage_names)} | {existing} existing")
+
+        # Print backend tiers if LLM is configured
+        if hasattr(self.toolkit, 'llm'):
+            from groundhog.base.backend import BackendRegistry
+            reg = self.toolkit.llm
+            if isinstance(reg, BackendRegistry):
+                tiers = []
+                for tier in ["max", "high", "default", "budget", "cheap"]:
+                    b = reg.get(tier)
+                    # Only show if it's not just the default fallback
+                    if tier == "default" or b is not reg.get("default"):
+                        tiers.append(f"{tier}={b.model}")
+                print(f"LLM: {' | '.join(tiers)}")
+            else:
+                print(f"LLM: {reg.__class__.__name__}")
+        else:
+            print("LLM: none")
         print()
 
     def _score_attempt(self, attempt, scorer):
@@ -195,14 +212,14 @@ class SimpleOptimizer(Optimizer):
 
         print("Trunks:")
         for trunk, best_score in scored_trunks:
-            chain = " → ".join(f"#{a.number}" for a in trunk)
+            chain = " ->".join(f"#{a.number}" for a in trunk)
             # Read approach from root attempt if available
             root = trunk[0]
             approach = ""
             if hasattr(root, 'path'):
                 approach_path = root.path / "approach.md"
                 if approach_path.exists():
-                    approach = approach_path.read_text().strip().split('\n')[0][:80]
+                    approach = approach_path.read_text(encoding="utf-8").strip().split('\n')[0][:80]
             approach_str = f" | {approach}" if approach else ""
             print(f"  {chain} (best: {best_score:.4f}, {len(trunk)} attempts){approach_str}")
         print()

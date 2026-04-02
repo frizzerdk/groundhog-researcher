@@ -2,7 +2,8 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Union
 
 
 @dataclass
@@ -44,7 +45,7 @@ class EvalStage:
     """
     name: str
     description: str
-    call: Callable[[str], StageResult]
+    call: Callable  # (code_or_path) -> StageResult — accepts str or Path
     scorer: Callable[[StageResult], float] = _default_score
 
     def score(self, result: StageResult) -> float:
@@ -76,16 +77,22 @@ class Context(ABC):
 
 
 class Evaluator(ABC):
-    """Evaluates code: E(code, D) -> StageResult."""
+    """Evaluates code: E(code_or_path, D) -> StageResult.
+
+    Receives either a code string or a Path to a workspace directory.
+    If Path, read whatever files you need (e.g. path / "solution.py").
+    If string, use it directly. This lets simple evaluators exec code
+    while complex evaluators inspect workspace artifacts.
+    """
 
     @abstractmethod
-    def evaluate(self, code: str, data: 'Data') -> StageResult: ...
+    def evaluate(self, code_or_path: Union[str, Path], data: 'Data') -> StageResult: ...
 
     def get_stages(self, data: 'Data') -> List[EvalStage]:
         """Return evaluation stages, cheapest first. Override to add cheaper stages."""
         return [
             EvalStage("evaluate", "Full evaluation",
-                      lambda code, d=data: self.evaluate(code, d))
+                      lambda code_or_path, d=data: self.evaluate(code_or_path, d))
         ]
 
     def eval_stages(self, data: 'Data', through=None) -> List[EvalStage]:
@@ -103,12 +110,12 @@ class Evaluator(ABC):
                     return stages[:i + 1]
         return stages
 
-    def run(self, code: str, data: 'Data', through=None) -> EvaluationResult:
-        """Evaluate code by cascading through stages. Stops on error."""
+    def run(self, code_or_path: Union[str, Path], data: 'Data', through=None) -> EvaluationResult:
+        """Evaluate by cascading through stages. Stops on error."""
         stages = self.eval_stages(data, through=through)
         eval_result = EvaluationResult()
         for stage in stages:
-            stage_result = stage.call(code)
+            stage_result = stage.call(code_or_path)
             eval_result.stages[stage.name] = stage_result
             if stage_result.errors:
                 eval_result.completed = False
@@ -126,6 +133,6 @@ class Task:
         self.evaluator = evaluator
         self.name = name or self.__class__.__name__
 
-    def evaluate(self, code: str, through=None) -> EvaluationResult:
-        """Evaluate code against this task's problem."""
-        return self.evaluator.run(code, self.data, through=through)
+    def evaluate(self, code_or_path: Union[str, Path], through=None) -> EvaluationResult:
+        """Evaluate against this task. Accepts code string or workspace Path."""
+        return self.evaluator.run(code_or_path, self.data, through=through)

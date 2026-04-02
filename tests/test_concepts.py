@@ -53,8 +53,17 @@ class FixtureContext(Context):
         return "def solve() -> float"
 
 
+def _read_code(code_or_path):
+    """Helper: accept string or Path, return code string."""
+    from pathlib import Path
+    if isinstance(code_or_path, (str, bytes)):
+        return code_or_path
+    return (Path(code_or_path) / "solution.py").read_text()
+
+
 class FixtureEvaluator(Evaluator):
-    def evaluate(self, code, data):
+    def evaluate(self, code_or_path, data):
+        code = _read_code(code_or_path)
         namespace = {}
         exec(code, namespace)
         value = namespace["solve"]()
@@ -78,14 +87,15 @@ class FixtureEvaluator(Evaluator):
     def get_stages(self, data):
         return [
             EvalStage("smoke", "Syntax check",
-                      lambda code: self._smoke(code),
+                      lambda code_or_path: self._smoke(code_or_path),
                       scorer=self._smoke_scorer),
             EvalStage("evaluate", "Full evaluation",
-                      lambda code, d=data: self.evaluate(code, d),
+                      lambda code_or_path, d=data: self.evaluate(code_or_path, d),
                       scorer=self._scorer),
         ]
 
-    def _smoke(self, code):
+    def _smoke(self, code_or_path):
+        code = _read_code(code_or_path)
         try:
             namespace = {}
             exec(code, namespace)
@@ -622,6 +632,49 @@ def test_backend_registry_fallback():
     assert reg.get("high").name == "high"
     assert reg.get("default").name == "default"
     assert reg.get("missing_tier").name == "default"  # falls back
+
+
+# === End-to-end mock task test ===
+
+def test_mock_task_end_to_end():
+    """Run MockTask with MockStrategy for 5 iterations — full loop including path-based evaluation."""
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    # Import mock task and strategy from templates
+    from groundhog.templates.mock_task import MockTask
+    from groundhog.templates.mock_strategy import MockStrategy
+    from groundhog import SimpleOptimizer
+
+    with tempfile.TemporaryDirectory() as d:
+        task = MockTask(seed=42)
+        strategy = MockStrategy()
+        optimizer = SimpleOptimizer(task, strategy=strategy, seed=69, seed_strategy=None, path=Path(d))
+        optimizer.run(n=5)
+
+        # Verify attempts were created
+        attempts = optimizer.history.list()
+        assert len(attempts) == 5
+
+        # Verify scoring works (all should have valid scores)
+        scorer = optimizer._get_scorer()
+        for a in attempts:
+            assert a.result.completed
+            score = optimizer._score_attempt(a, scorer)
+            assert 0.0 <= score <= 1.0
+
+        # Verify best is deterministic with seed
+        best = optimizer.history.best(scorer)
+        assert best is not None
+
+        # Verify trunks can be derived
+        trunks = optimizer.history.derive_trunks(scorer)
+        assert len(trunks) > 0
+
+        # Verify solution.py exists in each attempt
+        for a in attempts:
+            assert (a.path / "solution.py").exists()
 
 
 # === Run all tests ===

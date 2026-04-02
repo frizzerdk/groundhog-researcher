@@ -62,7 +62,7 @@ def _read_json(ws_path):
     if not path.exists():
         return []
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, ValueError):
         return []
 
@@ -70,7 +70,7 @@ def _read_json(ws_path):
 def _append_json(ws_path, entry):
     entries = _read_json(ws_path)
     entries.append(entry)
-    _json_path(ws_path).write_text(json.dumps(entries, indent=2))
+    _json_path(ws_path).write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # --- Markdown (rendered view) ---
@@ -90,4 +90,4 @@ def _render_markdown(ws_path):
             if parts:
                 lines.append(f"*{', '.join(parts)}*\n")
         lines.append("---\n")
-    (Path(ws_path) / "conversation.md").write_text("\n".join(lines))
+    (Path(ws_path) / "conversation.md").write_text("\n".join(lines), encoding="utf-8")
