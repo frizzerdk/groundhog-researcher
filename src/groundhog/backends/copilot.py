@@ -66,9 +66,10 @@ class CopilotBackend(LLMBackend):
     # 3x: Claude Opus 4.5/4.6
     COST_PER_PREMIUM_REQUEST = 10.0 / 300
 
-    def __init__(self, model: str = "gpt-5-mini", warn_interval: int = 30):
+    def __init__(self, model: str = "gpt-5-mini", warn_interval: int = 30, max_retries: int = 2):
         self.model = model
         self.warn_interval = warn_interval
+        self.max_retries = max_retries
 
     def _run_cli(self, cmd, input_text):
         """Run CLI with stdin, periodic warnings, no timeout."""
@@ -124,6 +125,26 @@ class CopilotBackend(LLMBackend):
         return stdout, stderr, proc.returncode
 
     def generate(self, prompt: Prompt, system_prompt: str = "") -> LLMResponse:
+        errors = []
+        for attempt in range(self.max_retries + 1):
+            try:
+                result = self._generate(prompt, system_prompt)
+                if errors:
+                    result.usage["retries"] = len(errors)
+                    result.usage["retry_errors"] = [str(e) for e in errors]
+                return result
+            except RuntimeError as e:
+                # Don't retry auth errors — those need user interaction
+                if "Not authenticated" in str(e) or "login" in str(e).lower():
+                    raise
+                errors.append(e)
+                if attempt < self.max_retries:
+                    wait = 5 * (attempt + 1)
+                    print(f"(error: {e}, retrying in {wait}s)... ", end="", file=sys.stderr, flush=True)
+                    time.sleep(wait)
+        raise errors[-1]
+
+    def _generate(self, prompt: Prompt, system_prompt: str = "") -> LLMResponse:
         prompt_text = prompt if isinstance(prompt, str) else " ".join(
             p.text for p in prompt if isinstance(p, TextPart))
 

@@ -109,14 +109,20 @@ def discover_backends() -> Dict[str, LLMBackend]:
     return backends
 
 
+# Alias map: user-friendly names -> discovery names
+BACKEND_ALIASES = {
+    "gemini": "gemini_cli",   # "gemini" prefers CLI over API
+    "claude": "claude_code",
+}
+
 # Tier definitions: name, priority list, variant function
 # Tiers from strongest to cheapest: max > high > default > budget > cheap
 TIER_DEFS = {
-    "max":     ["anthropic", "openai", "gemini", "claude_code", "copilot", "openrouter"],
-    "high":    ["gemini", "anthropic", "openai", "claude_code", "copilot", "openrouter"],
-    "default": ["claude_code", "anthropic", "gemini", "openai", "deepseek", "copilot", "openrouter", "opencode", "groq"],
-    "budget":  ["deepseek", "groq", "gemini", "openai", "claude_code", "copilot", "ollama"],
-    "cheap":   ["ollama", "deepseek", "groq", "gemini", "openai", "claude_code", "copilot"],
+    "max":     ["anthropic", "openai", "gemini", "gemini_cli", "claude_code", "copilot", "openrouter"],
+    "high":    ["gemini", "gemini_cli", "anthropic", "openai", "claude_code", "copilot", "openrouter"],
+    "default": ["claude_code", "anthropic", "gemini", "gemini_cli", "openai", "deepseek", "copilot", "openrouter", "opencode", "groq"],
+    "budget":  ["deepseek", "groq", "gemini", "gemini_cli", "openai", "claude_code", "copilot", "ollama"],
+    "cheap":   ["ollama", "deepseek", "groq", "gemini", "gemini_cli", "openai", "claude_code", "copilot"],
 }
 
 
@@ -210,12 +216,14 @@ def _get_max_variant(name, backend):
     from groundhog.backends.openai_compat import OpenAICompatibleBackend
     from groundhog.backends.claude_code import ClaudeCodeBackend
     from groundhog.backends.gemini import GeminiBackend
+    from groundhog.backends.gemini_cli import GeminiCLIBackend
     from groundhog.backends.copilot import CopilotBackend
 
     variants = {
         "anthropic": lambda: AnthropicBackend(model="claude-opus-4-6-20260205"),
         "openai":    lambda: OpenAICompatibleBackend.openai(model="gpt-5.4"),
         "gemini":    lambda: GeminiBackend(model="gemini-3.1-pro-preview"),
+        "gemini_cli": lambda: GeminiCLIBackend(model="gemini-3.1-pro-preview"),
         "claude_code": lambda: ClaudeCodeBackend(model="opus"),
         "copilot":   lambda: CopilotBackend(model="claude-sonnet-4.6"),
         "openrouter": lambda: OpenAICompatibleBackend.openrouter(model="anthropic/claude-opus-4-6-20260205"),
@@ -229,10 +237,12 @@ def _get_high_variant(name, backend):
     from groundhog.backends.openai_compat import OpenAICompatibleBackend
     from groundhog.backends.claude_code import ClaudeCodeBackend
     from groundhog.backends.gemini import GeminiBackend
+    from groundhog.backends.gemini_cli import GeminiCLIBackend
     from groundhog.backends.copilot import CopilotBackend
 
     variants = {
         "gemini":    lambda: GeminiBackend(model="gemini-3-flash-preview"),
+        "gemini_cli": lambda: GeminiCLIBackend(model="gemini-3-flash-preview"),
         "anthropic": lambda: AnthropicBackend(model="claude-sonnet-4-6-20260217"),
         "openai":    lambda: OpenAICompatibleBackend.openai(model="gpt-5.4-mini"),
         "claude_code": lambda: ClaudeCodeBackend(model="sonnet"),
@@ -246,6 +256,7 @@ def _get_budget_variant(name, backend):
     """Cheap but capable."""
     from groundhog.backends.openai_compat import OpenAICompatibleBackend
     from groundhog.backends.gemini import GeminiBackend
+    from groundhog.backends.gemini_cli import GeminiCLIBackend
     from groundhog.backends.claude_code import ClaudeCodeBackend
     from groundhog.backends.copilot import CopilotBackend
 
@@ -253,6 +264,7 @@ def _get_budget_variant(name, backend):
         "deepseek":   lambda: backend,
         "groq":       lambda: backend,
         "gemini":     lambda: GeminiBackend(model="gemini-2.5-flash"),
+        "gemini_cli": lambda: GeminiCLIBackend(model="gemini-3.1-flash-lite-preview"),
         "openai":     lambda: OpenAICompatibleBackend.openai(model="gpt-5.4-nano"),
         "claude_code": lambda: ClaudeCodeBackend(model="haiku"),
         "copilot":   lambda: CopilotBackend(model="gpt-5-mini"),
@@ -265,6 +277,7 @@ def _get_cheap_variant(name, backend):
     """Cheapest possible."""
     from groundhog.backends.openai_compat import OpenAICompatibleBackend
     from groundhog.backends.gemini import GeminiBackend
+    from groundhog.backends.gemini_cli import GeminiCLIBackend
     from groundhog.backends.claude_code import ClaudeCodeBackend
     from groundhog.backends.copilot import CopilotBackend
 
@@ -273,6 +286,7 @@ def _get_cheap_variant(name, backend):
         "deepseek":   lambda: backend,
         "groq":       lambda: backend,
         "gemini":     lambda: GeminiBackend(model="gemini-2.5-flash-lite"),
+        "gemini_cli": lambda: GeminiCLIBackend(model="gemini-2.5-flash-lite"),
         "openai":     lambda: OpenAICompatibleBackend.openai(model="gpt-5.4-nano"),
         "claude_code": lambda: ClaudeCodeBackend(model="haiku"),
         "copilot":   lambda: CopilotBackend(model="gpt-5-mini"),

@@ -16,12 +16,30 @@ class ClaudeCodeBackend(LLMBackend):
     Effort: "low", "medium", "high" -- caps extended thinking budget.
     """
 
-    def __init__(self, model: str = "sonnet", effort: str = "low", warn_interval: int = 30):
+    def __init__(self, model: str = "sonnet", effort: str = "low", warn_interval: int = 30, max_retries: int = 2):
         self.model = model
         self.effort = effort
         self.warn_interval = warn_interval
+        self.max_retries = max_retries
 
     def generate(self, prompt: Prompt, system_prompt: str = "") -> LLMResponse:
+        errors = []
+        for attempt in range(self.max_retries + 1):
+            try:
+                result = self._call(prompt, system_prompt)
+                if errors:
+                    result.usage["retries"] = len(errors)
+                    result.usage["retry_errors"] = [str(e) for e in errors]
+                return result
+            except RuntimeError as e:
+                errors.append(e)
+                if attempt < self.max_retries:
+                    wait = 5 * (attempt + 1)
+                    print(f"(error: {e}, retrying in {wait}s)... ", end="", file=sys.stderr, flush=True)
+                    time.sleep(wait)
+        raise errors[-1]
+
+    def _call(self, prompt: Prompt, system_prompt: str = "") -> LLMResponse:
         prompt_text = prompt if isinstance(prompt, str) else " ".join(
             p.text for p in prompt if isinstance(p, TextPart))
 
