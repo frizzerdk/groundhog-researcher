@@ -1,7 +1,7 @@
 # Groundhog Researcher
 
 <p align="center">
-  <img src="docs/grindhog.jpg" width="300" alt="The Grindhog - Just One More Iteration">
+  <img src="https://raw.githubusercontent.com/frizzerdk/groundhog-researcher/master/docs/grindhog.jpg" width="300" alt="The Grindhog - Just One More Iteration">
 </p>
 
 *Just one more iteration...*

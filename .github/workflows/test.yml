@@ -39,18 +39,15 @@ jobs:
 
       - name: Test init-mock
         run: |
-          uv run groundhog init-mock --script /tmp/test_mock
-          python -c "import ast; ast.parse(open('/tmp/test_mock/task.py').read()); print('mock template OK')"
-        shell: bash
+          uv run groundhog init-mock test_mock
+          uv run python -c "import ast; ast.parse(open('test_mock/task.py').read()); print('mock template OK')"
 
       - name: Test new strategy
         run: |
-          uv run groundhog new strategy /tmp/test_strat.py
-          python -c "import ast; ast.parse(open('/tmp/test_strat.py').read()); print('strategy template OK')"
-        shell: bash
+          uv run groundhog new strategy test_strat.py
+          uv run python -c "import ast; ast.parse(open('test_strat.py').read()); print('strategy template OK')"
 
       - name: Test new backend
         run: |
-          uv run groundhog new backend /tmp/test_backend.py
-          python -c "import ast; ast.parse(open('/tmp/test_backend.py').read()); print('backend template OK')"
-        shell: bash
+          uv run groundhog new backend test_backend.py
+          uv run python -c "import ast; ast.parse(open('test_backend.py').read()); print('backend template OK')"
