@@ -56,16 +56,28 @@ def init(template_name, target_dir=None, script_only=False):
         deps = ["groundhog-researcher", "python-dotenv"] + template.get("deps", [])
         deps_str = ", ".join(f'"{d}"' for d in deps)
         name = target.name.replace(" ", "-").lower()
+        # Check if groundhog-researcher is on real PyPI
+        _on_pypi = False
+        try:
+            import urllib.request
+            urllib.request.urlopen("https://pypi.org/pypi/groundhog-researcher/json", timeout=3)
+            _on_pypi = True
+        except Exception:
+            pass
+
         pyproject_content = (
             f'[project]\nname = "{name}"\nversion = "0.1.0"\n'
             f'requires-python = ">=3.11"\n'
             f'dependencies = [{deps_str}]\n'
-            f'\n[[tool.uv.index]]\nname = "testpypi"\n'
-            f'url = "https://test.pypi.org/simple/"\n'
-            f'explicit = true\n'
-            f'\n[tool.uv.sources]\n'
-            f'groundhog-researcher = {{ index = "testpypi" }}\n'
         )
+        if not _on_pypi:
+            pyproject_content += (
+                f'\n[[tool.uv.index]]\nname = "testpypi"\n'
+                f'url = "https://test.pypi.org/simple/"\n'
+                f'explicit = true\n'
+                f'\n[tool.uv.sources]\n'
+                f'groundhog-researcher = {{ index = "testpypi" }}\n'
+            )
         (target / "pyproject.toml").write_text(pyproject_content, encoding="utf-8")
 
     # Copy template files (after uv init so task.py overwrites the default)

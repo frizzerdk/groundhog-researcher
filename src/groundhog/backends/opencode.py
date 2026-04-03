@@ -23,10 +23,10 @@ class OpenCodeBackend(LLMBackend):
         if system_prompt:
             prompt_text = f"{system_prompt}\n\n{prompt_text}"
 
-        cmd = ["opencode", "run", "--format", "json", "--model", self.model, prompt_text]
+        cmd = ["opencode", "run", "--format", "json", "--model", self.model]
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True,
+            result = subprocess.run(cmd, input=prompt_text, capture_output=True, text=True,
                                     timeout=self.timeout, encoding="utf-8",
                                     errors="replace")
         except FileNotFoundError:

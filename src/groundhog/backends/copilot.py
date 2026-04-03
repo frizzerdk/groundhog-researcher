@@ -3,6 +3,9 @@
 import os
 import re
 import subprocess
+import sys
+import threading
+import time
 
 from groundhog.base.backend import LLMBackend, LLMResponse, Prompt, TextPart
 
@@ -63,9 +66,62 @@ class CopilotBackend(LLMBackend):
     # 3x: Claude Opus 4.5/4.6
     COST_PER_PREMIUM_REQUEST = 10.0 / 300
 
-    def __init__(self, model: str = "gpt-5-mini", timeout: int = 600):
+    def __init__(self, model: str = "gpt-5-mini", warn_interval: int = 30):
         self.model = model
-        self.timeout = timeout
+        self.warn_interval = warn_interval
+
+    def _run_cli(self, cmd, input_text):
+        """Run CLI with stdin, periodic warnings, no timeout."""
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+        except FileNotFoundError:
+            raise RuntimeError("Copilot CLI not found. Install from https://github.com/github/copilot-cli")
+
+        stdout_chunks = []
+        stderr_chunks = []
+        bytes_received = [0]
+
+        def read_stream(stream, chunks, counter):
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                counter[0] += len(chunk)
+
+        t_out = threading.Thread(target=read_stream, args=(proc.stdout, stdout_chunks, bytes_received), daemon=True)
+        t_err = threading.Thread(target=read_stream, args=(proc.stderr, stderr_chunks, bytes_received), daemon=True)
+        t_out.start()
+        t_err.start()
+
+        proc.stdin.write(input_text.encode("utf-8"))
+        proc.stdin.close()
+
+        start = time.time()
+        last_bytes = 0
+        last_status_len = 0
+        while proc.poll() is None:
+            t_out.join(timeout=self.warn_interval)
+            if proc.poll() is None:
+                elapsed = int(time.time() - start)
+                current_bytes = bytes_received[0]
+                status = "working" if current_bytes > last_bytes else "waiting"
+                msg = f"({status} {elapsed}s)... "
+                print("\b" * last_status_len + msg, end="", file=sys.stderr, flush=True)
+                last_status_len = len(msg)
+                last_bytes = current_bytes
+
+        if last_status_len:
+            print("\b" * last_status_len + " " * last_status_len + "\b" * last_status_len,
+                  end="", file=sys.stderr, flush=True)
+
+        t_out.join(timeout=5)
+        t_err.join(timeout=5)
+
+        stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+        stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        return stdout, stderr, proc.returncode
 
     def generate(self, prompt: Prompt, system_prompt: str = "") -> LLMResponse:
         prompt_text = prompt if isinstance(prompt, str) else " ".join(
@@ -79,35 +135,20 @@ class CopilotBackend(LLMBackend):
         cmd = ["copilot", "--model", self.model,
                "--no-custom-instructions", "--available-tools"]
 
-        try:
-            result = subprocess.run(cmd, input=prompt_text, capture_output=True, text=True,
-                                    timeout=self.timeout, encoding="utf-8",
-                                    errors="replace")
-        except FileNotFoundError:
-            raise RuntimeError("Copilot CLI not found. Install from https://github.com/github/copilot-cli")
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"Copilot CLI timed out after {self.timeout}s")
+        stdout, stderr, returncode = self._run_cli(cmd, prompt_text)
 
-        stdout = result.stdout or ""
-        stderr = result.stderr or ""
-
-        if result.returncode != 0 and not stdout.strip():
+        if returncode != 0 and not stdout.strip():
             if "No authentication" in stderr:
                 print("\n[copilot] Not authenticated in this environment.")
                 answer = input("  Log in now? (y/n): ").strip().lower()
                 if answer in ("y", "yes", ""):
                     if login_copilot():
-                        # Retry the call
-                        result = subprocess.run(cmd, capture_output=True, text=True,
-                                                timeout=self.timeout, encoding="utf-8",
-                                                errors="replace")
-                        stdout = result.stdout or ""
-                        stderr = result.stderr or ""
+                        stdout, stderr, returncode = self._run_cli(cmd, prompt_text)
                     else:
                         raise RuntimeError("Copilot login failed.")
                 else:
                     raise RuntimeError("Copilot not authenticated. Run 'groundhog backends' to log in.")
-            if result.returncode != 0 and not stdout.strip():
+            if returncode != 0 and not stdout.strip():
                 raise RuntimeError(f"Copilot CLI error: {stderr.strip()}")
 
         # Strip copilot CLI noise (● lines are CLI artifacts, not LLM output)

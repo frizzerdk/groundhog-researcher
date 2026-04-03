@@ -8,26 +8,65 @@
 
 LLM-powered function optimization. Define how to score your code, and the groundhog iterates overnight. Wake up to a better solution.
 
+## Install
+
+```bash
+uv tool install groundhog-researcher
+```
+
+This gives you the `groundhog` CLI (and `ghg` alias).
+
 ## Quick start
 
-Scaffold a task folder:
-
 ```bash
-uv add groundhog-researcher
-groundhog init my_task
+# See what LLM backends you have available
+groundhog backends
+
+# Scaffold a task
+groundhog init my_task           # basic template
+# groundhog init-llm my_task    # detailed template with full LLM guide
+# groundhog init-mock my_task   # mock task, no LLM needed, for testing
+# groundhog init-mnist my_task  # 5 sample MNIST digit classification, real ML task
+
 cd my_task
-echo "GEMINI_API_KEY=your-key-here" > .env
-# edit task.py with your task logic
-uv run task.py 10
+uv run python task.py 10
+
+# Check progress anytime
+uv run python task.py status
 ```
 
-Check status anytime:
+Works with whatever LLM you have — Claude Code, GitHub Copilot, API keys, Ollama. `auto_registry()` discovers available backends automatically.
+
+### Prefer a backend
 
 ```bash
-uv run task.py status
+groundhog prefer copilot                              # use copilot for all tiers
+groundhog prefer-tier max copilot claude-sonnet-4.6    # override one tier
+groundhog prefer reset                                 # back to auto-discovery
 ```
 
-Or write a task from scratch — one file is everything:
+## CLI commands
+
+```
+groundhog init [dir]              Basic task template
+groundhog init-llm [dir]          Detailed template with full LLM guide
+groundhog init-mock [dir]         Mock task (no LLM needed, for testing)
+groundhog init-mnist [dir]        MNIST example (real ML task)
+
+groundhog new strategy [file]     Custom strategy template
+groundhog new backend [file]      Custom backend template
+
+groundhog backends                Show available backends and tier assignments
+groundhog prefer <backend>        Prefer a backend for all tiers
+groundhog prefer-tier <tier> <backend> [model]
+groundhog prefer reset            Reset all preferences
+
+groundhog --version
+```
+
+## Write a task from scratch
+
+One file is everything:
 
 ```python
 # /// script
@@ -61,8 +100,7 @@ class MyContext(Context):
 
 class MyEvaluator(Evaluator):
     def evaluate(self, code_or_path, data):
-        # Accepts a code string or a Path to the workspace directory
-        code = code_or_path if isinstance(code_or_path, str) else (code_or_path / "solution.py").read_text()
+        code = code_or_path if isinstance(code_or_path, str) else (code_or_path / "solution.py").read_text(encoding="utf-8")
         return StageResult(metrics={"score": 0.85, "time": 1.2})
 
     def get_stages(self, data):
@@ -76,16 +114,8 @@ class MyEvaluator(Evaluator):
 task = Task(data=MyData(), context=MyContext(), evaluator=MyEvaluator(), name="MyTask")
 
 optimizer = SimpleOptimizer(task, strategy=Improve())
-optimizer.toolkit.llm = auto_registry()  # uses whatever LLM you have available
+optimizer.toolkit.llm = auto_registry()
 optimizer.run(n=100)
-```
-
-Works with whatever LLM you have — Claude Code, API keys, Ollama. Run:
-
-```bash
-uv run task.py 10
-uv run task.py status         # check progress anytime
-groundhog backends            # see available LLM backends
 ```
 
 ## What happens
@@ -95,7 +125,7 @@ The optimizer works in the current directory:
 ```
 my_task/
     task.py                 # your task definition + entry point
-    .env                    # API keys
+    .env                    # API keys (optional)
     learnings.md            # what the optimizer has learned
     attempts/               # every candidate
         001_none/           # first attempt (no parent)
@@ -109,18 +139,12 @@ my_task/
 The loop:
 1. Selects a **prior** (best attempt, weighted by potential)
 2. Runs a **strategy** (improve, explore, combine ideas)
-3. Evaluates — raw results stored, scored via stage scorers
+3. Evaluates -- raw results stored, scored via stage scorers
 4. Records the attempt in an immutable **attempt tree**
 5. Updates **learnings**
 6. Repeats
 
-Every attempt is kept. Nothing discarded. Change what "good" means later — the history is reinterpretable.
-
-Check status anytime:
-
-```bash
-uv run task.py status
-```
+Every attempt is kept. Nothing discarded. Change what "good" means later -- the history is reinterpretable.
 
 ## Multi-strategy optimizer
 
@@ -140,11 +164,9 @@ optimizer = SimpleOptimizer(
 )
 ```
 
-The schedule cycles — 14 + 5 + 1 = 20 per cycle. FreshApproach creates new trunks, Improve refines them, CrossPollinate transfers ideas between them.
-
 ## Backend tiers
 
-`auto_registry()` discovers what's available and assigns tiers automatically. Or configure manually — strategies request tiers, missing tiers fall back to "default":
+`auto_registry()` discovers what's available and assigns 5 tiers (max, high, default, budget, cheap). Or configure manually:
 
 ```python
 from groundhog import BackendRegistry, AnthropicBackend, GeminiBackend, OpenAICompatibleBackend
@@ -154,15 +176,29 @@ optimizer.toolkit.llm = BackendRegistry(
     default=GeminiBackend(model="gemini-2.5-flash"),
     cheap=OpenAICompatibleBackend.ollama(model="llama3"),
 )
-
-# In a strategy:
-response = toolkit.llm.get("high").generate(prompt=prompt)     # uses high
-response = toolkit.llm.get("expensive").generate(prompt=prompt) # falls back to default
 ```
+
+Override individual tiers after auto-discovery:
+
+```python
+optimizer.toolkit.llm = auto_registry()
+optimizer.toolkit.llm.set("high", AnthropicBackend(model="claude-opus-4-6-20260205"))
+```
+
+Available backends:
+
+| Type | Backends |
+|------|----------|
+| **API** | `OpenAICompatibleBackend` (.openai, .deepseek, .groq, .cerebras, .xai, .together, .fireworks, .ollama, .openrouter, ...), `AnthropicBackend`, `GeminiBackend` |
+| **CLI** | `ClaudeCodeBackend`, `CopilotBackend`, `GeminiCLIBackend`, `OpenCodeBackend` |
 
 ## Building a custom strategy
 
-Subclass `Strategy`, define a `Config`, implement `__call__`:
+```bash
+groundhog new strategy my_strategy.py    # generates a documented template
+```
+
+Or subclass directly:
 
 ```python
 from dataclasses import dataclass
@@ -178,20 +214,11 @@ class MyStrategy(Strategy):
 
     def __call__(self, toolkit, config=None):
         cfg = self._resolve_config(config)
-        # cfg.temperature, cfg.max_retries available
-
         ws = toolkit.history.workspace(parent=None)
         # ... generate code, write to ws.path / "solution.py" ...
-        result = toolkit.task.evaluate(code, through="evaluate")
+        result = toolkit.task.evaluate(ws.path, through="evaluate")
         attempt = ws.commit(result, metadata={"strategy": "mine"})
-        return {"attempt": attempt.number, "strategy": "mine"}
-```
-
-Configs are introspectable — any tool can discover what's configurable:
-
-```python
-MyStrategy.Config().describe()
-# {"temperature": {"type": "float", "default": 0.7, "description": "LLM sampling temperature"}, ...}
+        return {"attempt": attempt.number}
 ```
 
 ## Core concepts
@@ -201,14 +228,14 @@ MyStrategy.Config().describe()
 | **Task** | Your problem: data + context + evaluator |
 | **Strategy** | An action that moves the state forward (improve, explore, combine, analyse) |
 | **Attempt History** | Immutable tree of every candidate and its raw results |
-| **Scorer** | Per-stage callable that maps raw results to scores — change it without re-running |
+| **Scorer** | Per-stage callable that maps raw results to scores -- change it without re-running |
 | **Learnings** | What the optimizer has learned about how to optimize your task |
 | **Toolkit** | Capabilities available to strategies (LLMs, history, learnings, logging) |
 
 ## Architecture
 
 ```
-base/           # interfaces only — Task, Strategy, Optimizer, AttemptHistory, etc.
+base/           # interfaces only -- Task, Strategy, Optimizer, AttemptHistory, etc.
 strategies/     # Improve, FreshApproach, CrossPollinate, Analyse
 optimizers/     # SimpleOptimizer
 histories/      # FolderAttemptHistory
@@ -221,14 +248,6 @@ templates/      # task scaffolding templates (used by groundhog init)
 ```
 
 `base/` defines interfaces. Everything else is implementations. Build your own by subclassing the interfaces.
-
-## Install
-
-```bash
-uv add groundhog-researcher
-# or
-pip install groundhog-researcher
-```
 
 ## License
 
