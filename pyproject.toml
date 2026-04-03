@@ -30,6 +30,11 @@ dev = ["pytest>=7.0"]
 [tool.hatch.build.targets.wheel]
 packages = ["src/groundhog"]
 
+[project.urls]
+Homepage = "https://github.com/frizzerdk/groundhog-researcher"
+Repository = "https://github.com/frizzerdk/groundhog-researcher"
+Issues = "https://github.com/frizzerdk/groundhog-researcher/issues"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
