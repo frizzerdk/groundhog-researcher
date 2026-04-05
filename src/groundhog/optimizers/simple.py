@@ -79,6 +79,16 @@ class SimpleOptimizer(Optimizer):
         if self.through:
             self.toolkit.through = self.through
 
+        # Agent backends (optional — strategies check hasattr)
+        from groundhog.backends.discover import auto_agent_registry
+        agent_registry = auto_agent_registry()
+        if agent_registry:
+            self.toolkit.agent = agent_registry
+
+        # Default agent tools from toolkit capabilities
+        from groundhog.agents.tools import build_default_agent_tools
+        self.toolkit.agent_tools = build_default_agent_tools(self.toolkit)
+
     def _get_scorer(self):
         stages = self.task.evaluator.eval_stages(self.task.data, through=self.through)
         return stages[-1].score

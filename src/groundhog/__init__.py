@@ -9,6 +9,9 @@ from groundhog.base import (
     PromptPart, TextPart, ImagePart, AudioPart, Prompt,
     LLMBackend, LLMResponse, BackendRegistry,
     Learnings, Acceptance, Toolkit,
+    ToolResult, AgentTool, agent_tool,
+    AgentSpec, AgentResult,
+    AgentBackend, AgentRegistry,
 )
 
 # Utilities
@@ -34,3 +37,7 @@ from groundhog.strategies.improve import Improve
 from groundhog.strategies.fresh import FreshApproach
 from groundhog.strategies.cross_pollinate import CrossPollinate
 from groundhog.strategies.analyse import Analyse
+from groundhog.strategies.agent import AgentStrategy
+from groundhog.agents.claude_code import ClaudeCodeAgentBackend
+from groundhog.agents.gemini_cli import GeminiCliAgentBackend
+from groundhog.backends.discover import discover_agent_backends, auto_agent_registry

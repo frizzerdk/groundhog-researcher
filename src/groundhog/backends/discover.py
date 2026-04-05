@@ -301,3 +301,73 @@ _TIER_VARIANTS = {
     "budget": _get_budget_variant,
     "cheap": _get_cheap_variant,
 }
+
+
+# ---------------------------------------------------------------------------
+# Agent backend discovery
+# ---------------------------------------------------------------------------
+
+def discover_agent_backends():
+    """Check what agent-capable CLI tools are available.
+
+    Returns a dict of {name: AgentBackend} for everything found.
+    Only CLI tools qualify — API backends are stateless LLMs, not agents.
+    """
+    from groundhog.base.agent import AgentBackend
+    backends = {}
+
+    if shutil.which("claude"):
+        try:
+            from groundhog.agents.claude_code import ClaudeCodeAgentBackend
+            backends["claude_code"] = ClaudeCodeAgentBackend()
+        except Exception:
+            pass
+
+    if shutil.which("gemini"):
+        try:
+            from groundhog.agents.gemini_cli import GeminiCliAgentBackend
+            backends["gemini_cli"] = GeminiCliAgentBackend()
+        except Exception:
+            pass
+
+    return backends
+
+
+_AGENT_TIER_DEFS = {
+    "default": ["claude_code", "gemini_cli"],
+    "budget":  ["gemini_cli", "claude_code"],
+}
+
+
+def auto_agent_registry():
+    """Build an AgentRegistry from available agent backends.
+
+    Returns None if no agent backends are found (agents are optional).
+    Respects ~/.groundhog/config.json preferences.
+    """
+    from groundhog.base.agent import AgentRegistry
+
+    available = discover_agent_backends()
+    if not available:
+        return None
+
+    prefs = _load_preferences()
+    tiers = {}
+
+    for tier, priority in _AGENT_TIER_DEFS.items():
+        # Check preferences first
+        tier_pref = prefs.get("agent_tiers", {}).get(tier)
+        if tier_pref and tier_pref in available:
+            tiers[tier] = available[tier_pref]
+            continue
+
+        # Fall through priority list
+        for name in priority:
+            if name in available:
+                tiers[tier] = available[name]
+                break
+
+    if not tiers:
+        return None
+
+    return AgentRegistry(**tiers)

@@ -13,3 +13,8 @@ from groundhog.base.backend import (
 from groundhog.base.learnings import Learnings
 from groundhog.base.acceptance import Acceptance
 from groundhog.base.toolkit import Toolkit
+from groundhog.base.agent import (
+    ToolResult, AgentTool, agent_tool,
+    AgentSpec, AgentResult,
+    AgentBackend, AgentRegistry,
+)

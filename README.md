@@ -4,7 +4,7 @@
   <img src="https://raw.githubusercontent.com/frizzerdk/groundhog-researcher/master/docs/mascot.png" width="300" alt="The Grindhog - Just One More Iteration">
 </p>
 
-*Just one more iteration...*
+*They called it Groundhog Day. But what was the groundhog doing? Running experiments. Keeping notes. Getting better, one iteration at a time.*
 
 LLM-powered function optimization. Define how to score your code, and the groundhog iterates overnight. Wake up to a better solution.
 
