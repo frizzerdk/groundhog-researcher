@@ -145,109 +145,114 @@ def _get_ordered_params(tool: AgentTool) -> tuple:
 # --- Bash wrapper generation ---
 
 def generate_wrappers(tools: List[AgentTool], bin_dir: Path, port: int) -> None:
-    """Generate bash wrapper scripts for each tool in bin_dir."""
+    """Generate wrapper scripts for each tool in bin_dir.
+
+    Creates cross-platform Python scripts (no bash/curl dependency).
+    On Unix: executable scripts with #!/usr/bin/env python3 shebang.
+    On Windows: .cmd wrappers that call the Python script.
+    """
     bin_dir.mkdir(parents=True, exist_ok=True)
     python_path = sys.executable
+    is_windows = sys.platform == "win32"
 
     for tool in tools:
         ordered_names, required_count, defaults, path_params = _get_ordered_params(tool)
-        script = _build_wrapper_script(
-            tool.name, ordered_names, required_count, defaults, path_params, port, python_path,
+        py_script = _build_python_wrapper(
+            tool.name, ordered_names, required_count, defaults, path_params, port,
         )
-        script_path = bin_dir / tool.name
-        script_path.write_text(script)
-        script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+        if is_windows:
+            # Write .py script + .cmd launcher
+            py_path = bin_dir / f"{tool.name}.py"
+            py_path.write_text(py_script, encoding="utf-8")
+            cmd_path = bin_dir / f"{tool.name}.cmd"
+            cmd_path.write_text(f'@"{python_path}" "%~dp0{tool.name}.py" %*\n', encoding="utf-8")
+        else:
+            # Write executable Python script with shebang
+            script_path = bin_dir / tool.name
+            script_path.write_text(f"#!/usr/bin/env python3\n{py_script}", encoding="utf-8")
+            script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _build_wrapper_script(
+def _build_python_wrapper(
     tool_name: str,
     param_names: List[str],
     required_count: int,
     defaults: Dict[str, Any],
     path_params: set,
     port: int,
-    python_path: str = "python3",
 ) -> str:
-    """Build a bash wrapper script that supports both positional and --kwargs.
+    """Build a cross-platform Python wrapper script.
 
-    Auto-detects mode: if any argument starts with --, uses kwargs mode.
-    Otherwise falls back to positional mode.
-    Params with type "path" are resolved to absolute paths from the agent's cwd.
+    Supports both positional and --kwargs modes.
+    Uses urllib (stdlib) instead of curl for HTTP.
+    Resolves "path" type params to absolute paths.
     """
-    param_names_repr = repr(param_names)
-    defaults_repr = repr(defaults)
-    path_params_repr = repr(path_params)
+    return f'''import json, sys, os, urllib.request
 
-    # Build usage strings
-    usage_positional = " ".join(
-        [f"<{n}>" for n in param_names[:required_count]]
-        + [f"[{n}]" for n in param_names[required_count:]]
-    )
-    usage_kwargs = " ".join(f"--{n} <val>" for n in param_names)
+NAMES = {repr(param_names)}
+DEFAULTS = {repr(defaults)}
+PATH_PARAMS = {repr(path_params)}
+REQUIRED = {required_count}
+PORT = {port}
+TOOL = {repr(tool_name)}
 
-    parts = [
-        '#!/usr/bin/env bash',
-        'set -euo pipefail',
-    ]
-
-    if required_count > 0:
-        parts.append(f'''
-if [ $# -lt {required_count} ] && ! echo "${{@}}" | grep -q "\\-\\-"; then
-    echo "Usage: {tool_name} {usage_positional}" >&2
-    echo "       {tool_name} {usage_kwargs}" >&2
-    exit 1
-fi''')
-
-    parts.append(f'''
-JSON=$({python_path} -c "
-import json, sys, os
-names = {param_names_repr}
-defaults = {defaults_repr}
-path_params = {path_params_repr}
 args = sys.argv[1:]
-params = {{}}
 
-if any(a.startswith('--') for a in args):
-    # kwargs mode
+# Check required args
+if len(args) < REQUIRED and not any(a.startswith("--") for a in args):
+    usage_pos = " ".join(f"<{{n}}>" for n in NAMES[:REQUIRED]) + " " + " ".join(f"[{{n}}]" for n in NAMES[REQUIRED:])
+    usage_kw = " ".join(f"--{{n}} <val>" for n in NAMES)
+    print(f"Usage: {{TOOL}} {{usage_pos}}", file=sys.stderr)
+    print(f"       {{TOOL}} {{usage_kw}}", file=sys.stderr)
+    sys.exit(1)
+
+# Parse args
+params = {{}}
+if any(a.startswith("--") for a in args):
     i = 0
     while i < len(args):
-        if args[i].startswith('--') and i + 1 < len(args):
+        if args[i].startswith("--") and i + 1 < len(args):
             params[args[i][2:]] = args[i + 1]
             i += 2
         else:
             i += 1
-    for name in names:
-        if name not in params and name in defaults:
-            params[name] = defaults[name]
+    for name in NAMES:
+        if name not in params and name in DEFAULTS:
+            params[name] = DEFAULTS[name]
 else:
-    # positional mode
-    for i, name in enumerate(names):
+    for i, name in enumerate(NAMES):
         if i < len(args):
             params[name] = args[i]
-        elif name in defaults:
-            params[name] = defaults[name]
+        elif name in DEFAULTS:
+            params[name] = DEFAULTS[name]
 
-# Resolve path params to absolute (agent cwd may differ from tool server cwd)
-for name in path_params:
+# Resolve path params
+for name in PATH_PARAMS:
     if name in params and isinstance(params[name], str):
         params[name] = os.path.abspath(params[name])
 
-print(json.dumps(params))
-" "$@")
-
-curl -s -X POST "http://127.0.0.1:{port}/{tool_name}" \\
-    -H "Content-Type: application/json" -d "$JSON" \\
-| {python_path} -c "
-import sys, json
-r = json.load(sys.stdin)
-if r['success']:
-    print(r['output'])
-else:
-    print(r.get('error', 'Error'), file=sys.stderr)
+# POST to tool server
+data = json.dumps(params).encode()
+req = urllib.request.Request(
+    f"http://127.0.0.1:{{PORT}}/{{TOOL}}",
+    data=data,
+    headers={{"Content-Type": "application/json"}},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(req) as resp:
+        r = json.loads(resp.read())
+except Exception as e:
+    print(f"Error calling {{TOOL}}: {{e}}", file=sys.stderr)
     sys.exit(1)
-"''')
 
-    return "\n".join(parts) + "\n"
+if r["success"]:
+    print(r["output"])
+else:
+    print(r.get("error", "Error"), file=sys.stderr)
+    sys.exit(1)
+'''
 
 
 def cleanup_wrappers(bin_dir: Path) -> None:
