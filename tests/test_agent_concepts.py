@@ -259,6 +259,13 @@ def test_tool_server_unknown_tool():
 
 # === Bash wrapper generation ===
 
+def _get_wrapper_path(bin_dir, name):
+    """Get the correct wrapper path for this platform."""
+    if sys.platform == "win32":
+        return bin_dir / f"{name}.cmd"
+    return bin_dir / name
+
+
 def test_wrapper_generation_positional():
     """Generated wrappers work with positional args."""
     from groundhog.agents.tool_server import ToolServer, generate_wrappers, cleanup_wrappers
@@ -273,15 +280,15 @@ def test_wrapper_generation_positional():
         port = server.start()
         generate_wrappers([tool], bin_dir, port)
 
-        wrapper = bin_dir / "double"
+        wrapper = _get_wrapper_path(bin_dir, "double")
         assert wrapper.exists()
-        assert wrapper.stat().st_mode & stat.S_IEXEC
 
         # Run wrapper with positional arg
         result = subprocess.run(
             [str(wrapper), "21"],
             capture_output=True, text=True,
             env={**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]},
+            shell=(sys.platform == "win32"),
         )
         assert result.returncode == 0
         assert result.stdout.strip() == "42"
@@ -307,13 +314,14 @@ def test_wrapper_generation_kwargs():
         port = server.start()
         generate_wrappers([tool], bin_dir, port)
 
-        wrapper = bin_dir / "greet"
+        wrapper = _get_wrapper_path(bin_dir, "greet")
 
         # Test --kwargs mode
         result = subprocess.run(
             [str(wrapper), "--name", "world", "--style", "hi"],
             capture_output=True, text=True,
             env={**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]},
+            shell=(sys.platform == "win32"),
         )
         assert result.returncode == 0
         assert result.stdout.strip() == "hi world"
