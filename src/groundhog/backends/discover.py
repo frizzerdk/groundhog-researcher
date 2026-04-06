@@ -330,12 +330,20 @@ def discover_agent_backends():
         except Exception:
             pass
 
+    if shutil.which("copilot"):
+        try:
+            from groundhog.agents.copilot import CopilotAgentBackend
+            backends["copilot"] = CopilotAgentBackend()
+        except Exception:
+            pass
+
     return backends
 
 
 _AGENT_TIER_DEFS = {
-    "default": ["claude_code", "gemini_cli"],
-    "budget":  ["gemini_cli", "claude_code"],
+    "default": ["claude_code", "copilot", "gemini_cli"],
+    "high":    ["claude_code", "copilot", "gemini_cli"],
+    "budget":  ["gemini_cli", "copilot", "claude_code"],
 }
 
 

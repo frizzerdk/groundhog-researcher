@@ -449,6 +449,192 @@ def test_eval_tool_with_bad_code():
     assert result.error  # should have error message
 
 
+# === eval_to_dir ===
+
+def test_eval_to_dir_writes_results_json():
+    """eval_to_dir writes results.json with score and metrics."""
+    from groundhog.agents.tools import eval_to_dir
+    from groundhog.base.types import EvalStage, StageResult
+
+    stage = EvalStage("validate", "Quick test",
+                       lambda code: StageResult(score=0.85, metrics={"accuracy": 0.85, "time": 1.2}))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_file = Path(tmpdir) / "solution.py"
+        test_file.write_text("SCORE = 0.85\n")
+
+        result = eval_to_dir(stage, str(test_file), str(Path(tmpdir) / "output" / "validate"))
+
+        # results.json written
+        results_path = Path(tmpdir) / "output" / "validate" / "results.json"
+        assert results_path.exists()
+        data = json.loads(results_path.read_text())
+        assert data["score"] == 0.85
+        assert data["metrics"]["accuracy"] == 0.85
+
+        # Result unchanged
+        assert result.score == 0.85
+
+
+def test_eval_to_dir_writes_artifacts():
+    """eval_to_dir writes artifacts to disk and replaces with paths."""
+    from groundhog.agents.tools import eval_to_dir
+    from groundhog.base.types import EvalStage, StageResult
+
+    stage = EvalStage("evaluate", "Full eval",
+                       lambda code: StageResult(
+                           score=0.9,
+                           metrics={"score": 0.9},
+                           artifacts={
+                               "report.txt": "detailed report here",
+                               "data.json": {"classes": [0.9, 0.8, 0.7]},
+                               "plot.png": b"\x89PNG fake image data",
+                           }))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_file = Path(tmpdir) / "solution.py"
+        test_file.write_text("pass\n")
+        out_dir = str(Path(tmpdir) / "output" / "evaluate")
+
+        result = eval_to_dir(stage, str(test_file), out_dir)
+
+        # Artifacts written to disk
+        assert (Path(out_dir) / "report.txt").exists()
+        assert (Path(out_dir) / "data.json").exists()
+        assert (Path(out_dir) / "plot.png").exists()
+
+        # Text artifact content
+        assert (Path(out_dir) / "report.txt").read_text() == "detailed report here"
+
+        # Binary artifact content
+        assert (Path(out_dir) / "plot.png").read_bytes() == b"\x89PNG fake image data"
+
+        # Result artifacts replaced with paths
+        assert "report.txt" in result.artifacts
+        assert result.artifacts["report.txt"].endswith("report.txt")
+        assert isinstance(result.artifacts["report.txt"], str)  # path, not content
+
+
+def test_eval_to_dir_does_not_mutate_original():
+    """eval_to_dir returns a copy, original StageResult untouched."""
+    from groundhog.agents.tools import eval_to_dir
+    from groundhog.base.types import EvalStage, StageResult
+
+    original_artifacts = {"data.txt": "original content"}
+    stage = EvalStage("test", "Test",
+                       lambda code: StageResult(score=1.0, artifacts=dict(original_artifacts)))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_file = Path(tmpdir) / "code.py"
+        test_file.write_text("pass\n")
+
+        result = eval_to_dir(stage, str(test_file), str(Path(tmpdir) / "out"))
+
+        # Returned result has path
+        assert result.artifacts["data.txt"].endswith("data.txt")
+
+        # Call again — original stage still returns content, not paths
+        fresh = stage.call("pass")
+        assert fresh.artifacts["data.txt"] == "original content"
+
+
+# === Cost model ===
+
+def test_cost_model_default():
+    """AgentBackend defaults to per_token."""
+    from groundhog.base.agent import AgentBackend
+    class TestBackend(AgentBackend):
+        def run(self, spec): pass
+    assert TestBackend().cost_model == "per_token"
+
+
+def test_cost_model_copilot():
+    """CopilotAgentBackend declares per_request."""
+    from groundhog.agents.copilot import CopilotAgentBackend
+    assert CopilotAgentBackend().cost_model == "per_request"
+
+
+def test_cost_model_claude():
+    """ClaudeCodeAgentBackend keeps per_token default."""
+    from groundhog.agents.claude_code import ClaudeCodeAgentBackend
+    assert ClaudeCodeAgentBackend().cost_model == "per_token"
+
+
+# === Permission translation ===
+
+def test_copilot_permission_translation():
+    """Copilot translates Claude-style permissions to its own syntax."""
+    from groundhog.agents.copilot import _translate_permission
+
+    assert _translate_permission("Bash(git:*)") == "shell(git:*)"
+    assert _translate_permission("Bash(validate)") == "shell(validate)"
+    assert _translate_permission("Write(*)") == "write"
+    assert _translate_permission("Write(workspace/*)") == "write(workspace/*)"
+    assert _translate_permission("Edit(solution.py)") == "write(solution.py)"
+    assert _translate_permission("Read(*)") == "read"
+    assert _translate_permission("Read(src/*)") == "read(src/*)"
+
+
+# === Copilot event parsing ===
+
+def test_copilot_event_summarize():
+    """Copilot event summarizer extracts key content using actual schema."""
+    from groundhog.agents.copilot import _summarize_event
+
+    # assistant.message with text
+    lines = _summarize_event({
+        "type": "assistant.message",
+        "data": {"content": "hello world", "toolRequests": []},
+    })
+    assert len(lines) == 1
+    assert lines[0]["role"] == "assistant"
+    assert lines[0]["content"] == "hello world"
+
+    # assistant.message with tool request (actual copilot schema)
+    lines = _summarize_event({
+        "type": "assistant.message",
+        "data": {
+            "content": "",
+            "toolRequests": [{
+                "toolCallId": "toolu_abc",
+                "name": "bash",
+                "arguments": {"command": "ls"},
+                "type": "function",
+            }],
+        },
+    })
+    assert len(lines) == 1
+    assert lines[0]["type"] == "tool_use"
+    assert lines[0]["tool"] == "bash"
+    assert lines[0]["input"]["command"] == "ls"
+
+    # tool.execution_complete (actual schema: result.content, toolCallId)
+    lines = _summarize_event({
+        "type": "tool.execution_complete",
+        "data": {
+            "toolCallId": "toolu_abc",
+            "result": {"content": "file.txt"},
+        },
+    })
+    assert len(lines) == 1
+    assert lines[0]["role"] == "tool_result"
+    assert lines[0]["tool_use_id"] == "toolu_abc"
+    assert lines[0]["content"] == "file.txt"
+
+    # result event
+    lines = _summarize_event({
+        "type": "result",
+        "sessionId": "sess-123",
+        "usage": {"premiumRequests": 1, "sessionDurationMs": 5000},
+    })
+    assert len(lines) == 1
+    assert lines[0]["session_id"] == "sess-123"
+
+    # ephemeral events return nothing
+    assert _summarize_event({"type": "assistant.message_delta", "data": {}}) == []
+    assert _summarize_event({"type": "session.tools_updated", "data": {}}) == []
+
+
 # === Run all tests ===
 
 if __name__ == "__main__":

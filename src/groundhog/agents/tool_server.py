@@ -119,12 +119,15 @@ def _make_handler(tools: Dict[str, AgentTool]) -> type:
 def _get_ordered_params(tool: AgentTool) -> tuple:
     """Get parameters ordered: required first, optional last.
 
-    Returns (ordered_names, required_count, defaults_dict).
+    Returns (ordered_names, required_count, defaults_dict, path_params).
+    path_params is a set of param names with type "path" — wrappers resolve
+    these to absolute paths from the agent's cwd.
     """
     params = tool.get_parameters()
     required = []
     optional = []
     defaults = {}
+    path_params = set()
 
     for name, schema in params.items():
         if "default" in schema:
@@ -132,9 +135,11 @@ def _get_ordered_params(tool: AgentTool) -> tuple:
             defaults[name] = schema["default"]
         else:
             required.append(name)
+        if schema.get("type") == "path":
+            path_params.add(name)
 
     ordered = required + optional
-    return ordered, len(required), defaults
+    return ordered, len(required), defaults, path_params
 
 
 # --- Bash wrapper generation ---
@@ -145,9 +150,9 @@ def generate_wrappers(tools: List[AgentTool], bin_dir: Path, port: int) -> None:
     python_path = sys.executable
 
     for tool in tools:
-        ordered_names, required_count, defaults = _get_ordered_params(tool)
+        ordered_names, required_count, defaults, path_params = _get_ordered_params(tool)
         script = _build_wrapper_script(
-            tool.name, ordered_names, required_count, defaults, port, python_path,
+            tool.name, ordered_names, required_count, defaults, path_params, port, python_path,
         )
         script_path = bin_dir / tool.name
         script_path.write_text(script)
@@ -159,6 +164,7 @@ def _build_wrapper_script(
     param_names: List[str],
     required_count: int,
     defaults: Dict[str, Any],
+    path_params: set,
     port: int,
     python_path: str = "python3",
 ) -> str:
@@ -166,9 +172,11 @@ def _build_wrapper_script(
 
     Auto-detects mode: if any argument starts with --, uses kwargs mode.
     Otherwise falls back to positional mode.
+    Params with type "path" are resolved to absolute paths from the agent's cwd.
     """
     param_names_repr = repr(param_names)
     defaults_repr = repr(defaults)
+    path_params_repr = repr(path_params)
 
     # Build usage strings
     usage_positional = " ".join(
@@ -192,9 +200,10 @@ fi''')
 
     parts.append(f'''
 JSON=$({python_path} -c "
-import json, sys
+import json, sys, os
 names = {param_names_repr}
 defaults = {defaults_repr}
+path_params = {path_params_repr}
 args = sys.argv[1:]
 params = {{}}
 
@@ -217,6 +226,11 @@ else:
             params[name] = args[i]
         elif name in defaults:
             params[name] = defaults[name]
+
+# Resolve path params to absolute (agent cwd may differ from tool server cwd)
+for name in path_params:
+    if name in params and isinstance(params[name], str):
+        params[name] = os.path.abspath(params[name])
 
 print(json.dumps(params))
 " "$@")
@@ -251,7 +265,7 @@ def build_tool_docs(tools: List[AgentTool]) -> str:
 
     lines = ["## Available bash tools", ""]
     for tool in tools:
-        ordered_names, required_count, defaults = _get_ordered_params(tool)
+        ordered_names, required_count, defaults, _ = _get_ordered_params(tool)
 
         # Usage line
         usage_parts = (

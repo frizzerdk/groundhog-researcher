@@ -8,7 +8,53 @@ All tools are built at optimizer init time — no workspace binding needed.
 The strategy controls which tools are available per phase via filtering.
 """
 
+import copy
+import json
+from pathlib import Path
+
 from groundhog.base.agent import agent_tool
+
+
+def eval_to_dir(stage, path, output_dir):
+    """Run eval stage on a file, write results + artifacts to output_dir.
+
+    Returns a copy of StageResult with artifacts replaced by file paths.
+    The original StageResult is not mutated (history/commit needs raw data).
+    """
+    code = Path(path).read_text(encoding="utf-8")
+    result = stage.call(code)
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Always write results.json with score + metrics
+    results_data = {"score": result.score, "metrics": result.metrics}
+    if result.errors:
+        results_data["errors"] = result.errors
+    if result.warnings:
+        results_data["warnings"] = result.warnings
+    (out / "results.json").write_text(
+        json.dumps(results_data, indent=2, default=str), encoding="utf-8")
+
+    # Write artifacts, collect paths
+    written = {}
+    for name, content in result.artifacts.items():
+        if name.startswith("_"):
+            continue
+        dest = out / name
+        if isinstance(content, bytes):
+            dest.write_bytes(content)
+        elif isinstance(content, str):
+            dest.write_text(content, encoding="utf-8")
+        else:
+            dest = out / (name if name.endswith(".json") else f"{name}.json")
+            dest.write_text(json.dumps(content, indent=2, default=str), encoding="utf-8")
+        written[name] = str(dest)
+
+    # Return copy with artifacts replaced by paths
+    out_result = copy.copy(result)
+    out_result.artifacts = written
+    return out_result
 
 
 def build_default_agent_tools(toolkit) -> list:
@@ -36,9 +82,11 @@ def build_default_agent_tools(toolkit) -> list:
             tools.append(agent_tool(
                 name=stage.name,
                 description=f"{stage.description}. Pass the path to a .py file to evaluate.",
-                func=lambda path, s=stage: s.call(open(path).read()),
+                func=lambda path, output_dir=f"workspace/output/{stage.name}", s=stage: eval_to_dir(s, path, output_dir),
                 params={
-                    "path": {"type": "str", "description": "Path to .py file to evaluate"},
+                    "path": {"type": "path", "description": "Path to .py file to evaluate"},
+                    "output_dir": {"type": "path", "default": f"workspace/output/{stage.name}",
+                                   "description": "Where to write results and artifacts"},
                 },
             ))
 

@@ -129,12 +129,14 @@ WHY the current solution scores what it does before changing anything.
 4. Edit workspace/temp_solution.py with your improvements
 5. Run `{eval_command} workspace/temp_solution.py` to evaluate
 6. Read the output carefully — understand what improved and why
-7. Iterate: keep improving workspace/temp_solution.py
+7. When you beat the current best, copy workspace/temp_solution.py to workspace/best_solution.py
+8. Iterate: keep improving workspace/temp_solution.py, save to best_solution.py when you improve
 
 ## Key Rules
 
 - solution.py is READ-ONLY — edit workspace/temp_solution.py instead
-- Your best version will be submitted to solution.py in the next phase
+- When you get a better score, save it: cp workspace/temp_solution.py workspace/best_solution.py
+- Your best_solution.py will be submitted in the next phase
 - Run `{eval_command} <path>` to evaluate any .py file
 - Focus on understanding before changing — blind edits waste iterations
 - workspace/ is yours for experiments and analysis scripts
@@ -148,8 +150,9 @@ SUBMIT_PROMPT = """\
 Your exploration phase is over. Time to submit your best solution.
 
 1. Review the scores from your evaluation runs during this session
-2. Ensure workspace/temp_solution.py contains your best version
-3. Copy it to solution.py — you now have write access
+2. Ensure workspace/best_solution.py contains your highest-scoring version
+3. If best_solution.py doesn't exist, copy your best from temp_solution.py
+4. Copy workspace/best_solution.py to solution.py — you now have write access
 
 Do NOT run any more experiments or modify learnings.md. \
 Just make sure solution.py has your best work."""
@@ -169,6 +172,58 @@ Write a retrospective in learnings.md about this session:
 - Any promising directions you didn't have time to explore?
 
 Do not modify solution.py."""
+
+# Per-request explore prompt — agent does everything in one call
+EXPLORE_PROMPT_FULL = """\
+{session_header}
+
+You are an expert code optimizer. You work iteratively using tools.
+
+## Task
+
+{task_context}
+
+## Workflow
+
+You have one session to improve the solution. Use it well: understand
+WHY the current solution scores what it does before changing anything.
+
+1. Read TASK_CONTEXT.md for the full problem description
+2. Read solution.py — the current best approach (READ-ONLY)
+3. Run `get-learnings` for accumulated knowledge from previous runs
+4. Edit workspace/temp_solution.py with your improvements
+5. Run `{eval_command} workspace/temp_solution.py` to evaluate
+6. Read the output carefully — understand what improved and why
+7. When you beat the current best, save it: cp workspace/temp_solution.py workspace/best_solution.py
+8. Iterate: keep improving temp_solution.py, save to best_solution.py when you improve
+9. When done, write what you learned to workspace/learnings.md — brief, actionable notes
+
+## Key Rules
+
+- solution.py is READ-ONLY — edit workspace/temp_solution.py instead
+- When you get a better score, save it: cp workspace/temp_solution.py workspace/best_solution.py
+- workspace/best_solution.py will be submitted as your final solution
+- workspace/learnings.md will be saved for future runs
+- Run `{eval_command} <path>` to evaluate any .py file
+- Focus on understanding before changing — blind edits waste iterations
+- workspace/ is yours for experiments and analysis scripts
+{budget_info}{guidance}
+
+## Files
+
+{file_listing}"""
+
+PATCH_SOLUTION_PROMPT = """\
+Look at the agent's work in workspace/ and the evaluation logs.
+Find the best-performing version and save it to workspace/best_solution.py.
+If workspace/temp_solution.py is the only version, copy it to workspace/best_solution.py."""
+
+PATCH_LEARNINGS_PROMPT = """\
+Write a brief retrospective to workspace/learnings.md about the work done so far.
+Look at the evaluation results and any changes in workspace/.
+- What was tried? What scores?
+- What worked? What didn't?
+- What to try next?"""
 
 
 class AgentStrategy(Strategy):
@@ -193,19 +248,50 @@ class AgentStrategy(Strategy):
         try:
             self._prepare_workspace(toolkit, ws, prior)
 
-            session_id = self._explore(toolkit, ws, prior)
-            self._submit(toolkit, ws, session_id)
-            result = self._evaluate(toolkit, ws)
-            result = self._fix_loop(toolkit, ws, session_id, result)
-            self._reflect(toolkit, ws, session_id)
-            self._log_conversation(ws)
-
-            attempt = ws.commit(result, metadata=self._build_metadata(prior))
-            return self._build_log(attempt, prior, result, toolkit)
+            backend = toolkit.agent.get("default")
+            if backend.cost_model == "per_request":
+                return self._run_per_request(toolkit, ws, prior)
+            else:
+                return self._run_per_token(toolkit, ws, prior)
 
         except Exception as e:
             ws.abort()
             return {"skipped": f"agent error: {e}"}
+
+    # --- Execution paths ---
+
+    def _run_per_token(self, toolkit, ws, prior):
+        """Multi-phase: explore → submit → evaluate → fix → reflect."""
+        session_id = self._explore(toolkit, ws, prior)
+        self._submit(toolkit, ws, session_id)
+        result = self._evaluate(toolkit, ws)
+        result = self._fix_loop(toolkit, ws, session_id, result)
+        self._reflect(toolkit, ws, session_id)
+        self._log_conversation(ws)
+
+        attempt = ws.commit(result, metadata=self._build_metadata(prior))
+        return self._build_log(attempt, prior, result, toolkit)
+
+    def _run_per_request(self, toolkit, ws, prior):
+        """Single explore call + verify/patch with cheap models."""
+        session_id = self._explore_full(toolkit, ws, prior)
+        self._log_conversation(ws)
+
+        # Copy best solution to solution.py (best_solution > temp_solution > patch)
+        self._submit_best(toolkit, ws)
+
+        # Evaluate
+        result = self._evaluate(toolkit, ws)
+
+        # Fix if needed
+        if not result.completed:
+            result = self._fix_loop(toolkit, ws, session_id, result)
+
+        # Collect learnings
+        self._collect_learnings(toolkit, ws)
+
+        attempt = ws.commit(result, metadata=self._build_metadata(prior))
+        return self._build_log(attempt, prior, result, toolkit)
 
     # --- Init ---
 
@@ -329,8 +415,118 @@ class AgentStrategy(Strategy):
 
         return result.session_id
 
+    def _explore_full(self, toolkit, ws, prior):
+        """Per-request explore — agent does everything in one call."""
+        if prior:
+            prior_score = self._score_result(prior.result, toolkit)
+            session_header = f"[{toolkit.task.name} #{ws.number}] prior=#{prior.number} score={prior_score:.4f}"
+        else:
+            session_header = f"[{toolkit.task.name} #{ws.number}] fresh start"
+
+        eval_command = self._get_eval_command(toolkit)
+        budget_info = ""
+        if self.cfg.timeout:
+            minutes = self.cfg.timeout // 60
+            budget_info = f"\n- Time limit: ~{minutes} minutes."
+        guidance = f"\n\n## Additional Guidance\n{self.cfg.guidance}" if self.cfg.guidance else ""
+
+        goal = EXPLORE_PROMPT_FULL.format(
+            session_header=session_header,
+            task_context=toolkit.task.context.get(),
+            eval_command=eval_command,
+            budget_info=budget_info,
+            guidance=guidance,
+            file_listing=self._build_file_listing(ws),
+        )
+
+        self.log.start(f"--- Agent (per-request) | {'prior=#' + str(prior.number) if prior else 'fresh'}")
+
+        tools = self._get_tools(toolkit, phase="explore")
+        allow, deny = _resolve_permissions("explore")
+
+        spec = AgentSpec(
+            goal=goal,
+            workspace_path=ws.path,
+            tools=tools,
+            model=self.cfg.model,
+            effort=self.cfg.effort,
+            allowed_tools=allow,
+            denied_tools=deny,
+            timeout=self.cfg.timeout,
+        )
+        result = toolkit.agent.get("high").run(spec)
+        self.cost += result.cost
+        self.log.tock()
+
+        return result.session_id
+
+    def _patch(self, toolkit, ws, prompt):
+        """Cheap agent call to fix a missed step (copy solution, write learnings)."""
+        self.log.inline("patch... ")
+        allow, deny = _resolve_permissions("explore")
+        spec = AgentSpec(
+            goal=prompt,
+            workspace_path=ws.path,
+            tools=[],
+            allowed_tools=allow,
+            denied_tools=deny,
+            timeout=60,
+        )
+        # Use budget tier for cheap patching
+        tier = "budget" if "budget" in toolkit.agent._tiers else "default"
+        result = toolkit.agent.get(tier).run(spec)
+        self.cost += result.cost
+        self.log.tock()
+
+    def _submit_best(self, toolkit, ws):
+        """Copy the best workspace solution to solution.py.
+
+        Priority: best_solution.py > temp_solution.py > patch with cheap model.
+        """
+        best = ws.path / "workspace" / "best_solution.py"
+        temp = ws.path / "workspace" / "temp_solution.py"
+        prior = ws.path / "solution.py"
+
+        if best.exists():
+            (ws.path / "solution.py").write_text(best.read_text(encoding="utf-8"), encoding="utf-8")
+        elif temp.exists():
+            # Check if temp was actually modified (not just the prior copy)
+            temp_code = temp.read_text(encoding="utf-8")
+            prior_code = prior.read_text(encoding="utf-8") if prior.exists() else ""
+            if temp_code != prior_code:
+                (ws.path / "solution.py").write_text(temp_code, encoding="utf-8")
+            else:
+                # Agent didn't modify anything — patch with cheap model
+                self._patch(toolkit, ws, PATCH_SOLUTION_PROMPT)
+                if (ws.path / "workspace" / "best_solution.py").exists():
+                    (ws.path / "solution.py").write_text(
+                        (ws.path / "workspace" / "best_solution.py").read_text(encoding="utf-8"),
+                        encoding="utf-8")
+        else:
+            self._patch(toolkit, ws, PATCH_SOLUTION_PROMPT)
+            if (ws.path / "workspace" / "best_solution.py").exists():
+                (ws.path / "solution.py").write_text(
+                    (ws.path / "workspace" / "best_solution.py").read_text(encoding="utf-8"),
+                    encoding="utf-8")
+
+    def _collect_learnings(self, toolkit, ws):
+        """Read learnings from workspace, patch with cheap model if missing."""
+        learnings_path = ws.path / "workspace" / "learnings.md"
+        if learnings_path.exists():
+            text = learnings_path.read_text(encoding="utf-8").strip()
+            if text and hasattr(toolkit, 'learnings'):
+                toolkit.learnings.add(text)
+                return
+
+        # Patch: cheap agent to write learnings
+        self._patch(toolkit, ws, PATCH_LEARNINGS_PROMPT)
+        if learnings_path.exists() and hasattr(toolkit, 'learnings'):
+            text = learnings_path.read_text(encoding="utf-8").strip()
+            if text:
+                toolkit.learnings.add(text)
+
     def _submit(self, toolkit, ws, session_id):
-        """Agent finalizes best solution into solution.py."""
+        """Agent finalizes best solution into solution.py (per-token path)."""
         allow, deny = _resolve_permissions("submit")
         spec = AgentSpec(
             goal=SUBMIT_PROMPT,

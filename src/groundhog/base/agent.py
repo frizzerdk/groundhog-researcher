@@ -30,6 +30,7 @@ class ToolResult:
 # Type coercion map: string name -> converter function
 _TYPE_COERCIONS = {
     "str": str,
+    "path": str,  # resolved to absolute in bash wrapper, passed as string
     "int": int,
     "float": float,
     "bool": lambda v: v.lower() in ("true", "1", "yes") if isinstance(v, str) else bool(v),
@@ -154,7 +155,12 @@ class AgentBackend(ABC):
     Unlike LLMBackend (single-turn text generation), an AgentBackend runs
     a multi-turn session where the agent reasons, calls tools, and acts
     autonomously. Each run() call is one job — the strategy decides phasing.
+
+    cost_model: how the backend charges. Strategy adapts execution pattern:
+        "per_token"   — cost scales with work. Multi-phase calls are fine.
+        "per_request" — fixed cost per call. One big call is cheapest.
     """
+    cost_model: str = "per_token"
 
     @abstractmethod
     def run(self, spec: AgentSpec) -> AgentResult: ...

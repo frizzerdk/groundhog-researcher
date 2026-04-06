@@ -23,7 +23,9 @@ jobs:
         run: uv python install ${{ matrix.python }}
 
       - name: Run tests
-        run: uv run python tests/test_concepts.py
+        run: |
+          uv run python tests/test_concepts.py
+          uv run python tests/test_agent_concepts.py
 
       - name: Build package
         run: uv build
