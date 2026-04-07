@@ -1,4 +1,4 @@
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 # Base types and interfaces
 from groundhog.base import (

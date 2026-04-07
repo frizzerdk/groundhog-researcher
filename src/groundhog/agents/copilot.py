@@ -111,6 +111,10 @@ class CopilotAgentBackend(AgentBackend):
         env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
         if port is not None:
             env["TOOL_SERVER_PORT"] = str(port)
+        # Ensure tool wrapper scripts use UTF-8 on Windows (default cp1252 crashes
+        # on unicode characters like em dashes or degree symbols in output)
+        if os.name == "nt":
+            env.setdefault("PYTHONIOENCODING", "utf-8")
         env.update(spec.env)
         return env
 
@@ -120,6 +124,12 @@ class CopilotAgentBackend(AgentBackend):
         if docs:
             return spec.goal + "\n\n" + docs
         return spec.goal
+
+    # Copilot builtin tools that the agent may need
+    BUILTIN_TOOLS = [
+        "view", "edit", "create", "glob", "grep", "powershell",
+        "report_intent", "task_complete",
+    ]
 
     def _build_command(self, spec: AgentSpec) -> list:
         model = spec.model or self.model
@@ -131,27 +141,34 @@ class CopilotAgentBackend(AgentBackend):
             "--output-format", "json",
             "--model", model,
             "--reasoning-effort", effort,
+            "--autopilot",
         ]
 
         if spec.session_id:
             cmd += ["--resume", spec.session_id]
 
-        # Translate and apply permission rules
-        allow_rules = [_translate_permission(r) for r in spec.allowed_tools]
-        deny_rules = [_translate_permission(r) for r in spec.denied_tools]
-
-        # Add tool-specific shell permissions
+        # Whitelist available tools: copilot builtins + tool-server wrappers.
+        # This controls what tools the model can SEE.
+        available = list(self.BUILTIN_TOOLS)
         for tool in spec.tools:
-            allow_rules.append(f"shell({tool.name}:*)")
-            allow_rules.append(f"shell({tool.name})")
+            available.append(tool.name)
+        cmd += ["--available-tools", ",".join(available)]
 
-        if allow_rules:
-            for rule in allow_rules:
-                cmd += ["--allow-tool", rule]
+        # --allow-all-tools is required for non-interactive (pipe/json) mode.
+        # Individual --allow-tool flags only suppress the confirmation prompt
+        # in interactive mode; in pipe mode tools silently don't execute.
+        cmd.append("--allow-all-tools")
 
-        if deny_rules:
-            for rule in deny_rules:
-                cmd += ["--deny-tool", rule]
+        # Deny rules for specific files (e.g. solution.py during explore phase).
+        # Only translate path-specific denies — blanket denies like Write(*)
+        # would block all writes since copilot doesn't support "deny broad,
+        # allow specific" patterns.
+        for rule in spec.denied_tools:
+            translated = _translate_permission(rule)
+            # Skip blanket denies — they'd override --allow-all-tools
+            if translated in ("write", "read", "shell"):
+                continue
+            cmd += ["--deny-tool", translated]
 
         return cmd
 

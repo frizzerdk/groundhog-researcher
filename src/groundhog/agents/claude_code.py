@@ -75,6 +75,10 @@ class ClaudeCodeAgentBackend(AgentBackend):
         env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
         if port is not None:
             env["TOOL_SERVER_PORT"] = str(port)
+        # Ensure tool wrapper scripts use UTF-8 on Windows (default cp1252 crashes
+        # on unicode characters like em dashes or degree symbols in output)
+        if os.name == "nt":
+            env.setdefault("PYTHONIOENCODING", "utf-8")
         env.update(spec.env)
         return env
 

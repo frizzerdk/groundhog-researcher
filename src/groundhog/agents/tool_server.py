@@ -166,7 +166,10 @@ def generate_wrappers(tools: List[AgentTool], bin_dir: Path, port: int) -> None:
             py_path = bin_dir / f"{tool.name}.py"
             py_path.write_text(py_script, encoding="utf-8")
             cmd_path = bin_dir / f"{tool.name}.cmd"
-            cmd_path.write_text(f'@"{python_path}" "%~dp0{tool.name}.py" %*\n', encoding="utf-8")
+            cmd_path.write_text(
+                f'@set PYTHONIOENCODING=utf-8\n@"{python_path}" "%~dp0{tool.name}.py" %*\n',
+                encoding="utf-8",
+            )
         else:
             # Write executable Python script with shebang
             script_path = bin_dir / tool.name
