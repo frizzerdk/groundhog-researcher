@@ -460,7 +460,7 @@ def test_eval_tool_with_bad_code():
 # === eval_to_dir ===
 
 def test_eval_to_dir_writes_results_json():
-    """eval_to_dir writes results.json with score and metrics."""
+    """eval_to_dir writes results.json and returns formatted string."""
     from groundhog.agents.tools import eval_to_dir
     from groundhog.base.types import EvalStage, StageResult
 
@@ -480,12 +480,13 @@ def test_eval_to_dir_writes_results_json():
         assert data["score"] == 0.85
         assert data["metrics"]["accuracy"] == 0.85
 
-        # Result unchanged
-        assert result.score == 0.85
+        # Returns formatted string with metrics
+        assert isinstance(result, str)
+        assert "accuracy" in result
 
 
 def test_eval_to_dir_writes_artifacts():
-    """eval_to_dir writes artifacts to disk and replaces with paths."""
+    """eval_to_dir writes artifacts to disk and lists paths in output."""
     from groundhog.agents.tools import eval_to_dir
     from groundhog.base.types import EvalStage, StageResult
 
@@ -517,14 +518,14 @@ def test_eval_to_dir_writes_artifacts():
         # Binary artifact content
         assert (Path(out_dir) / "plot.png").read_bytes() == b"\x89PNG fake image data"
 
-        # Result artifacts replaced with paths
-        assert "report.txt" in result.artifacts
-        assert result.artifacts["report.txt"].endswith("report.txt")
-        assert isinstance(result.artifacts["report.txt"], str)  # path, not content
+        # Formatted output lists artifact paths
+        assert isinstance(result, str)
+        assert "Artifacts:" in result
+        assert "report.txt" in result
 
 
 def test_eval_to_dir_does_not_mutate_original():
-    """eval_to_dir returns a copy, original StageResult untouched."""
+    """eval_to_dir does not mutate the original StageResult."""
     from groundhog.agents.tools import eval_to_dir
     from groundhog.base.types import EvalStage, StageResult
 
@@ -538,8 +539,8 @@ def test_eval_to_dir_does_not_mutate_original():
 
         result = eval_to_dir(stage, str(test_file), str(Path(tmpdir) / "out"))
 
-        # Returned result has path
-        assert result.artifacts["data.txt"].endswith("data.txt")
+        # Returns formatted string
+        assert isinstance(result, str)
 
         # Call again — original stage still returns content, not paths
         fresh = stage.call("pass")
