@@ -210,6 +210,12 @@ class CopilotAgentBackend(AgentBackend):
                         summary_file.write(json.dumps(summary_line) + "\n")
                     summary_file.flush()
 
+                    if spec.on_event:
+                        try:
+                            spec.on_event(event)
+                        except Exception:
+                            pass
+
                     if deadline and time.monotonic() > deadline:
                         proc.kill()
                         raise TimeoutError(f"Agent timed out after {spec.timeout}s")

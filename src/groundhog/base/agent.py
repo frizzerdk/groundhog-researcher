@@ -132,6 +132,7 @@ class AgentSpec:
     budget_usd: Optional[float] = None      # cost cap — backend enforces if supported
     session_id: Optional[str] = None        # for resume — opaque, backend interprets
     env: Dict[str, str] = field(default_factory=dict)
+    on_event: Optional[Callable] = None     # callback(event_dict) for live progress
 
 
 @dataclass

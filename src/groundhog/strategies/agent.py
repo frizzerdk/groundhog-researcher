@@ -301,6 +301,40 @@ class AgentStrategy(Strategy):
         self.through = self.cfg.eval_through or getattr(toolkit, 'through', None)
         self.log = toolkit.log if hasattr(toolkit, 'log') else StrategyLog()
         self.cost = 0.0
+        self._last_event_text = None
+
+    def _on_event(self, event):
+        """Live progress callback for agent events. Prints inline updates."""
+        event_type = event.get("type")
+        data = event.get("data", {})
+
+        if event_type == "assistant.message":
+            content = data.get("content", "")
+            if content and content.strip():
+                # Show first line of agent's reasoning, truncated
+                first_line = content.strip().split("\n")[0][:80]
+                if first_line != self._last_event_text:
+                    self._last_event_text = first_line
+                    self.log.inline(f"\n{self.log.INDENT}  > {first_line}")
+
+        elif event_type == "tool.execution_start":
+            tool_name = data.get("toolName", "")
+            if tool_name in ("report_intent",):
+                return
+            args = data.get("arguments", {})
+            # Compact tool summary
+            if tool_name in ("view", "glob", "grep"):
+                detail = args.get("path", "")[:60]
+            elif tool_name == "powershell":
+                detail = args.get("command", "")[:60]
+            elif tool_name == "edit":
+                detail = args.get("path", "").split("\\")[-1].split("/")[-1]
+            elif tool_name == "create":
+                detail = args.get("path", "").split("\\")[-1].split("/")[-1]
+            else:
+                detail = ""
+            summary = f"{tool_name}" + (f" {detail}" if detail else "")
+            self.log.inline(f"\n{self.log.INDENT}  [{summary}]")
 
     # --- Selection ---
 
@@ -408,6 +442,7 @@ class AgentStrategy(Strategy):
             denied_tools=deny,
             timeout=self.cfg.timeout,
             budget_usd=self.cfg.budget_usd,
+            on_event=self._on_event,
         )
         result = toolkit.agent.get("default").run(spec)
         self.cost += result.cost
@@ -453,6 +488,7 @@ class AgentStrategy(Strategy):
             allowed_tools=allow,
             denied_tools=deny,
             timeout=self.cfg.timeout,
+            on_event=self._on_event,
         )
         result = toolkit.agent.get("high").run(spec)
         self.cost += result.cost

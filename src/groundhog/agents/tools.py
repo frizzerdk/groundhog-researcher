@@ -15,12 +15,8 @@ from pathlib import Path
 from groundhog.base.agent import agent_tool
 
 
-def _format_eval_result(result, output_dir):
-    """Format a StageResult into a readable string for the agent.
-
-    Includes metrics, errors, warnings, and paths to generated artifacts
-    (images, G-code, etc.) that the agent can view.
-    """
+def _format_eval_result(result):
+    """Format a StageResult into a readable string for the agent."""
     lines = []
 
     # Score and key metrics
@@ -46,12 +42,12 @@ def _format_eval_result(result, output_dir):
         for key, msg in result.warnings.items():
             lines.append(f"  {key}: {msg}")
 
-    # Artifacts
+    # Artifacts — list paths so the agent knows they exist
     if result.artifacts:
         lines.append("")
-        lines.append("ARTIFACTS (use 'view' to inspect images):")
+        lines.append("Artifacts:")
         for name, path in result.artifacts.items():
-            lines.append(f"  {name}: {path}")
+            lines.append(f"  {path}")
 
     return "\n".join(lines)
 
@@ -59,9 +55,8 @@ def _format_eval_result(result, output_dir):
 def eval_to_dir(stage, path, output_dir):
     """Run eval stage on a file, write results + artifacts to output_dir.
 
-    Returns a formatted string with metrics, errors, warnings, and artifact
-    paths. Artifacts (images, G-code) are written to output_dir and can be
-    viewed by the agent.
+    Returns a formatted string with metrics, errors, warnings, and paths
+    to any generated artifacts.
     """
     code = Path(path).read_text(encoding="utf-8")
     result = stage.call(code)
@@ -96,7 +91,7 @@ def eval_to_dir(stage, path, output_dir):
     # Return copy with artifacts replaced by paths, and format for agent
     out_result = copy.copy(result)
     out_result.artifacts = written
-    return _format_eval_result(out_result, out)
+    return _format_eval_result(out_result)
 
 
 def build_default_agent_tools(toolkit) -> list:
@@ -112,8 +107,8 @@ def build_default_agent_tools(toolkit) -> list:
             name="get-learnings",
             description=(
                 "Read accumulated learnings from previous optimization runs. "
-                "Returns brief notes about what worked, what didn't, confirmed "
-                "dead-ends, and key thresholds. Check this before starting work."
+                "Returns notes about what worked, what didn't, dead-ends, "
+                "and key thresholds."
             ),
             func=toolkit.learnings.get,
             params={
@@ -125,25 +120,23 @@ def build_default_agent_tools(toolkit) -> list:
         ))
 
     if hasattr(toolkit, 'task'):
-        through = getattr(toolkit, 'through', None)
+        through = getattr(toolkit, 'agent_through', None) or getattr(toolkit, 'through', None)
         for stage in toolkit.task.evaluator.eval_stages(toolkit.task.data, through=through):
+            description = (
+                f"{stage.description}. "
+                f"Returns score, metrics, errors/warnings, and paths to "
+                f"any generated artifacts."
+            )
             tools.append(agent_tool(
                 name=stage.name,
-                description=(
-                    f"{stage.description}. "
-                    f"Evaluates a .py file and returns: score, detailed metrics, "
-                    f"errors/warnings, and paths to generated artifacts (images, "
-                    f"G-code, etc.) in the output directory. "
-                    f"Use 'view' on artifact images (e.g. comparison.png, final.png) "
-                    f"to visually inspect results."
-                ),
+                description=description,
                 func=lambda path, output_dir=f"workspace/output/{stage.name}", s=stage: eval_to_dir(s, path, output_dir),
                 params={
                     "path": {"type": "path",
                              "description": "Path to the .py file to evaluate"},
                     "output_dir": {"type": "path",
                                    "default": f"workspace/output/{stage.name}",
-                                   "description": "Directory for results.json and artifact files"},
+                                   "description": "Directory for results and artifacts"},
                 },
             ))
 

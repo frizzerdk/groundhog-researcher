@@ -40,11 +40,13 @@ class SimpleOptimizer(Optimizer):
                  history: Optional[AttemptHistory] = None,
                  learnings: Optional[Learnings] = None,
                  through: Optional[str] = None,
+                 agent_through: Optional[str] = None,
                  seed_strategy="default"):
         from groundhog.strategies.fresh import FreshApproach
         self.task = task
         self.seed = seed
         self.through = through
+        self.agent_through = agent_through
         self.path = Path(path) if path else Path(".")
         self.history = history or FolderAttemptHistory(self.path)
         self.learnings = learnings or MarkdownLearnings(self.path)
@@ -85,7 +87,12 @@ class SimpleOptimizer(Optimizer):
         if agent_registry:
             self.toolkit.agent = agent_registry
 
-        # Default agent tools from toolkit capabilities
+        # Default agent tools from toolkit capabilities.
+        # agent_through limits which eval stages the agent gets as tools
+        # (e.g. "validate" for fast iteration), independent of `through`
+        # which controls final scoring.
+        if self.agent_through:
+            self.toolkit.agent_through = self.agent_through
         from groundhog.agents.tools import build_default_agent_tools
         self.toolkit.agent_tools = build_default_agent_tools(self.toolkit)
 
@@ -281,17 +288,29 @@ class SimpleOptimizer(Optimizer):
                 if strategy:
                     config = queue_item.get("config")
                     self.toolkit.log.info(f"[queue] {strategy_name} from {queue_item.get('source', '?')}")
-                    count_before = len(self.history.list())
-                    strategy(self.toolkit, config=config)
                 else:
                     self.toolkit.log.info(f"[queue] unknown strategy: {strategy_name}, skipping")
                     strategy = next(rotation)
-                    count_before = len(self.history.list())
-                    strategy(self.toolkit)
+                    config = None
             else:
                 strategy = next(rotation)
-                count_before = len(self.history.list())
-                strategy(self.toolkit)
+                config = None
+
+            count_before = len(self.history.list())
+            try:
+                if config is not None:
+                    strategy(self.toolkit, config=config)
+                else:
+                    strategy(self.toolkit)
+            except KeyboardInterrupt:
+                self.toolkit.log.end()
+                print(f"\n  Interrupted by user")
+                break
+            except Exception as e:
+                self.toolkit.log.end()
+                strategy_name = strategy.__class__.__name__
+                print(f"\n  [{strategy_name}] ERROR: {e}")
+                continue
             self.toolkit.log.end()
 
             # Some strategies (Analyse) don't create attempts
