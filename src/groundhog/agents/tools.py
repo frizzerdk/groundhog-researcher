@@ -144,8 +144,11 @@ def build_default_agent_tools(toolkit) -> list:
             tools.append(agent_tool(
                 name=stage.name,
                 description=description,
-                func=lambda path="work/solution.py", output_dir="work/artifacts",
-                       s=stage, p=prefix: eval_to_dir(s, path, output_dir, prefix=p),
+                func=lambda path="work/solution.py",
+                       s=stage, p=prefix: eval_to_dir(
+                           s, path,
+                           str(Path(path).parent / "artifacts"),
+                           prefix=p),
                 params={
                     "path": {"type": "path", "default": "work/solution.py",
                              "description": "Path to .py file to evaluate (default: work/solution.py)"},

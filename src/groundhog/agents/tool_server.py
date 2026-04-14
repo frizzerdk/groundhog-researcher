@@ -162,12 +162,20 @@ def generate_wrappers(tools: List[AgentTool], bin_dir: Path, port: int) -> None:
         )
 
         if is_windows:
-            # Write .py script + .cmd launcher
+            # Write .py script + .cmd launcher (for cmd.exe)
             py_path = bin_dir / f"{tool.name}.py"
             py_path.write_text(py_script, encoding="utf-8")
             cmd_path = bin_dir / f"{tool.name}.cmd"
             cmd_path.write_text(
                 f'@set PYTHONIOENCODING=utf-8\n@"{python_path}" "%~dp0{tool.name}.py" %*\n',
+                encoding="utf-8",
+            )
+            # Extensionless bash wrapper for Git Bash (Claude Code on Windows)
+            bash_path = bin_dir / tool.name
+            bash_python = python_path.replace("\\", "/")
+            bash_path.write_text(
+                f'#!/bin/bash\nexport PYTHONIOENCODING=utf-8\n'
+                f'exec "{bash_python}" "$(dirname "$0")/{tool.name}.py" "$@"\n',
                 encoding="utf-8",
             )
         else:
