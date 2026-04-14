@@ -39,6 +39,17 @@ class Attempt(ABC):
     @abstractmethod
     def metadata(self) -> dict: ...
 
+    @abstractmethod
+    def list_files(self) -> List[str]:
+        """List all files in this attempt (relative paths)."""
+        ...
+
+    @abstractmethod
+    def read_file(self, path: str) -> Optional[str]:
+        """Read a text file from this attempt. Returns None if not found.
+        Returns a placeholder for binary files."""
+        ...
+
 
 class Workspace(ABC):
     """A working directory for one attempt. Start → work → commit or abort."""
@@ -47,8 +58,8 @@ class Workspace(ABC):
     path: Path
 
     @abstractmethod
-    def commit(self, result: EvaluationResult, metadata: Optional[dict] = None) -> Attempt:
-        """Finalize this workspace as an immutable attempt."""
+    def commit(self, success: bool = True) -> Attempt:
+        """Mark this workspace as a completed attempt. No going back."""
         ...
 
     @abstractmethod
@@ -66,7 +77,7 @@ class AttemptHistory(ABC):
         ...
 
     @abstractmethod
-    def list(self) -> List[Attempt]: ...
+    def list(self, only_done: bool = True) -> List[Attempt]: ...
 
     @abstractmethod
     def get(self, number: int) -> Optional[Attempt]: ...

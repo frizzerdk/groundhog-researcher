@@ -75,6 +75,11 @@ class Context(ABC):
     def get(self) -> str:
         return f"{self.get_brief()}\n\n{self.get_extended()}"
 
+    def get_scoring(self) -> str:
+        """Optional: describe the scoring function for the agent prompt.
+        Override to explain how score is computed, what matters most, etc."""
+        return ""
+
 
 class Evaluator(ABC):
     """Evaluates code: E(code_or_path, D) -> StageResult.

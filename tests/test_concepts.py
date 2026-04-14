@@ -35,6 +35,7 @@ from groundhog import (
     EvalStage, StageResult, EvaluationResult,
     Toolkit, SimpleOptimizer, FolderAttemptHistory,
 )
+from groundhog.utils.results import write_result
 
 
 # === Test fixtures ===
@@ -219,7 +220,9 @@ def test_attempt_history_stores_no_scores():
         ws = history.workspace()
         (ws.path / "solution.py").write_text(make_code(50.0))
         result = task.evaluate(make_code(50.0))
-        attempt = ws.commit(result)
+        write_result(ws.path, result)
+
+        attempt = ws.commit(success=result.completed)
 
         # Read raw JSON — no "score" key at stage level
         raw = json.loads((attempt.path / "result.json").read_text())
@@ -234,7 +237,9 @@ def test_attempt_history_is_immutable():
         ws = history.workspace()
         (ws.path / "solution.py").write_text(make_code(50.0))
         result = EvaluationResult(stages={"eval": StageResult(metrics={"x": 1.0})})
-        attempt = ws.commit(result)
+        write_result(ws.path, result)
+
+        attempt = ws.commit(success=result.completed)
 
         code_before = attempt.code
         result_before = attempt.result
@@ -251,15 +256,18 @@ def test_attempt_history_tree_structure():
 
         ws1 = history.workspace(parent=None)
         (ws1.path / "solution.py").write_text("v1")
-        a1 = ws1.commit(result)
+        write_result(ws1.path, result)
+        a1 = ws1.commit(success=True)
 
         ws2 = history.workspace(parent=a1.number)
         (ws2.path / "solution.py").write_text("v2")
-        a2 = ws2.commit(result)
+        write_result(ws2.path, result)
+        a2 = ws2.commit(success=True)
 
         ws3 = history.workspace(parent=a1.number)
         (ws3.path / "solution.py").write_text("v3")
-        a3 = ws3.commit(result)
+        write_result(ws3.path, result)
+        a3 = ws3.commit(success=True)
 
         assert a1.parent is None
         assert a2.parent == a1.number
@@ -273,15 +281,18 @@ def test_attempt_history_lineage():
 
         ws1 = history.workspace()
         (ws1.path / "solution.py").write_text("v1")
-        a1 = ws1.commit(result)
+        write_result(ws1.path, result)
+        a1 = ws1.commit(success=True)
 
         ws2 = history.workspace(parent=a1.number)
         (ws2.path / "solution.py").write_text("v2")
-        a2 = ws2.commit(result)
+        write_result(ws2.path, result)
+        a2 = ws2.commit(success=True)
 
         ws3 = history.workspace(parent=a2.number)
         (ws3.path / "solution.py").write_text("v3")
-        a3 = ws3.commit(result)
+        write_result(ws3.path, result)
+        a3 = ws3.commit(success=True)
 
         chain = history.lineage(a3)
         assert [a.number for a in chain] == [1, 2, 3]
@@ -297,7 +308,9 @@ def test_attempt_history_best_uses_scorer():
             result = EvaluationResult(stages={
                 "eval": StageResult(metrics={"value": val, "distance": abs(val - 50)})
             })
-            ws.commit(result)
+            write_result(ws.path, result)
+
+            ws.commit(success=result.completed)
 
         # Scorer: closest to 50
         best_close = history.best(lambda r: -r.metrics.get("distance", 100))
@@ -319,10 +332,12 @@ def test_attempt_history_records_failed_attempts():
             completed=False,
             failed_stage="smoke",
         )
-        ws.commit(result)
+        write_result(ws.path, result)
 
-        assert len(history.list()) == 1
-        assert history.list()[0].result.completed is False
+        ws.commit(success=result.completed)
+
+        assert len(history.list(only_done=False)) == 1
+        assert history.list(only_done=False)[0].result.completed is False
 
 
 # === Workspace (attempt_history.py) ===
@@ -345,7 +360,9 @@ def test_workspace_commit_finalizes():
         ws = history.workspace()
         (ws.path / "solution.py").write_text(make_code(42))
         result = EvaluationResult(stages={"eval": StageResult(metrics={"x": 1.0})})
-        ws.commit(result)
+        write_result(ws.path, result)
+
+        ws.commit(success=result.completed)
 
         assert len(history.list()) == 1
 
@@ -403,7 +420,9 @@ def test_strategy_return_is_not_depended_on():
                 ws = toolkit.history.workspace()
                 (ws.path / "solution.py").write_text(make_code(50.0))
                 result = toolkit.task.evaluate(make_code(50.0))
-                ws.commit(result)
+                write_result(ws.path, result)
+
+                ws.commit(success=result.completed)
                 return {}  # empty dict — optimizer should still work
 
         optimizer = SimpleOptimizer(task, strategy=ReturnsNothing(), seed=42, history=history, seed_strategy=None)
@@ -423,7 +442,9 @@ def test_strategy_owns_evaluation_and_recording():
                 code = make_code(42.0)
                 (ws.path / "solution.py").write_text(code)
                 result = toolkit.task.evaluate(code)
-                attempt = ws.commit(result)
+                write_result(ws.path, result)
+
+                attempt = ws.commit(success=result.completed)
                 recorded.append(attempt.number)
                 return {"attempt": attempt.number}
 
@@ -455,7 +476,9 @@ def test_optimizer_is_deterministic_with_seed():
                     code = make_code(val)
                     (ws.path / "solution.py").write_text(code)
                     result = toolkit.task.evaluate(code)
-                    ws.commit(result)
+                    write_result(ws.path, result)
+
+                    ws.commit(success=result.completed)
                     return {"value": val}
 
             optimizer = SimpleOptimizer(task, strategy=DeterministicStrategy(), seed=42, history=history, seed_strategy=None)
@@ -511,6 +534,7 @@ def test_folder_history_workspace_commit():
     import tempfile
     from pathlib import Path
     from groundhog.histories.folder import FolderAttemptHistory
+    from groundhog.utils.results import write_result
     from groundhog.base.types import EvaluationResult, StageResult
 
     with tempfile.TemporaryDirectory() as d:
@@ -518,7 +542,9 @@ def test_folder_history_workspace_commit():
         ws = h.workspace(parent=None)
         (ws.path / "solution.py").write_text("def solve(): return 42")
         result = EvaluationResult(stages={"test": StageResult(metrics={"score": 1.0})})
-        attempt = ws.commit(result)
+        write_result(ws.path, result)
+
+        attempt = ws.commit(success=result.completed)
         assert attempt.number == 1
         assert attempt.parent is None
         assert attempt.code == "def solve(): return 42"
@@ -528,6 +554,7 @@ def test_folder_history_list_and_best():
     import tempfile
     from pathlib import Path
     from groundhog.histories.folder import FolderAttemptHistory
+    from groundhog.utils.results import write_result
     from groundhog.base.types import EvaluationResult, StageResult
 
     with tempfile.TemporaryDirectory() as d:
@@ -536,11 +563,15 @@ def test_folder_history_list_and_best():
         # Add two attempts with different scores
         ws1 = h.workspace(parent=None)
         (ws1.path / "solution.py").write_text("v1")
-        ws1.commit(EvaluationResult(stages={"test": StageResult(metrics={"score": 0.5})}))
+        r1 = EvaluationResult(stages={"test": StageResult(metrics={"score": 0.5})})
+        write_result(ws1.path, r1)
+        ws1.commit(success=True)
 
         ws2 = h.workspace(parent=1)
         (ws2.path / "solution.py").write_text("v2")
-        ws2.commit(EvaluationResult(stages={"test": StageResult(metrics={"score": 0.9})}))
+        r2 = EvaluationResult(stages={"test": StageResult(metrics={"score": 0.9})})
+        write_result(ws2.path, r2)
+        ws2.commit(success=True)
 
         assert len(h.list()) == 2
         best = h.best(lambda sr: sr.metrics.get("score", 0))
@@ -550,6 +581,7 @@ def test_folder_history_lineage():
     import tempfile
     from pathlib import Path
     from groundhog.histories.folder import FolderAttemptHistory
+    from groundhog.utils.results import write_result
     from groundhog.base.types import EvaluationResult, StageResult
 
     with tempfile.TemporaryDirectory() as d:
@@ -558,11 +590,15 @@ def test_folder_history_lineage():
 
         ws1 = h.workspace(parent=None)
         (ws1.path / "solution.py").write_text("v1")
-        ws1.commit(r(0.5))
+        r1 = r(0.5)
+        write_result(ws1.path, r1)
+        ws1.commit(success=True)
 
         ws2 = h.workspace(parent=1)
         (ws2.path / "solution.py").write_text("v2")
-        ws2.commit(r(0.8))
+        r2 = r(0.8)
+        write_result(ws2.path, r2)
+        ws2.commit(success=True)
 
         attempt2 = h.list()[-1]
         lineage = h.lineage(attempt2)

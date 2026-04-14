@@ -21,7 +21,9 @@ class MockStrategy:
         self._prepare_workspace(toolkit, ws, prior)
         self._do_work(toolkit, ws)
         result = self._evaluate(toolkit, ws)
-        attempt = ws.commit(result)
+        from groundhog.utils.results import write_result
+        write_result(ws.path, result)
+        attempt = ws.commit(success=result.completed)
         return self._log(attempt, prior, result, toolkit)
 
     # --- Selection ---

@@ -202,9 +202,13 @@ class CopilotAgentBackend(AgentBackend):
                     except json.JSONDecodeError:
                         continue
 
-                    events.append(event)
-                    raw_file.write(json.dumps(event) + "\n")
-                    raw_file.flush()
+                    # Skip delta events — the full result arrives as
+                    # assistant.message / assistant.reasoning
+                    event_type = event.get("type", "")
+                    if not event_type.endswith("_delta"):
+                        events.append(event)
+                        raw_file.write(json.dumps(event) + "\n")
+                        raw_file.flush()
 
                     for summary_line in _summarize_event(event):
                         summary_file.write(json.dumps(summary_line) + "\n")

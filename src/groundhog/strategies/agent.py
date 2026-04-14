@@ -12,6 +12,7 @@ The strategy filters which tools are available per phase.
 """
 
 import json
+import sys
 from dataclasses import dataclass
 from typing import Optional
 
@@ -42,33 +43,15 @@ class AgentConfig(StrategyConfig):
 BASE_PERMISSIONS = [
     ("allow", "Read(*)"),
     ("deny",  "Write(*)"),
-    ("allow", "Write(workspace/*)"),
-    ("allow", "Write(learnings.md)"),
-    ("allow", "Edit(workspace/*)"),
-    ("allow", "Edit(learnings.md)"),
-    ("deny",  "Write(TASK_CONTEXT.md)"),
-    ("deny",  "Write(result.json)"),
-    ("deny",  "Edit(TASK_CONTEXT.md)"),
-    ("deny",  "Edit(result.json)"),
+    ("allow", "Write(work/*)"),
+    ("allow", "Edit(work/*)"),
 ]
 
 PHASE_OVERRIDES = {
-    "explore": [
-        ("deny", "Write(solution.py)"),
-        ("deny", "Edit(solution.py)"),
-    ],
-    "submit": [
-        ("allow", "Write(solution.py)"),
-        ("allow", "Edit(solution.py)"),
-    ],
-    "fix": [
-        ("allow", "Write(solution.py)"),
-        ("allow", "Edit(solution.py)"),
-    ],
-    "reflect": [
-        ("deny", "Write(solution.py)"),
-        ("deny", "Edit(solution.py)"),
-    ],
+    "explore": [],
+    "submit":  [],
+    "fix": [],
+    "reflect": [],
 }
 
 
@@ -97,15 +80,11 @@ PHASE_TOOLS = {
 LEARNINGS_SEED = """\
 # Learnings
 
-Brief, high-value notes that persist across optimization runs.
-Keep this document high signal-to-noise. Only add entries that would
-save a future optimizer significant time or prevent repeated mistakes.
+Notes from this optimization chain. Keep high signal-to-noise.
+Only add entries that would save time or prevent repeated mistakes.
 
-Good entries: error solutions, confirmed dead-ends, key thresholds,
-techniques that produced measurable gains.
-
-Bad entries: speculative ideas, verbose explanations, anything obvious
-from reading the code.
+Good: confirmed dead-ends, key thresholds, techniques with measurable gains.
+Bad: speculative ideas, verbose explanations, anything obvious from the code.
 """
 
 EXPLORE_PROMPT = """\
@@ -116,30 +95,28 @@ You are an expert code optimizer. You work iteratively using tools.
 ## Task
 
 {task_context}
-
+{scoring_context}
+{approach_context}
 ## Workflow
 
 You are in the **exploration phase**. When your budget runs out you will
-automatically move to a submission phase. Use your budget wisely: understand
-WHY the current solution scores what it does before changing anything.
+automatically move to a submission phase.
 
-1. Read TASK_CONTEXT.md for the full problem description
-2. Read solution.py — the current best approach (READ-ONLY this phase)
-3. Run `get-learnings` for accumulated knowledge from previous runs
-4. Edit workspace/temp_solution.py with your improvements
-5. Run `{eval_command} workspace/temp_solution.py` to evaluate
-6. Read the output carefully — understand what improved and why
-7. When you beat the current best, copy workspace/temp_solution.py to workspace/best_solution.py
-8. Iterate: keep improving workspace/temp_solution.py, save to best_solution.py when you improve
+1. Read work/solution.py — the current best solution
+2. Run `get-learnings` for accumulated knowledge from previous runs
+3. Run `{eval_command}` to establish your baseline score
+4. **Analyze**: Study the metrics and artifacts — what is the bottleneck?
+5. **Plan**: Decide what single change to try and what you expect it to do
+6. **Implement**: Edit work/solution.py with your change
+7. **Evaluate**: Run `{eval_command}` to measure the impact
+8. **Reflect**: Did it help? Why or why not? Iterate from step 4
 
 ## Key Rules
 
-- solution.py is READ-ONLY — edit workspace/temp_solution.py instead
-- When you get a better score, save it: cp workspace/temp_solution.py workspace/best_solution.py
-- Your best_solution.py will be submitted in the next phase
-- Run `{eval_command} <path>` to evaluate any .py file
+- Edit work/solution.py directly — it will be submitted automatically
+- Run `{eval_command}` to evaluate (reads work/solution.py by default)
+- work/ is your writable area for solution, experiments, and artifacts
 - Focus on understanding before changing — blind edits waste iterations
-- workspace/ is yours for experiments and analysis scripts
 {budget_info}{guidance}
 
 ## Files
@@ -147,31 +124,23 @@ WHY the current solution scores what it does before changing anything.
 {file_listing}"""
 
 SUBMIT_PROMPT = """\
-Your exploration phase is over. Time to submit your best solution.
-
-1. Review the scores from your evaluation runs during this session
-2. Ensure workspace/best_solution.py contains your highest-scoring version
-3. If best_solution.py doesn't exist, copy your best from temp_solution.py
-4. Copy workspace/best_solution.py to solution.py — you now have write access
-
-Do NOT run any more experiments or modify learnings.md. \
-Just make sure solution.py has your best work."""
+Your exploration phase is over. Your work/solution.py will be submitted.
+No action needed — it is copied automatically."""
 
 FIX_PROMPT = """\
-Your solution.py failed evaluation with this error:
+Your work/solution.py failed evaluation with this error:
 
 {error}
 
-Fix the issue in solution.py and run `{eval_command} solution.py` to verify."""
+Fix the issue in work/solution.py and run `{eval_command}` to verify."""
 
 REFLECT_PROMPT = """\
-Write a retrospective in learnings.md about this session:
+Update work/learnings.md with what you learned this session:
 - What approaches did you try and what scores did they get?
 - What worked well? What didn't?
 - What dead ends should future attempts avoid?
-- Any promising directions you didn't have time to explore?
 
-Do not modify solution.py."""
+Do not modify work/solution.py."""
 
 # Per-request explore prompt — agent does everything in one call
 EXPLORE_PROMPT_FULL = """\
@@ -182,48 +151,33 @@ You are an expert code optimizer. You work iteratively using tools.
 ## Task
 
 {task_context}
-
+{scoring_context}
+{approach_context}
 ## Workflow
 
-You have one session to improve the solution. Use it well: understand
-WHY the current solution scores what it does before changing anything.
+You have one session to improve the solution.
 
-1. Read TASK_CONTEXT.md for the full problem description
-2. Read solution.py — the current best approach (READ-ONLY)
-3. Run `get-learnings` for accumulated knowledge from previous runs
-4. Edit workspace/temp_solution.py with your improvements
-5. Run `{eval_command} workspace/temp_solution.py` to evaluate
-6. Read the output carefully — understand what improved and why
-7. When you beat the current best, save it: cp workspace/temp_solution.py workspace/best_solution.py
-8. Iterate: keep improving temp_solution.py, save to best_solution.py when you improve
-9. When done, write what you learned to workspace/learnings.md — brief, actionable notes
+1. Read work/solution.py — the current best solution
+2. Run `get-learnings` for accumulated knowledge from previous runs
+3. Run `{eval_command}` to establish your baseline score
+4. **Analyze**: Study the metrics and artifacts — what is the bottleneck?
+5. **Plan**: Decide what single change to try and what you expect it to do
+6. **Implement**: Edit work/solution.py with your change
+7. **Evaluate**: Run `{eval_command}` to measure the impact
+8. **Reflect**: Did it help? Why or why not? Iterate from step 4
+9. When done, update work/learnings.md with what you learned
 
 ## Key Rules
 
-- solution.py is READ-ONLY — edit workspace/temp_solution.py instead
-- When you get a better score, save it: cp workspace/temp_solution.py workspace/best_solution.py
-- workspace/best_solution.py will be submitted as your final solution
-- workspace/learnings.md will be saved for future runs
-- Run `{eval_command} <path>` to evaluate any .py file
+- Edit work/solution.py directly — it will be submitted automatically
+- Run `{eval_command}` to evaluate (reads work/solution.py by default)
+- work/ is your writable area for solution, experiments, and artifacts
 - Focus on understanding before changing — blind edits waste iterations
-- workspace/ is yours for experiments and analysis scripts
 {budget_info}{guidance}
 
 ## Files
 
 {file_listing}"""
-
-PATCH_SOLUTION_PROMPT = """\
-Look at the agent's work in workspace/ and the evaluation logs.
-Find the best-performing version and save it to workspace/best_solution.py.
-If workspace/temp_solution.py is the only version, copy it to workspace/best_solution.py."""
-
-PATCH_LEARNINGS_PROMPT = """\
-Write a brief retrospective to workspace/learnings.md about the work done so far.
-Look at the evaluation results and any changes in workspace/.
-- What was tried? What scores?
-- What worked? What didn't?
-- What to try next?"""
 
 
 class AgentStrategy(Strategy):
@@ -263,21 +217,24 @@ class AgentStrategy(Strategy):
     def _run_per_token(self, toolkit, ws, prior):
         """Multi-phase: explore → submit → evaluate → fix → reflect."""
         session_id = self._explore(toolkit, ws, prior)
-        self._submit(toolkit, ws, session_id)
+        self._submit_best(toolkit, ws)
+        self.log.inline("submit... ")
+        self.log.tock()
         result = self._evaluate(toolkit, ws)
         result = self._fix_loop(toolkit, ws, session_id, result)
         self._reflect(toolkit, ws, session_id)
         self._log_conversation(ws)
 
-        attempt = ws.commit(result, metadata=self._build_metadata(prior))
+        self._finalize(ws, result, prior)
+        attempt = ws.commit(success=result.completed)
         return self._build_log(attempt, prior, result, toolkit)
 
     def _run_per_request(self, toolkit, ws, prior):
-        """Single explore call + verify/patch with cheap models."""
+        """Single explore call — agent edits work/solution.py directly."""
         session_id = self._explore_full(toolkit, ws, prior)
         self._log_conversation(ws)
 
-        # Copy best solution to solution.py (best_solution > temp_solution > patch)
+        # Copy work/solution.py to attempt root for evaluation
         self._submit_best(toolkit, ws)
 
         # Evaluate
@@ -287,10 +244,11 @@ class AgentStrategy(Strategy):
         if not result.completed:
             result = self._fix_loop(toolkit, ws, session_id, result)
 
-        # Collect learnings
+        # Promote local learnings to task-level
         self._collect_learnings(toolkit, ws)
 
-        attempt = ws.commit(result, metadata=self._build_metadata(prior))
+        self._finalize(ws, result, prior)
+        attempt = ws.commit(success=result.completed)
         return self._build_log(attempt, prior, result, toolkit)
 
     # --- Init ---
@@ -301,40 +259,51 @@ class AgentStrategy(Strategy):
         self.through = self.cfg.eval_through or getattr(toolkit, 'through', None)
         self.log = toolkit.log if hasattr(toolkit, 'log') else StrategyLog()
         self.cost = 0.0
-        self._last_event_text = None
+        self._event_line_len = 0
+        self._event_count = 0
 
     def _on_event(self, event):
-        """Live progress callback for agent events. Prints inline updates."""
+        """Live progress callback — overwrites a single status line with counter."""
         event_type = event.get("type")
         data = event.get("data", {})
+        text = None
 
         if event_type == "assistant.message":
             content = data.get("content", "")
             if content and content.strip():
-                # Show first line of agent's reasoning, truncated
-                first_line = content.strip().split("\n")[0][:80]
-                if first_line != self._last_event_text:
-                    self._last_event_text = first_line
-                    self.log.inline(f"\n{self.log.INDENT}  > {first_line}")
+                first_line = content.strip().split("\n")[0][:60]
+                self._event_count += 1
+                text = f"> {first_line}"
 
         elif event_type == "tool.execution_start":
             tool_name = data.get("toolName", "")
             if tool_name in ("report_intent",):
                 return
+            self._event_count += 1
             args = data.get("arguments", {})
-            # Compact tool summary
             if tool_name in ("view", "glob", "grep"):
-                detail = args.get("path", "")[:60]
-            elif tool_name == "powershell":
-                detail = args.get("command", "")[:60]
-            elif tool_name == "edit":
                 detail = args.get("path", "").split("\\")[-1].split("/")[-1]
-            elif tool_name == "create":
+            elif tool_name == "powershell":
+                detail = args.get("command", "")[:50].split("\n")[0]
+            elif tool_name in ("edit", "create"):
                 detail = args.get("path", "").split("\\")[-1].split("/")[-1]
             else:
                 detail = ""
-            summary = f"{tool_name}" + (f" {detail}" if detail else "")
-            self.log.inline(f"\n{self.log.INDENT}  [{summary}]")
+            text = f"[{tool_name}] {detail}" if detail else f"[{tool_name}]"
+
+        if text:
+            line = f"{self.log.INDENT}  #{self._event_count} {text}"
+            pad = max(0, self._event_line_len - len(line))
+            sys.stdout.write(f"\r{line}{' ' * pad}")
+            sys.stdout.flush()
+            self._event_line_len = len(line)
+
+    def _clear_event_line(self):
+        """Clear the in-place event status line."""
+        if self._event_line_len > 0:
+            sys.stdout.write(f"\r{' ' * self._event_line_len}\r")
+            sys.stdout.flush()
+            self._event_line_len = 0
 
     # --- Selection ---
 
@@ -354,61 +323,121 @@ class AgentStrategy(Strategy):
         return toolkit.history.workspace(parent=parent)
 
     def _prepare_workspace(self, toolkit, ws, prior):
+        # Strategy-managed files in attempt root
         (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get(), encoding="utf-8")
-        (ws.path / "workspace").mkdir(exist_ok=True)
-        if prior:
-            (ws.path / "solution.py").write_text(prior.code, encoding="utf-8")
-            # Pre-populate temp_solution.py — agent works on this during explore
-            (ws.path / "workspace" / "temp_solution.py").write_text(prior.code, encoding="utf-8")
+
+        # Copy approach.md from prior (read-only for agent)
         if prior is not None and hasattr(prior, 'path'):
             approach_path = prior.path / "approach.md"
             if approach_path.exists():
                 (ws.path / "approach.md").write_text(
                     approach_path.read_text(encoding="utf-8"), encoding="utf-8")
-        # Seed learnings.md if it doesn't exist
-        learnings_path = ws.path / "learnings.md"
-        if not learnings_path.exists():
-            learnings_path.write_text(LEARNINGS_SEED, encoding="utf-8")
+
+        # Seed work/solution.py from prior
+        if prior:
+            (ws.path / "work" / "solution.py").write_text(prior.code, encoding="utf-8")
+
+        # Seed work/learnings.md from prior's local learnings (chain knowledge)
+        if prior is not None and hasattr(prior, 'path'):
+            prior_learnings = prior.path / "work" / "learnings.md"
+            if prior_learnings.exists():
+                (ws.path / "work" / "learnings.md").write_text(
+                    prior_learnings.read_text(encoding="utf-8"), encoding="utf-8")
+        if not (ws.path / "work" / "learnings.md").exists():
+            (ws.path / "work" / "learnings.md").write_text(LEARNINGS_SEED, encoding="utf-8")
 
     # --- Tool filtering ---
 
-    def _get_tools(self, toolkit, phase="explore"):
-        """Filter toolkit.agent_tools by phase."""
+    def _get_tools(self, toolkit, phase="explore", prior=None):
+        """Get tools for the agent: toolkit tools + prior tools."""
         allowed = PHASE_TOOLS.get(phase)
         all_tools = getattr(toolkit, 'agent_tools', [])
         if allowed is not None and not allowed:
             return []
         if allowed is None:
-            return list(all_tools)
-        return [t for t in all_tools if t.name in allowed]
+            tools = list(all_tools)
+        else:
+            tools = [t for t in all_tools if t.name in allowed]
+
+        # Add prior file access tools (per-attempt, only during explore/fix)
+        if phase in ("explore", "fix") and prior is not None:
+            from groundhog.agents.tools import build_prior_tools
+            tools.extend(build_prior_tools(prior))
+
+        return tools
 
     # --- Helpers ---
 
     def _get_eval_command(self, toolkit):
         """Get the first eval stage name for prompt references."""
-        stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=self.through)
+        through = getattr(toolkit, 'agent_through', None) or self.through
+        stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=through)
         return stages[0].name if stages else "evaluate"
 
     def _build_file_listing(self, ws):
         """List workspace files for agent orientation."""
         files = sorted(
-            str(f.relative_to(ws.path))
+            str(f.relative_to(ws.path)).replace("\\", "/")
             for f in ws.path.rglob("*") if f.is_file()
         )
         return "\n".join(f"  {f}" for f in files) if files else "  (empty)"
 
+    def _build_session_header(self, toolkit, ws, prior):
+        """Build session header with prior score and key metrics."""
+        if not prior:
+            return f"[{toolkit.task.name} #{ws.number}] fresh start"
+
+        prior_score = self._score_result(prior.result, toolkit)
+        header = f"[{toolkit.task.name} #{ws.number}] prior=#{prior.number} score={prior_score:.4f}"
+
+        # Append key metrics from the prior's last stage
+        prior_metrics = self._get_prior_metrics(prior, toolkit)
+        if prior_metrics:
+            parts = []
+            for k, v in prior_metrics.items():
+                if k == "score":
+                    continue
+                if isinstance(v, float):
+                    parts.append(f"{k}={v:.4f}")
+                else:
+                    parts.append(f"{k}={v}")
+            if parts:
+                header += "\n  " + " ".join(parts)
+
+        return header
+
+    def _get_prior_metrics(self, prior, toolkit):
+        """Get metrics dict from the prior's last completed stage."""
+        if not prior or not prior.result.completed:
+            return {}
+        stages = list(prior.result.stages.values())
+        return stages[-1].metrics if stages else {}
+
+    def _build_scoring_context(self, toolkit):
+        """Build optional scoring section from task context."""
+        scoring = toolkit.task.context.get_scoring()
+        if scoring:
+            return f"\n## Scoring\n\n{scoring}\n"
+        return ""
+
+    def _build_approach_context(self, ws):
+        """Build optional approach section from approach.md."""
+        approach_path = ws.path / "approach.md"
+        if approach_path.exists():
+            text = approach_path.read_text(encoding="utf-8").strip()
+            if text:
+                return f"\n## Approach (preserve this direction)\n\n{text}\n"
+        return ""
+
     # --- Phases ---
 
-    def _explore(self, toolkit, ws, prior):
-        """Main work phase — agent explores in workspace/."""
-        # Build session header
-        if prior:
-            prior_score = self._score_result(prior.result, toolkit)
-            session_header = f"[{toolkit.task.name} #{ws.number}] prior=#{prior.number} score={prior_score:.4f}"
-        else:
-            session_header = f"[{toolkit.task.name} #{ws.number}] fresh start"
-
+    def _build_prompt_vars(self, toolkit, ws, prior):
+        """Build common prompt template variables."""
+        session_header = self._build_session_header(toolkit, ws, prior)
         eval_command = self._get_eval_command(toolkit)
+        scoring_context = self._build_scoring_context(toolkit)
+        approach_context = self._build_approach_context(ws)
+
         budget_info = ""
         if self.cfg.budget_usd:
             budget_info = f"\n- Budget: ${self.cfg.budget_usd:.2f} for this exploration phase."
@@ -417,19 +446,25 @@ class AgentStrategy(Strategy):
             budget_info += f"\n- Time limit: ~{minutes} minutes."
         guidance = f"\n\n## Additional Guidance\n{self.cfg.guidance}" if self.cfg.guidance else ""
 
-        goal = EXPLORE_PROMPT.format(
+        return dict(
             session_header=session_header,
             task_context=toolkit.task.context.get(),
             eval_command=eval_command,
+            scoring_context=scoring_context,
+            approach_context=approach_context,
             budget_info=budget_info,
             guidance=guidance,
             file_listing=self._build_file_listing(ws),
         )
 
+    def _explore(self, toolkit, ws, prior):
+        """Main work phase — agent works in work/."""
+        goal = EXPLORE_PROMPT.format(**self._build_prompt_vars(toolkit, ws, prior))
+
         budget_str = f"${self.cfg.budget_usd:.2f}" if self.cfg.budget_usd else "unlimited"
         self.log.start(f"--- Agent | {'prior=#' + str(prior.number) if prior else 'fresh'} | budget={budget_str}")
 
-        tools = self._get_tools(toolkit, phase="explore")
+        tools = self._get_tools(toolkit, phase="explore", prior=prior)
         allow, deny = _resolve_permissions("explore")
 
         spec = AgentSpec(
@@ -445,6 +480,7 @@ class AgentStrategy(Strategy):
             on_event=self._on_event,
         )
         result = toolkit.agent.get("default").run(spec)
+        self._clear_event_line()
         self.cost += result.cost
         self.log.tock()
 
@@ -452,31 +488,11 @@ class AgentStrategy(Strategy):
 
     def _explore_full(self, toolkit, ws, prior):
         """Per-request explore — agent does everything in one call."""
-        if prior:
-            prior_score = self._score_result(prior.result, toolkit)
-            session_header = f"[{toolkit.task.name} #{ws.number}] prior=#{prior.number} score={prior_score:.4f}"
-        else:
-            session_header = f"[{toolkit.task.name} #{ws.number}] fresh start"
-
-        eval_command = self._get_eval_command(toolkit)
-        budget_info = ""
-        if self.cfg.timeout:
-            minutes = self.cfg.timeout // 60
-            budget_info = f"\n- Time limit: ~{minutes} minutes."
-        guidance = f"\n\n## Additional Guidance\n{self.cfg.guidance}" if self.cfg.guidance else ""
-
-        goal = EXPLORE_PROMPT_FULL.format(
-            session_header=session_header,
-            task_context=toolkit.task.context.get(),
-            eval_command=eval_command,
-            budget_info=budget_info,
-            guidance=guidance,
-            file_listing=self._build_file_listing(ws),
-        )
+        goal = EXPLORE_PROMPT_FULL.format(**self._build_prompt_vars(toolkit, ws, prior))
 
         self.log.start(f"--- Agent (per-request) | {'prior=#' + str(prior.number) if prior else 'fresh'}")
 
-        tools = self._get_tools(toolkit, phase="explore")
+        tools = self._get_tools(toolkit, phase="explore", prior=prior)
         allow, deny = _resolve_permissions("explore")
 
         spec = AgentSpec(
@@ -491,94 +507,27 @@ class AgentStrategy(Strategy):
             on_event=self._on_event,
         )
         result = toolkit.agent.get("high").run(spec)
+        self._clear_event_line()
         self.cost += result.cost
         self.log.tock()
 
         return result.session_id
 
-    def _patch(self, toolkit, ws, prompt):
-        """Cheap agent call to fix a missed step (copy solution, write learnings)."""
-        self.log.inline("patch... ")
-        allow, deny = _resolve_permissions("explore")
-        spec = AgentSpec(
-            goal=prompt,
-            workspace_path=ws.path,
-            tools=[],
-            allowed_tools=allow,
-            denied_tools=deny,
-            timeout=60,
-        )
-        # Use budget tier for cheap patching
-        tier = "budget" if "budget" in toolkit.agent._tiers else "default"
-        result = toolkit.agent.get(tier).run(spec)
-        self.cost += result.cost
-        self.log.tock()
-
     def _submit_best(self, toolkit, ws):
-        """Copy the best workspace solution to solution.py.
-
-        Priority: best_solution.py > temp_solution.py > patch with cheap model.
-        """
-        best = ws.path / "workspace" / "best_solution.py"
-        temp = ws.path / "workspace" / "temp_solution.py"
-        prior = ws.path / "solution.py"
-
-        if best.exists():
-            (ws.path / "solution.py").write_text(best.read_text(encoding="utf-8"), encoding="utf-8")
-        elif temp.exists():
-            # Check if temp was actually modified (not just the prior copy)
-            temp_code = temp.read_text(encoding="utf-8")
-            prior_code = prior.read_text(encoding="utf-8") if prior.exists() else ""
-            if temp_code != prior_code:
-                (ws.path / "solution.py").write_text(temp_code, encoding="utf-8")
-            else:
-                # Agent didn't modify anything — patch with cheap model
-                self._patch(toolkit, ws, PATCH_SOLUTION_PROMPT)
-                if (ws.path / "workspace" / "best_solution.py").exists():
-                    (ws.path / "solution.py").write_text(
-                        (ws.path / "workspace" / "best_solution.py").read_text(encoding="utf-8"),
-                        encoding="utf-8")
-        else:
-            self._patch(toolkit, ws, PATCH_SOLUTION_PROMPT)
-            if (ws.path / "workspace" / "best_solution.py").exists():
-                (ws.path / "solution.py").write_text(
-                    (ws.path / "workspace" / "best_solution.py").read_text(encoding="utf-8"),
-                    encoding="utf-8")
+        """Copy work/solution.py to attempt root. Simple — one file, no patching."""
+        src = ws.path / "work" / "solution.py"
+        if src.exists():
+            (ws.path / "solution.py").write_text(
+                src.read_text(encoding="utf-8"), encoding="utf-8")
 
     def _collect_learnings(self, toolkit, ws):
-        """Read learnings from workspace, patch with cheap model if missing."""
-        learnings_path = ws.path / "workspace" / "learnings.md"
-        if learnings_path.exists():
-            text = learnings_path.read_text(encoding="utf-8").strip()
-            if text and hasattr(toolkit, 'learnings'):
-                toolkit.learnings.add(text)
-                return
-
-        # Patch: cheap agent to write learnings
-        self._patch(toolkit, ws, PATCH_LEARNINGS_PROMPT)
-        if learnings_path.exists() and hasattr(toolkit, 'learnings'):
-            text = learnings_path.read_text(encoding="utf-8").strip()
-            if text:
-                toolkit.learnings.add(text)
-
-    def _submit(self, toolkit, ws, session_id):
-        """Agent finalizes best solution into solution.py (per-token path)."""
-        allow, deny = _resolve_permissions("submit")
-        spec = AgentSpec(
-            goal=SUBMIT_PROMPT,
-            workspace_path=ws.path,
-            tools=self._get_tools(toolkit, phase="submit"),
-            model=self.cfg.model,
-            effort=self.cfg.effort,
-            allowed_tools=allow,
-            denied_tools=deny,
-            timeout=self.cfg.phase_timeout,
-            session_id=session_id,
-        )
-        result = toolkit.agent.get("default").run(spec)
-        self.cost += result.cost
-        self.log.inline("submit... ")
-        self.log.tock()
+        """Promote local learnings to task-level store."""
+        learnings_path = ws.path / "work" / "learnings.md"
+        if not learnings_path.exists() or not hasattr(toolkit, 'learnings'):
+            return
+        text = learnings_path.read_text(encoding="utf-8").strip()
+        if text and text != LEARNINGS_SEED.strip():
+            toolkit.learnings.add(text)
 
     def _evaluate(self, toolkit, ws):
         """Run the task evaluator on solution.py."""
@@ -620,7 +569,7 @@ class AgentStrategy(Strategy):
         return result
 
     def _reflect(self, toolkit, ws, session_id):
-        """Agent writes learnings."""
+        """Agent writes learnings to work/learnings.md."""
         allow, deny = _resolve_permissions("reflect")
         spec = AgentSpec(
             goal=REFLECT_PROMPT,
@@ -638,12 +587,20 @@ class AgentStrategy(Strategy):
         self.log.inline("reflect... ")
         self.log.tock()
 
-        # Read agent's learnings and add to persistent store
-        learnings_path = ws.path / "learnings.md"
-        if learnings_path.exists() and hasattr(toolkit, 'learnings'):
-            text = learnings_path.read_text(encoding="utf-8").strip()
-            if text and text != LEARNINGS_SEED.strip():
-                toolkit.learnings.add(text)
+        # Promote local learnings to task-level store
+        self._collect_learnings(toolkit, ws)
+
+    # --- Finalization ---
+
+    def _finalize(self, ws, result, prior):
+        """Write result.json and solution.py to attempt root before commit."""
+        from groundhog.utils.results import write_result
+        write_result(ws.path, result, metadata=self._build_metadata(prior))
+        # Copy work/solution.py to root (canonical location for committed attempts)
+        work_solution = ws.path / "work" / "solution.py"
+        if work_solution.exists():
+            (ws.path / "solution.py").write_text(
+                work_solution.read_text(encoding="utf-8"), encoding="utf-8")
 
     # --- Logging ---
 
@@ -685,7 +642,10 @@ class AgentStrategy(Strategy):
         }
 
     def _score_result(self, result, toolkit):
+        """Score a result using the current scorer. Falls back through stages."""
         stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=self.through)
-        final_name = stages[-1].name
-        final_result = result.stages.get(final_name)
-        return stages[-1].score(final_result) if final_result else -1.0
+        for stage in reversed(stages):
+            stage_result = result.stages.get(stage.name)
+            if stage_result is not None:
+                return stage.score(stage_result)
+        return -1.0

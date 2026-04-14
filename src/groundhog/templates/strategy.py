@@ -29,7 +29,8 @@ EVALUATION:
 WORKSPACE PATTERN:
   ws = toolkit.history.workspace(parent=prior.number)  # or parent=None for fresh
   (ws.path / "solution.py").write_text(code, encoding="utf-8")
-  attempt = ws.commit(result, metadata={...})           # finalize
+  write_result(ws.path, result, metadata={...})         # serialize results
+  attempt = ws.commit(success=result.completed)          # finalize
   # or ws.abort() to discard without recording
 
 APPROACH FILE:
@@ -103,11 +104,13 @@ class MyStrategy(Strategy):
         self.log.inline("evaluating... ")
         result = self._evaluate_with_retries(toolkit, ws)
         self.log.tock()
-        attempt = ws.commit(result, metadata={
+        from groundhog.utils.results import write_result
+        write_result(ws.path, result, metadata={
             "strategy": "my_strategy",
             "prior": prior.number if prior else None,
             "cost": round(self.cost, 6),
         })
+        attempt = ws.commit(success=result.completed)
         return {"attempt": attempt.number, "strategy": "my_strategy"}
 
     # --- Init ---

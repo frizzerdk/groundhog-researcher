@@ -2,7 +2,8 @@
 
 Uses agent_tool() factory to wrap toolkit methods as agent-callable tools.
 The optimizer calls build_default_agent_tools() and puts the result on
-toolkit.agent_tools. Users can extend the list with custom tools.
+toolkit.agent_tools. Strategies can extend with per-attempt tools (e.g. prior
+file access) via build_prior_tools().
 
 All tools are built at optimizer init time — no workspace binding needed.
 The strategy controls which tools are available per phase via filtering.
@@ -52,11 +53,16 @@ def _format_eval_result(result):
     return "\n".join(lines)
 
 
-def eval_to_dir(stage, path, output_dir):
+def eval_to_dir(stage, path, output_dir, prefix=""):
     """Run eval stage on a file, write results + artifacts to output_dir.
 
-    Returns a formatted string with metrics, errors, warnings, and paths
-    to any generated artifacts.
+    Args:
+        stage: EvalStage to run.
+        path: Path to the .py file to evaluate.
+        output_dir: Directory for results and artifacts.
+        prefix: Prefix for artifact filenames (e.g. "validate_").
+
+    Returns a formatted string with metrics, errors, warnings, and artifact paths.
     """
     code = Path(path).read_text(encoding="utf-8")
     result = stage.call(code)
@@ -64,31 +70,38 @@ def eval_to_dir(stage, path, output_dir):
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Always write results.json with score + metrics
+    # Write results.json (prefixed)
     results_data = {"score": result.score, "metrics": result.metrics}
     if result.errors:
         results_data["errors"] = result.errors
     if result.warnings:
         results_data["warnings"] = result.warnings
-    (out / "results.json").write_text(
+    results_name = f"{prefix}results.json" if prefix else "results.json"
+    (out / results_name).write_text(
         json.dumps(results_data, indent=2, default=str), encoding="utf-8")
 
-    # Write artifacts, collect paths
+    # Write artifacts with prefix, collect paths
     written = {}
     for name, content in result.artifacts.items():
         if name.startswith("_"):
             continue
-        dest = out / name
+        out_name = f"{prefix}{name}" if prefix else name
+        dest = out / out_name
         if isinstance(content, bytes):
             dest.write_bytes(content)
         elif isinstance(content, str):
             dest.write_text(content, encoding="utf-8")
         else:
-            dest = out / (name if name.endswith(".json") else f"{name}.json")
+            if not out_name.endswith(".json"):
+                out_name = f"{out_name}.json"
+            dest = out / out_name
             dest.write_text(json.dumps(content, indent=2, default=str), encoding="utf-8")
-        written[name] = str(dest)
+        written[out_name] = str(dest)
 
-    # Return copy with artifacts replaced by paths, and format for agent
+    # Add results.json to written paths
+    written[results_name] = str(out / results_name)
+
+    # Format for agent
     out_result = copy.copy(result)
     out_result.artifacts = written
     return _format_eval_result(out_result)
@@ -122,22 +135,56 @@ def build_default_agent_tools(toolkit) -> list:
     if hasattr(toolkit, 'task'):
         through = getattr(toolkit, 'agent_through', None) or getattr(toolkit, 'through', None)
         for stage in toolkit.task.evaluator.eval_stages(toolkit.task.data, through=through):
+            prefix = f"{stage.name}_"
             description = (
                 f"{stage.description}. "
-                f"Returns score, metrics, errors/warnings, and paths to "
-                f"any generated artifacts."
+                f"Evaluates work/solution.py by default. "
+                f"Returns score, metrics, errors/warnings, and artifact paths."
             )
             tools.append(agent_tool(
                 name=stage.name,
                 description=description,
-                func=lambda path, output_dir=f"workspace/output/{stage.name}", s=stage: eval_to_dir(s, path, output_dir),
+                func=lambda path="work/solution.py", output_dir="work/artifacts",
+                       s=stage, p=prefix: eval_to_dir(s, path, output_dir, prefix=p),
                 params={
-                    "path": {"type": "path",
-                             "description": "Path to the .py file to evaluate"},
-                    "output_dir": {"type": "path",
-                                   "default": f"workspace/output/{stage.name}",
-                                   "description": "Directory for results and artifacts"},
+                    "path": {"type": "path", "default": "work/solution.py",
+                             "description": "Path to .py file to evaluate (default: work/solution.py)"},
                 },
             ))
+
+    return tools
+
+
+def build_prior_tools(prior_attempt) -> list:
+    """Build tools for accessing files from the prior attempt.
+
+    Called per-attempt by the strategy (prior changes each attempt).
+    Returns empty list if prior_attempt is None.
+    """
+    if prior_attempt is None:
+        return []
+
+    tools = []
+
+    tools.append(agent_tool(
+        name="get-prior-file",
+        description=(
+            "Read a file from the previous attempt. "
+            "Use for prior artifacts, learnings, etc. "
+            "Example: get-prior-file work/artifacts/validate_results.json"
+        ),
+        func=lambda path, a=prior_attempt: a.read_file(path),
+        params={
+            "path": {"type": "path",
+                     "description": "File path relative to prior attempt root"},
+        },
+    ))
+
+    tools.append(agent_tool(
+        name="list-prior-files",
+        description="List all files from the previous attempt.",
+        func=lambda a=prior_attempt: "\n".join(a.list_files()),
+        params={},
+    ))
 
     return tools

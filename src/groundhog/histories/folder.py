@@ -31,6 +31,11 @@ class FolderAttempt(Attempt):
         self.parent = parent
         self.path = path
 
+    # Binary file extensions that should not be read as text
+    _BINARY_EXTS = {".png", ".gif", ".jpg", ".jpeg", ".bmp", ".ico", ".pdf",
+                    ".zip", ".gz", ".tar", ".bin", ".pkl", ".npy", ".npz",
+                    ".whl", ".so", ".dll", ".exe", ".pyc"}
+
     @property
     def code(self) -> str:
         return (self.path / "solution.py").read_text(encoding="utf-8")
@@ -56,6 +61,27 @@ class FolderAttempt(Attempt):
         data = json.loads((self.path / "result.json").read_text(encoding="utf-8"))
         return data.get("metadata", {})
 
+    def list_files(self) -> List[str]:
+        """List all files in this attempt (relative paths)."""
+        return sorted(
+            str(f.relative_to(self.path)).replace("\\", "/")
+            for f in self.path.rglob("*") if f.is_file()
+        )
+
+    def read_file(self, path: str) -> Optional[str]:
+        """Read a text file from this attempt. Returns None if not found."""
+        target = self.path / path
+        if not target.exists():
+            return None
+        if target.suffix.lower() in self._BINARY_EXTS:
+            size_kb = target.stat().st_size / 1024
+            return f"[binary file: {size_kb:.0f}KB — use your file viewer to inspect]"
+        try:
+            return target.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            size_kb = target.stat().st_size / 1024
+            return f"[binary file: {size_kb:.0f}KB — use your file viewer to inspect]"
+
     def __repr__(self):
         return f"Attempt({self.number}, parent={self.parent})"
 
@@ -68,36 +94,19 @@ class FolderWorkspace(Workspace):
         self.parent = parent
         self.path = path
         self.path.mkdir(parents=True)
+        (self.path / "work").mkdir(exist_ok=True)
 
-    def commit(self, result: EvaluationResult, metadata: Optional[dict] = None) -> FolderAttempt:
-        """Write result.json and finalize as an immutable attempt."""
-        result_data = {
-            "parent": self.parent,
-            "completed": result.completed,
-            "failed_stage": result.failed_stage,
-            "stages": {},
-        }
-        for stage_name, stage_result in result.stages.items():
-            result_data["stages"][stage_name] = {
-                "metrics": stage_result.metrics,
-                "errors": stage_result.errors,
-                "warnings": stage_result.warnings,
-            }
-            # Write artifacts as separate files
-            for artifact_name, artifact_data in stage_result.artifacts.items():
-                artifact_path = self.path / artifact_name
-                if isinstance(artifact_data, bytes):
-                    artifact_path.write_bytes(artifact_data)
-                elif isinstance(artifact_data, str):
-                    artifact_path.write_text(artifact_data, encoding="utf-8")
-                else:
-                    artifact_path.write_text(json.dumps(artifact_data, indent=2), encoding="utf-8")
+    def commit(self, success: bool = True) -> FolderAttempt:
+        """Mark this workspace as done by renaming the folder.
 
-        if metadata:
-            result_data["metadata"] = metadata
-
-        (self.path / "result.json").write_text(json.dumps(result_data, indent=2), encoding="utf-8")
-        return FolderAttempt(number=self.number, parent=self.parent, path=self.path)
+        Strategy must write all files (solution.py, result.json, etc.)
+        before calling commit(). This just flips the visibility flag.
+        """
+        suffix = "_done" if success else "_fail"
+        new_path = self.path.parent / (self.path.name + suffix)
+        self.path.rename(new_path)
+        self.path = new_path
+        return FolderAttempt(number=self.number, parent=self.parent, path=new_path)
 
     def abort(self):
         """Delete the workspace folder entirely."""
@@ -137,15 +146,23 @@ class FolderAttemptHistory(AttemptHistory):
         path = self.base_path / self._folder_name(number, parent)
         return FolderWorkspace(number=number, parent=parent, path=path)
 
-    def list(self) -> List[FolderAttempt]:
+    def list(self, only_done: bool = True) -> List[FolderAttempt]:
         attempts = []
         for d in sorted(self.base_path.iterdir()):
             if not d.is_dir():
                 continue
-            # Only list committed attempts (have result.json)
-            if not (d / "result.json").exists():
-                continue
-            parts = d.name.split("_", 1)
+            name = d.name
+            if name.endswith("_done"):
+                base = name[:-5]
+            elif name.endswith("_fail"):
+                if only_done:
+                    continue
+                base = name[:-5]
+            else:
+                if only_done:
+                    continue
+                base = name  # in-progress
+            parts = base.split("_", 1)
             number = int(parts[0])
             parent = None if parts[1] == "none" else int(parts[1])
             attempts.append(FolderAttempt(number=number, parent=parent, path=d))

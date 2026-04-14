@@ -47,12 +47,14 @@ class CrossPollinate(Strategy):
         self.log.inline("evaluating... ")
         result = self._evaluate_with_retries(toolkit, ws)
         self.log.tock()
-        attempt = ws.commit(result, metadata={
+        from groundhog.utils.results import write_result
+        write_result(ws.path, result, metadata={
             "strategy": "cross_pollinate",
             "prior": prior.number,
             "inspiration": inspiration.number,
             "cost": round(self.cost, 6),
         })
+        attempt = ws.commit(success=result.completed)
         return self._build_log(attempt, prior, result, toolkit)
 
     # --- Init ---

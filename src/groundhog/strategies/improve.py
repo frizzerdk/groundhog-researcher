@@ -50,7 +50,9 @@ class Improve(Strategy):
         self.log.inline("learnings... ")
         self._record_learnings(toolkit, ws, prior, result)
         self.log.tock()
-        attempt = ws.commit(result, metadata={"strategy": "improve", "prior": prior.number, "cost": round(self.cost, 6)})
+        from groundhog.utils.results import write_result
+        write_result(ws.path, result, metadata={"strategy": "improve", "prior": prior.number, "cost": round(self.cost, 6)})
+        attempt = ws.commit(success=result.completed)
         return self._build_log(attempt, prior, result, toolkit)
 
     # --- Init ---
