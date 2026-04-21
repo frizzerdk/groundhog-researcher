@@ -348,12 +348,12 @@ def test_build_tool_docs():
     assert "--last" in docs
 
 
-# === Default agent tools (learnings) ===
+# === Learnings tool ===
 
 def test_learnings_tool():
-    """Learnings tool wraps MarkdownLearnings correctly."""
+    """build_learnings_tool wraps MarkdownLearnings correctly."""
     from groundhog.learnings.markdown import MarkdownLearnings
-    from groundhog.agents.tools import build_default_agent_tools
+    from groundhog.agents.tools import build_learnings_tool
     from groundhog.base.toolkit import Toolkit
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -363,10 +363,9 @@ def test_learnings_tool():
 
         toolkit = Toolkit()
         toolkit.learnings = learnings
-        tools = build_default_agent_tools(toolkit)
+        tool = build_learnings_tool(toolkit)
 
-        assert len(tools) == 1
-        tool = tools[0]
+        assert tool is not None
         assert tool.name == "get-learnings"
 
         result = tool.execute(last="2", random="0")
@@ -374,12 +373,15 @@ def test_learnings_tool():
         assert "KNN" in result.output
         assert "Augmentation" in result.output
 
+    # Without toolkit.learnings, returns None
+    assert build_learnings_tool(Toolkit()) is None
 
-# === Eval tools via build_default_agent_tools ===
+
+# === Eval tools via build_eval_tools ===
 
 def test_eval_tools_from_toolkit():
     """Eval tools are built from toolkit.task eval stages."""
-    from groundhog.agents.tools import build_default_agent_tools
+    from groundhog.agents.tools import build_eval_tools
     from groundhog.base.toolkit import Toolkit
     from groundhog.base.types import Task, Data, Context, Evaluator, EvalStage, StageResult
 
@@ -407,15 +409,14 @@ def test_eval_tools_from_toolkit():
 
     task = Task(data=SimpleData(), context=SimpleContext(), evaluator=SimpleEvaluator(), name="Test")
     toolkit = Toolkit(task=task)
-    tools = build_default_agent_tools(toolkit)
 
-    # Should have smoke + evaluate (no learnings since toolkit.learnings not set)
-    tool_names = [t.name for t in tools]
-    assert "smoke" in tool_names
-    assert "evaluate" in tool_names
-
-    # Write a test file and evaluate it
     with tempfile.TemporaryDirectory() as tmpdir:
+        tools = build_eval_tools(toolkit, Path(tmpdir))
+
+        tool_names = [t.name for t in tools]
+        assert "smoke" in tool_names
+        assert "evaluate" in tool_names
+
         test_file = Path(tmpdir) / "test.py"
         test_file.write_text("SCORE = 0.85\n")
 
@@ -427,7 +428,7 @@ def test_eval_tools_from_toolkit():
 
 def test_eval_tool_with_bad_code():
     """Eval tool handles errors gracefully."""
-    from groundhog.agents.tools import build_default_agent_tools
+    from groundhog.agents.tools import build_eval_tools
     from groundhog.base.toolkit import Toolkit
     from groundhog.base.types import Task, Data, Context, Evaluator, EvalStage, StageResult
 
@@ -448,13 +449,14 @@ def test_eval_tool_with_bad_code():
 
     task = Task(data=SimpleData(), context=SimpleContext(), evaluator=SimpleEvaluator(), name="Test")
     toolkit = Toolkit(task=task)
-    tools = build_default_agent_tools(toolkit)
-    eval_tool = tools[0]
 
-    # Non-existent file
-    result = eval_tool.execute(path="/nonexistent/file.py")
-    assert not result.success
-    assert result.error  # should have error message
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tools = build_eval_tools(toolkit, Path(tmpdir))
+        eval_tool = tools[0]
+
+        result = eval_tool.execute(path="/nonexistent/file.py")
+        assert not result.success
+        assert result.error
 
 
 # === eval_to_dir ===
