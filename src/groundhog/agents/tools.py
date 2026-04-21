@@ -1,12 +1,15 @@
-"""Default agent tools built from toolkit capabilities.
+"""Agent tool helpers.
 
-Uses agent_tool() factory to wrap toolkit methods as agent-callable tools.
-The optimizer calls build_default_agent_tools() and puts the result on
-toolkit.agent_tools. Strategies can extend with per-attempt tools (e.g. prior
-file access) via build_prior_tools().
+Provides:
+  - eval_to_dir(): run an eval stage and write results/artifacts to a directory
+  - build_default_agent_tools(): general-purpose utility tools for toolkit.agent_tools
+  - build_prior_tools(): per-attempt tools for accessing prior attempt files
+  - build_eval_tools(): wrap eval stages as agent tools (called by strategy, not optimizer)
+  - build_learnings_tool(): wrap toolkit.learnings as an agent tool
 
-All tools are built at optimizer init time — no workspace binding needed.
-The strategy controls which tools are available per phase via filtering.
+The optimizer puts general utilities on toolkit.agent_tools.
+Eval tools and learnings are built by the strategy, which owns the workspace
+and can add policies like promote-best.
 """
 
 import copy
@@ -108,42 +111,90 @@ def eval_to_dir(stage, path, output_dir, prefix=""):
 
 
 def build_default_agent_tools(toolkit) -> list:
-    """Build agent tools from toolkit capabilities.
+    """Build general-purpose utility tools for toolkit.agent_tools.
 
-    Inspects what's on the toolkit and wraps available methods.
-    Returns a plain list — caller puts it on toolkit.agent_tools.
+    Eval tools and learnings are built by the strategy (which owns the workspace
+    and can add policies like promote-best). This builds task-defined utility
+    tools only — currently empty, placeholder for future tools (plotting,
+    knowledge base, etc.).
     """
+    return []
+
+
+def build_learnings_tool(toolkit):
+    """Wrap toolkit.learnings as an agent tool. Returns None if unavailable."""
+    if not hasattr(toolkit, 'learnings'):
+        return None
+    return agent_tool(
+        name="get-learnings",
+        description=(
+            "Read accumulated learnings from previous optimization runs. "
+            "Returns notes about what worked, what didn't, dead-ends, "
+            "and key thresholds."
+        ),
+        func=toolkit.learnings.get,
+        params={
+            "last": {"type": "int", "default": 20,
+                     "description": "Number of recent entries to return"},
+            "random": {"type": "int", "default": 10,
+                       "description": "Number of random older entries to include"},
+        },
+    )
+
+
+def build_eval_tools(toolkit, ws_path, through=None, on_best=None):
+    """Wrap eval stages as agent tools. Called by the strategy per-attempt.
+
+    Args:
+        toolkit: the Toolkit (has .task with evaluator)
+        ws_path: workspace Path — for artifact output and promote-best
+        through: eval stage limit (None = all stages)
+        on_best: optional callback(score, path) called when final stage beats
+                 current best. Strategy uses this for promote-best logic.
+
+    Returns list of agent tools, one per eval stage.
+    """
+    if not hasattr(toolkit, 'task'):
+        return []
+
+    effective_through = through or getattr(toolkit, 'agent_through', None) or getattr(toolkit, 'through', None)
+    stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=effective_through)
     tools = []
 
-    if hasattr(toolkit, 'learnings'):
-        tools.append(agent_tool(
-            name="get-learnings",
-            description=(
-                "Read accumulated learnings from previous optimization runs. "
-                "Returns notes about what worked, what didn't, dead-ends, "
-                "and key thresholds."
-            ),
-            func=toolkit.learnings.get,
-            params={
-                "last": {"type": "int", "default": 20,
-                         "description": "Number of recent entries to return"},
-                "random": {"type": "int", "default": 10,
-                           "description": "Number of random older entries to include"},
-            },
-        ))
+    for i, stage in enumerate(stages):
+        is_final = (i == len(stages) - 1)
+        prefix = f"{stage.name}_"
+        description = (
+            f"{stage.description}. "
+            f"Evaluates work/solution.py by default. "
+            f"Returns score, metrics, errors/warnings, and artifact paths."
+        )
 
-    if hasattr(toolkit, 'task'):
-        through = getattr(toolkit, 'agent_through', None) or getattr(toolkit, 'through', None)
-        for stage in toolkit.task.evaluator.eval_stages(toolkit.task.data, through=through):
-            prefix = f"{stage.name}_"
-            description = (
-                f"{stage.description}. "
-                f"Evaluates work/solution.py by default. "
-                f"Returns score, metrics, errors/warnings, and artifact paths."
-            )
+        if is_final and on_best is not None:
+            # Final stage with promote-best callback
+            def _make_fn(s=stage, p=prefix, cb=on_best):
+                def fn(path="work/solution.py"):
+                    result_str = eval_to_dir(s, path,
+                                             str(Path(path).parent / "artifacts"), p)
+                    # Read score from the result
+                    code = Path(path).read_text(encoding="utf-8")
+                    result = s.call(code)
+                    score = s.score(result)
+                    cb(score, path)
+                    return result_str
+                return fn
+
             tools.append(agent_tool(
-                name=stage.name,
-                description=description,
+                name=stage.name, description=description,
+                func=_make_fn(),
+                params={
+                    "path": {"type": "path", "default": "work/solution.py",
+                             "description": "Path to .py file to evaluate (default: work/solution.py)"},
+                },
+            ))
+        else:
+            tools.append(agent_tool(
+                name=stage.name, description=description,
                 func=lambda path="work/solution.py",
                        s=stage, p=prefix: eval_to_dir(
                            s, path,
@@ -178,7 +229,10 @@ def build_prior_tools(prior_attempt) -> list:
         ),
         func=lambda path, a=prior_attempt: a.read_file(path),
         params={
-            "path": {"type": "path",
+            # type=str (not path): the path is relative to the prior attempt
+            # root, not the agent's CWD. Using type=path would abspath it
+            # against the current workspace, silently pointing nowhere.
+            "path": {"type": "str",
                      "description": "File path relative to prior attempt root"},
         },
     ))

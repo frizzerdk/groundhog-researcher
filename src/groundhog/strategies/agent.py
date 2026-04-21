@@ -12,8 +12,10 @@ The strategy filters which tools are available per phase.
 """
 
 import json
+import shutil
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from groundhog.base.agent import AgentSpec
@@ -346,25 +348,56 @@ class AgentStrategy(Strategy):
         if not (ws.path / "work" / "learnings.md").exists():
             (ws.path / "work" / "learnings.md").write_text(LEARNINGS_SEED, encoding="utf-8")
 
-    # --- Tool filtering ---
+    # --- Tool building ---
 
-    def _get_tools(self, toolkit, phase="explore", prior=None):
-        """Get tools for the agent: toolkit tools + prior tools."""
+    def _get_tools(self, toolkit, ws, prior, phase="explore"):
+        """Build tools for the agent from toolkit capabilities.
+
+        Assembles: utility tools + learnings + eval tools + prior file access.
+        Eval tools are wrapped here (not at optimizer init) so the strategy
+        can add policies like promote-best on the final stage.
+        """
         allowed = PHASE_TOOLS.get(phase)
-        all_tools = getattr(toolkit, 'agent_tools', [])
         if allowed is not None and not allowed:
             return []
-        if allowed is None:
-            tools = list(all_tools)
-        else:
-            tools = [t for t in all_tools if t.name in allowed]
 
-        # Add prior file access tools (per-attempt, only during explore/fix)
-        if phase in ("explore", "fix") and prior is not None:
-            from groundhog.agents.tools import build_prior_tools
-            tools.extend(build_prior_tools(prior))
+        # General utilities from toolkit (plotting, KB, etc.)
+        tools = list(getattr(toolkit, 'agent_tools', []))
+
+        # Learnings tool
+        from groundhog.agents.tools import build_learnings_tool
+        learnings_tool = build_learnings_tool(toolkit)
+        if learnings_tool is not None:
+            tools.append(learnings_tool)
+
+        # Eval tools. Promote-best only during explore: it protects against the
+        # agent regressing after a good score. In fix, the current root is known
+        # to have failed evaluation, so any fix is preferable — we copy work/ to
+        # root unconditionally after the fix agent runs.
+        if phase in ("explore", "fix"):
+            from groundhog.agents.tools import build_eval_tools, build_prior_tools
+
+            on_best = self._make_promote_callback(ws) if phase == "explore" else None
+            tools += build_eval_tools(
+                toolkit, ws.path, through=self.through, on_best=on_best,
+            )
+
+            if prior is not None:
+                tools.extend(build_prior_tools(prior))
 
         return tools
+
+    def _make_promote_callback(self, ws):
+        """Snapshot solution.py to attempt root whenever a new session-best score lands."""
+        best_score = [float('-inf')]
+
+        def on_best(score, path):
+            if score > best_score[0]:
+                best_score[0] = score
+                src = Path(path)
+                if src.exists():
+                    shutil.copy2(str(src), str(ws.path / "solution.py"))
+        return on_best
 
     # --- Helpers ---
 
@@ -464,7 +497,7 @@ class AgentStrategy(Strategy):
         budget_str = f"${self.cfg.budget_usd:.2f}" if self.cfg.budget_usd else "unlimited"
         self.log.start(f"--- Agent | {'prior=#' + str(prior.number) if prior else 'fresh'} | budget={budget_str}")
 
-        tools = self._get_tools(toolkit, phase="explore", prior=prior)
+        tools = self._get_tools(toolkit, ws, prior, phase="explore")
         allow, deny = _resolve_permissions("explore")
 
         spec = AgentSpec(
@@ -492,7 +525,7 @@ class AgentStrategy(Strategy):
 
         self.log.start(f"--- Agent (per-request) | {'prior=#' + str(prior.number) if prior else 'fresh'}")
 
-        tools = self._get_tools(toolkit, phase="explore", prior=prior)
+        tools = self._get_tools(toolkit, ws, prior, phase="explore")
         allow, deny = _resolve_permissions("explore")
 
         spec = AgentSpec(
@@ -514,11 +547,22 @@ class AgentStrategy(Strategy):
         return result.session_id
 
     def _submit_best(self, toolkit, ws):
-        """Copy work/solution.py to attempt root. Simple — one file, no patching."""
+        """Fallback: copy work/solution.py to attempt root IF root doesn't exist.
+
+        The promote-best callback on eval tools is the primary mechanism — it
+        snapshots the best-scoring version during the session. This function
+        only runs for sessions where the agent never successfully ran the
+        final eval stage (no promote happened), in which case we fall back to
+        whatever is in work/.
+        """
+        dst = ws.path / "solution.py"
+        if dst.exists():
+            # Promote-best already handled this — don't overwrite with a
+            # potentially regressed final version.
+            return
         src = ws.path / "work" / "solution.py"
         if src.exists():
-            (ws.path / "solution.py").write_text(
-                src.read_text(encoding="utf-8"), encoding="utf-8")
+            dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
     def _collect_learnings(self, toolkit, ws):
         """Promote local learnings to task-level store."""
@@ -552,7 +596,7 @@ class AgentStrategy(Strategy):
             spec = AgentSpec(
                 goal=goal,
                 workspace_path=ws.path,
-                tools=self._get_tools(toolkit, phase="fix"),
+                tools=self._get_tools(toolkit, ws, prior=None, phase="fix"),
                 model=self.cfg.model,
                 effort=self.cfg.effort,
                 allowed_tools=allow,
@@ -564,6 +608,14 @@ class AgentStrategy(Strategy):
             self.cost += fix_result.cost
             self.log.tock()
 
+            # Root is known-failed here; fix replaces it unconditionally so
+            # the re-eval sees the fix even if the agent didn't run the eval
+            # tool (promote-best is intentionally disabled for fix phase).
+            work_solution = ws.path / "work" / "solution.py"
+            if work_solution.exists():
+                (ws.path / "solution.py").write_text(
+                    work_solution.read_text(encoding="utf-8"), encoding="utf-8")
+
             result = toolkit.task.evaluate(ws.path, through=self.through)
 
         return result
@@ -574,7 +626,7 @@ class AgentStrategy(Strategy):
         spec = AgentSpec(
             goal=REFLECT_PROMPT,
             workspace_path=ws.path,
-            tools=self._get_tools(toolkit, phase="reflect"),
+            tools=self._get_tools(toolkit, ws, prior=None, phase="reflect"),
             model=self.cfg.model,
             effort=self.cfg.effort,
             allowed_tools=allow,
@@ -593,14 +645,11 @@ class AgentStrategy(Strategy):
     # --- Finalization ---
 
     def _finalize(self, ws, result, prior):
-        """Write result.json and solution.py to attempt root before commit."""
+        """Write result.json. solution.py at root is maintained throughout the
+        run by promote-best (explore) and the fix-loop copy — don't overwrite
+        it here or we'd regress to the agent's last edit."""
         from groundhog.utils.results import write_result
         write_result(ws.path, result, metadata=self._build_metadata(prior))
-        # Copy work/solution.py to root (canonical location for committed attempts)
-        work_solution = ws.path / "work" / "solution.py"
-        if work_solution.exists():
-            (ws.path / "solution.py").write_text(
-                work_solution.read_text(encoding="utf-8"), encoding="utf-8")
 
     # --- Logging ---
 
