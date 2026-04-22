@@ -96,6 +96,13 @@ class SimpleOptimizer(Optimizer):
         from groundhog.agents.tools import build_default_agent_tools
         self.toolkit.agent_tools = build_default_agent_tools(self.toolkit)
 
+        # Seed rng and install default prior selector. Set here (not in run())
+        # so users can override before calling .run(). Anything the user can
+        # customise belongs on the toolkit at construction time.
+        self.toolkit.rng = random.Random(self.seed)
+        scorer = self._get_scorer()
+        self.toolkit.get_prior = lambda tk: select_prior(tk.history, scorer, tk.rng)
+
     def _get_scorer(self):
         stages = self.task.evaluator.eval_stages(self.task.data, through=self.through)
         return stages[-1].score
@@ -242,13 +249,9 @@ class SimpleOptimizer(Optimizer):
         print()
 
     def run(self, n: int = 10):
-        self.toolkit.rng = random.Random(self.seed)
         scorer = self._get_scorer()
         best_score = None
         total_cost = 0.0
-
-        # Set up potential-based prior selection on toolkit
-        self.toolkit.get_prior = lambda tk: select_prior(tk.history, scorer, tk.rng)
 
         self._print_header()
 

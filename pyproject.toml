@@ -1,6 +1,6 @@
 [project]
 name = "groundhog-researcher"
-version = "0.2.9"
+version = "0.2.10"
 description = "LLM-powered iterative function optimization"
 readme = "README.md"
 license = "MIT"

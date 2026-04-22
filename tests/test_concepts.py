@@ -488,6 +488,36 @@ def test_optimizer_is_deterministic_with_seed():
     assert results[0] == results[1]
 
 
+def test_user_get_prior_hook_is_respected():
+    """User-assigned toolkit.get_prior survives .run() and is invoked."""
+    with tempfile.TemporaryDirectory() as tmp:
+        task = FixtureTask()
+        history = FolderAttemptHistory(Path(tmp))
+        called = []
+
+        class RecordingStrategy:
+            def __call__(self, toolkit, config=None):
+                toolkit.get_prior(toolkit)
+                ws = toolkit.history.workspace()
+                (ws.path / "solution.py").write_text(make_code(1.0))
+                result = toolkit.task.evaluate(make_code(1.0))
+                write_result(ws.path, result)
+                ws.commit(success=result.completed)
+                return {}
+
+        def my_hook(tk):
+            called.append(True)
+            return None
+
+        optimizer = SimpleOptimizer(task, strategy=RecordingStrategy(),
+                                    seed=42, history=history, seed_strategy=None)
+        optimizer.toolkit.get_prior = my_hook
+        optimizer.run(n=2)
+
+        assert optimizer.toolkit.get_prior is my_hook, "hook was replaced by run()"
+        assert len(called) == 2, f"hook invoked {len(called)} times, expected 2"
+
+
 # === Strategy Config tests ===
 
 def test_strategy_config_from_dict_ignores_unknown():
