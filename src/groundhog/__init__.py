@@ -1,4 +1,4 @@
-__version__ = "0.2.10"
+__version__ = "0.2.11"
 
 # Base types and interfaces
 from groundhog.base import (
@@ -23,6 +23,8 @@ from groundhog.tools.cost_estimate import estimate_cost, estimate_total_cost
 from groundhog.optimizers.simple import SimpleOptimizer
 from groundhog.histories.folder import FolderAttemptHistory
 from groundhog.learnings.markdown import MarkdownLearnings
+from groundhog.learnings.compacted import Compacted, make_llm_compactor
+from groundhog.learnings.queue_wait import QueueWaitLearnings
 from groundhog.acceptance.default import DefaultAcceptance
 from groundhog.backends.mock import MockBackend
 from groundhog.backends.gemini import GeminiBackend
@@ -38,6 +40,7 @@ from groundhog.strategies.fresh import FreshApproach
 from groundhog.strategies.cross_pollinate import CrossPollinate
 from groundhog.strategies.analyse import Analyse
 from groundhog.strategies.agent import AgentStrategy
+from groundhog.strategies.fresh_agent import FreshAgentStrategy
 from groundhog.agents.claude_code import ClaudeCodeAgentBackend
 from groundhog.agents.gemini_cli import GeminiCliAgentBackend
 from groundhog.agents.copilot import CopilotAgentBackend

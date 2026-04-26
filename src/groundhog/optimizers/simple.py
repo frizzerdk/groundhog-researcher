@@ -35,6 +35,7 @@ class SimpleOptimizer(Optimizer):
     def __init__(self, task: Task,
                  strategy: Union[Strategy, None] = None,
                  strategies: Optional[List[Tuple[Strategy, int]]] = None,
+                 extras: Optional[List[Strategy]] = None,
                  seed: int = 42,
                  path: Optional[Path] = None,
                  history: Optional[AttemptHistory] = None,
@@ -42,6 +43,14 @@ class SimpleOptimizer(Optimizer):
                  through: Optional[str] = None,
                  agent_through: Optional[str] = None,
                  seed_strategy="default"):
+        """Configure the optimizer.
+
+        ``extras`` registers strategies that are reachable from the queue but
+        do not appear in the rotation schedule — useful for one-shot strategies
+        like ``Analyse`` or queue-only ``FreshApproach`` invocations. Rotation
+        wins on name collision; a warning is logged for any extra whose name
+        is already taken.
+        """
         from groundhog.strategies.fresh import FreshApproach
         self.task = task
         self.seed = seed
@@ -63,16 +72,13 @@ class SimpleOptimizer(Optimizer):
             from groundhog.strategies.improve import Improve
             self._schedule = [Improve()]
 
-        # Build strategy registry for queue resolution
-        self._strategy_registry = {}
+        # Strategy registry: queue items resolve here. Rotation strategies
+        # populate first; extras fill any remaining slots without overwriting.
+        self._strategy_registry: Dict[str, Strategy] = {}
         for s in self._schedule:
-            name = s.__class__.__name__.lower()
-            # e.g. "improve", "freshapproach", "crosspollinate", "analyse"
-            self._strategy_registry[name] = s
-            # Also register with underscores: "fresh_approach", "cross_pollinate"
-            import re
-            snake = re.sub(r'(?<!^)(?=[A-Z])', '_', s.__class__.__name__).lower()
-            self._strategy_registry[snake] = s
+            self._register_strategy(s)
+        for s in (extras or []):
+            self._register_strategy(s, allow_overwrite=False)
 
         # Build toolkit
         self.toolkit = Toolkit(task=self.task, history=self.history)
@@ -102,6 +108,30 @@ class SimpleOptimizer(Optimizer):
         self.toolkit.rng = random.Random(self.seed)
         scorer = self._get_scorer()
         self.toolkit.get_prior = lambda tk: select_prior(tk.history, scorer, tk.rng)
+
+    def _register_strategy(self, strategy: Strategy, allow_overwrite: bool = True) -> None:
+        """Add a strategy to the queue-resolution registry under both its
+        CamelCase-lower and snake_case names (e.g. ``FreshApproach`` registers
+        as both ``"freshapproach"`` and ``"fresh_approach"``).
+
+        With ``allow_overwrite=False`` (used for ``extras``), an existing
+        registration wins and the new one is logged as skipped.
+        """
+        import re
+        cls_name = strategy.__class__.__name__
+        names = {
+            cls_name.lower(),
+            re.sub(r'(?<!^)(?=[A-Z])', '_', cls_name).lower(),
+        }
+        for name in names:
+            if not allow_overwrite and name in self._strategy_registry:
+                # Rotation already owns this name; keep it.
+                if hasattr(self, "toolkit"):
+                    self.toolkit.log.info(
+                        f"[extras] skipping {cls_name}: {name!r} already registered"
+                    )
+                continue
+            self._strategy_registry[name] = strategy
 
     def _get_scorer(self):
         stages = self.task.evaluator.eval_stages(self.task.data, through=self.through)

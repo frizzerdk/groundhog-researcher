@@ -16,11 +16,20 @@ Directory structure:
 
 import json
 import shutil
+import time
 from pathlib import Path
 from typing import Callable, Optional, List
 
 from groundhog.base.types import EvaluationResult, StageResult
 from groundhog.base.attempt_history import Attempt, Workspace, AttemptHistory
+
+
+# Stale claim sentinels (left behind by a crashed allocator) are reclaimed
+# after this long. 5 minutes is well past any sane allocation latency.
+_CLAIM_TTL_SECONDS = 300
+
+# Defensive cap on retry contention — should never be hit in practice.
+_ALLOC_MAX_RETRIES = 100
 
 
 class FolderAttempt(Attempt):
@@ -93,7 +102,9 @@ class FolderWorkspace(Workspace):
         self.number = number
         self.parent = parent
         self.path = path
-        self.path.mkdir(parents=True)
+        # exist_ok=True so FolderAttemptHistory.workspace can pre-create the
+        # directory as part of its atomic-claim handshake.
+        self.path.mkdir(parents=True, exist_ok=True)
         (self.path / "work").mkdir(exist_ok=True)
 
     def commit(self, success: bool = True) -> FolderAttempt:
@@ -120,31 +131,73 @@ class FolderAttemptHistory(AttemptHistory):
     def __init__(self, base_path: Path):
         self.base_path = Path(base_path) / "attempts"
         self.base_path.mkdir(parents=True, exist_ok=True)
-        self._count = self._scan_count()
 
-    def _scan_count(self) -> int:
-        if not self.base_path.exists():
-            return 0
-        max_num = 0
+    def _used_numbers(self) -> set[int]:
+        """Numbers currently held by attempts on disk. Cleans stale claim sentinels."""
+        used: set[int] = set()
+        now = time.time()
         for d in self.base_path.iterdir():
-            if d.is_dir():
+            if not d.is_dir():
+                continue
+            if d.name.startswith(".claim_"):
                 try:
-                    num = int(d.name.split("_", 1)[0])
-                    max_num = max(max_num, num)
-                except ValueError:
+                    if (now - d.stat().st_mtime) > _CLAIM_TTL_SECONDS:
+                        d.rmdir()
+                except OSError:
                     pass
-        return max_num
+                continue
+            try:
+                used.add(int(d.name.split("_", 1)[0]))
+            except ValueError:
+                pass
+        return used
 
     def _folder_name(self, number: int, parent: Optional[int]) -> str:
         parent_str = str(parent) if parent is not None else "none"
         return f"{number:03d}_{parent_str}"
 
     def workspace(self, parent: Optional[int] = None) -> FolderWorkspace:
-        """Create a new workspace folder. Strategy writes files here, then commits or aborts."""
-        self._count += 1
-        number = self._count
-        path = self.base_path / self._folder_name(number, parent)
-        return FolderWorkspace(number=number, parent=parent, path=path)
+        """Create a new workspace folder. Strategy writes files here, then commits or aborts.
+
+        Allocation is atomic across concurrent processes: each call rescans the
+        attempts directory, picks ``max + 1``, then claims the number with a
+        hidden ``.claim_NNN`` sentinel directory. ``mkdir(exist_ok=False)`` is
+        atomic on POSIX and NTFS; whichever process wins owns the number.
+        Losers retry with a fresh scan.
+        """
+        for _ in range(_ALLOC_MAX_RETRIES):
+            number = max(self._used_numbers(), default=0) + 1
+            sentinel = self.base_path / f".claim_{number:03d}"
+            try:
+                sentinel.mkdir(exist_ok=False)
+            except FileExistsError:
+                # Another process is mid-claim at this number. Brief backoff
+                # so we don't spin while they finish, then re-scan.
+                time.sleep(0.05)
+                continue
+
+            path = self.base_path / self._folder_name(number, parent)
+            try:
+                path.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                # Defensive: leftover from a previous run at the same path.
+                # Drop the claim and let the next iteration pick a higher number.
+                try:
+                    sentinel.rmdir()
+                except OSError:
+                    pass
+                continue
+
+            try:
+                sentinel.rmdir()
+            except OSError:
+                pass  # Best-effort; TTL handles leftovers.
+
+            return FolderWorkspace(number=number, parent=parent, path=path)
+
+        raise RuntimeError(
+            f"Could not allocate a workspace number after {_ALLOC_MAX_RETRIES} retries"
+        )
 
     def list(self, only_done: bool = True) -> List[FolderAttempt]:
         attempts = []

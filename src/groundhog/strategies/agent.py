@@ -38,6 +38,7 @@ class AgentConfig(StrategyConfig):
     model: Optional[str] = param(None, "Override agent model")
     effort: Optional[str] = param(None, "Override agent effort/reasoning level")
     guidance: str = param("", "Additional guidance appended to agent prompt")
+    tier: str = param("default", "Agent backend tier (default/high/budget)")
 
 
 # --- Permissions (depth-based, deepest/last wins) ---
@@ -82,11 +83,15 @@ PHASE_TOOLS = {
 LEARNINGS_SEED = """\
 # Learnings
 
-Notes from this optimization chain. Keep high signal-to-noise.
+Notes from this attempt. Keep high signal-to-noise.
 Only add entries that would save time or prevent repeated mistakes.
 
 Good: confirmed dead-ends, key thresholds, techniques with measurable gains.
 Bad: speculative ideas, verbose explanations, anything obvious from the code.
+
+Prior attempts' notes are NOT auto-copied here. If you want context from
+earlier work, use the get-priors / list-prior / get-prior-file tools to
+read them on demand.
 """
 
 EXPLORE_PROMPT = """\
@@ -204,7 +209,7 @@ class AgentStrategy(Strategy):
         try:
             self._prepare_workspace(toolkit, ws, prior)
 
-            backend = toolkit.agent.get("default")
+            backend = toolkit.agent.get(self.cfg.tier)
             if backend.cost_model == "per_request":
                 return self._run_per_request(toolkit, ws, prior)
             else:
@@ -339,12 +344,9 @@ class AgentStrategy(Strategy):
         if prior:
             (ws.path / "work" / "solution.py").write_text(prior.code, encoding="utf-8")
 
-        # Seed work/learnings.md from prior's local learnings (chain knowledge)
-        if prior is not None and hasattr(prior, 'path'):
-            prior_learnings = prior.path / "work" / "learnings.md"
-            if prior_learnings.exists():
-                (ws.path / "work" / "learnings.md").write_text(
-                    prior_learnings.read_text(encoding="utf-8"), encoding="utf-8")
+        # Seed work/learnings.md as an empty notes scratchpad. Prior learnings
+        # are NOT copied forward — agents read them on demand via the
+        # get-priors / list-prior / get-prior-file tools.
         if not (ws.path / "work" / "learnings.md").exists():
             (ws.path / "work" / "learnings.md").write_text(LEARNINGS_SEED, encoding="utf-8")
 
@@ -377,27 +379,26 @@ class AgentStrategy(Strategy):
         if phase in ("explore", "fix"):
             from groundhog.agents.tools import build_eval_tools, build_prior_tools
 
-            on_best = self._make_promote_callback(ws) if phase == "explore" else None
+            promote_dest = (ws.path / "solution.py") if phase == "explore" else None
             tools += build_eval_tools(
-                toolkit, ws.path, through=self.through, on_best=on_best,
+                toolkit, ws.path, through=self.through, promote_dest=promote_dest,
             )
 
             if prior is not None:
-                tools.extend(build_prior_tools(prior))
+                # Score column comes from the same scorer the optimizer uses.
+                stages = toolkit.task.evaluator.eval_stages(
+                    toolkit.task.data, through=self.through
+                )
+                final_scorer = stages[-1].score if stages else None
+                tools.extend(
+                    build_prior_tools(
+                        prior,
+                        history=getattr(toolkit, "history", None),
+                        scorer=final_scorer,
+                    )
+                )
 
         return tools
-
-    def _make_promote_callback(self, ws):
-        """Snapshot solution.py to attempt root whenever a new session-best score lands."""
-        best_score = [float('-inf')]
-
-        def on_best(score, path):
-            if score > best_score[0]:
-                best_score[0] = score
-                src = Path(path)
-                if src.exists():
-                    shutil.copy2(str(src), str(ws.path / "solution.py"))
-        return on_best
 
     # --- Helpers ---
 
@@ -512,7 +513,7 @@ class AgentStrategy(Strategy):
             budget_usd=self.cfg.budget_usd,
             on_event=self._on_event,
         )
-        result = toolkit.agent.get("default").run(spec)
+        result = toolkit.agent.get(self.cfg.tier).run(spec)
         self._clear_event_line()
         self.cost += result.cost
         self.log.tock()
@@ -539,7 +540,10 @@ class AgentStrategy(Strategy):
             timeout=self.cfg.timeout,
             on_event=self._on_event,
         )
-        result = toolkit.agent.get("high").run(spec)
+        # Per-request explore historically used "high"; preserve that as the
+        # default while allowing tier= to override.
+        per_request_tier = self.cfg.tier if self.cfg.tier != "default" else "high"
+        result = toolkit.agent.get(per_request_tier).run(spec)
         self._clear_event_line()
         self.cost += result.cost
         self.log.tock()
@@ -604,7 +608,7 @@ class AgentStrategy(Strategy):
                 timeout=self.cfg.phase_timeout,
                 session_id=session_id,
             )
-            fix_result = toolkit.agent.get("default").run(spec)
+            fix_result = toolkit.agent.get(self.cfg.tier).run(spec)
             self.cost += fix_result.cost
             self.log.tock()
 
@@ -634,7 +638,7 @@ class AgentStrategy(Strategy):
             timeout=self.cfg.phase_timeout,
             session_id=session_id,
         )
-        result = toolkit.agent.get("default").run(spec)
+        result = toolkit.agent.get(self.cfg.tier).run(spec)
         self.cost += result.cost
         self.log.inline("reflect... ")
         self.log.tock()

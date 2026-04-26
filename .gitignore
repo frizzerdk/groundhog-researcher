@@ -8,3 +8,5 @@ build/
 workspace/
 tests/e2e_mnist_agent/attempts/*
 tests/e2e_mnist_agent/learnings.md
+tmp/*
+tests/e2e_mnist_agent/*

@@ -2,6 +2,7 @@
 
 Provides:
   - eval_to_dir(): run an eval stage and write results/artifacts to a directory
+  - promote_best(): wrap an eval tool to snapshot the source on score improvement
   - build_default_agent_tools(): general-purpose utility tools for toolkit.agent_tools
   - build_prior_tools(): per-attempt tools for accessing prior attempt files
   - build_eval_tools(): wrap eval stages as agent tools (called by strategy, not optimizer)
@@ -14,7 +15,10 @@ and can add policies like promote-best.
 
 import copy
 import json
+import operator
+import shutil
 from pathlib import Path
+from typing import Callable, Optional
 
 from groundhog.base.agent import agent_tool
 
@@ -142,106 +146,319 @@ def build_learnings_tool(toolkit):
     )
 
 
-def build_eval_tools(toolkit, ws_path, through=None, on_best=None):
+def _eval_stage_tool(stage):
+    """Build a plain eval tool for a single stage. Helper for build_eval_tools
+    and promote_best so they share the parameter/description shape."""
+    prefix = f"{stage.name}_"
+    description = (
+        f"{stage.description}. "
+        f"Evaluates work/solution.py by default. "
+        f"Returns score, metrics, errors/warnings, and artifact paths."
+    )
+
+    def fn(path="work/solution.py", s=stage, p=prefix):
+        return eval_to_dir(s, path, str(Path(path).parent / "artifacts"), prefix=p)
+
+    return agent_tool(
+        name=stage.name,
+        description=description,
+        func=fn,
+        params={
+            "path": {
+                "type": "path",
+                "default": "work/solution.py",
+                "description": "Path to .py file to evaluate (default: work/solution.py)",
+            },
+        },
+    )
+
+
+def promote_best(
+    stage,
+    dest_path,
+    src_relative: str = "work/solution.py",
+    compare: Callable[[float, float], bool] = operator.gt,
+):
+    """Build an eval tool for ``stage`` that ALSO snapshots the source file
+    to ``dest_path`` whenever the eval's score beats this tool's session-local
+    best.
+
+    Use this in place of a plain build_eval_tools entry for the eval tier
+    where promotion should happen. Typically: only the highest-fidelity
+    stage, since cheaper stages tend to be noisy and can produce
+    false-positive snapshots.
+
+    Args:
+        stage: ``EvalStage`` to wrap.
+        dest_path: where to copy the source file on improvement (typically
+            ``ws.path / "solution.py"``).
+        src_relative: tool param default for the file to evaluate. Best is
+            tracked relative to ``stage``'s scoring; the snapshot copies
+            *exactly* the path the agent passed (so re-evals on different
+            files don't promote stale work).
+        compare: how to compare the new score against the session best.
+            Defaults to strict ``>``; pass a different callable for
+            multi-objective or "lower is better" cases.
+
+    Returns an :class:`AgentTool` with the same name and parameter shape as
+    a plain eval tool — drop-in replaceable.
+    """
+    best = [float("-inf")]
+    dest = Path(dest_path)
+    prefix = f"{stage.name}_"
+
+    description = (
+        f"{stage.description}. "
+        f"Evaluates work/solution.py by default. "
+        f"Returns score, metrics, errors/warnings, and artifact paths. "
+        f"Snapshots solution to {dest.name} on score improvement."
+    )
+
+    def fn(path=src_relative, s=stage, p=prefix, dest=dest, best=best, cmp=compare):
+        result_str = eval_to_dir(s, path, str(Path(path).parent / "artifacts"), prefix=p)
+        # Re-derive score for the comparison. Same shape as the previous
+        # promote-best implementation; eval_to_dir already ran the stage,
+        # so this is effectively cached for deterministic stages.
+        code = Path(path).read_text(encoding="utf-8")
+        score = s.score(s.call(code))
+        if cmp(score, best[0]):
+            best[0] = score
+            src = Path(path)
+            if src.exists():
+                shutil.copy2(str(src), str(dest))
+        return result_str
+
+    return agent_tool(
+        name=stage.name,
+        description=description,
+        func=fn,
+        params={
+            "path": {
+                "type": "path",
+                "default": src_relative,
+                "description": f"Path to .py file to evaluate (default: {src_relative})",
+            },
+        },
+    )
+
+
+def build_eval_tools(toolkit, ws_path, through=None, promote_dest=None):
     """Wrap eval stages as agent tools. Called by the strategy per-attempt.
 
     Args:
-        toolkit: the Toolkit (has .task with evaluator)
-        ws_path: workspace Path — for artifact output and promote-best
-        through: eval stage limit (None = all stages)
-        on_best: optional callback(score, path) called when final stage beats
-                 current best. Strategy uses this for promote-best logic.
+        toolkit: the Toolkit (has ``.task`` with evaluator).
+        ws_path: workspace Path — for artifact output.
+        through: eval stage limit (None = all stages).
+        promote_dest: optional Path. When set, the highest-fidelity stage is
+            wrapped with :func:`promote_best` so its tool snapshots the
+            source file to ``promote_dest`` on score improvement. Cheaper
+            stages stay un-wrapped (their scores are noisy).
 
     Returns list of agent tools, one per eval stage.
     """
     if not hasattr(toolkit, 'task'):
         return []
 
-    effective_through = through or getattr(toolkit, 'agent_through', None) or getattr(toolkit, 'through', None)
-    stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=effective_through)
+    effective_through = (
+        through
+        or getattr(toolkit, 'agent_through', None)
+        or getattr(toolkit, 'through', None)
+    )
+    stages = toolkit.task.evaluator.eval_stages(
+        toolkit.task.data, through=effective_through
+    )
+
     tools = []
-
+    final_idx = len(stages) - 1
     for i, stage in enumerate(stages):
-        is_final = (i == len(stages) - 1)
-        prefix = f"{stage.name}_"
-        description = (
-            f"{stage.description}. "
-            f"Evaluates work/solution.py by default. "
-            f"Returns score, metrics, errors/warnings, and artifact paths."
-        )
-
-        if is_final and on_best is not None:
-            # Final stage with promote-best callback
-            def _make_fn(s=stage, p=prefix, cb=on_best):
-                def fn(path="work/solution.py"):
-                    result_str = eval_to_dir(s, path,
-                                             str(Path(path).parent / "artifacts"), p)
-                    # Read score from the result
-                    code = Path(path).read_text(encoding="utf-8")
-                    result = s.call(code)
-                    score = s.score(result)
-                    cb(score, path)
-                    return result_str
-                return fn
-
-            tools.append(agent_tool(
-                name=stage.name, description=description,
-                func=_make_fn(),
-                params={
-                    "path": {"type": "path", "default": "work/solution.py",
-                             "description": "Path to .py file to evaluate (default: work/solution.py)"},
-                },
-            ))
+        if i == final_idx and promote_dest is not None:
+            tools.append(promote_best(stage, dest_path=promote_dest))
         else:
-            tools.append(agent_tool(
-                name=stage.name, description=description,
-                func=lambda path="work/solution.py",
-                       s=stage, p=prefix: eval_to_dir(
-                           s, path,
-                           str(Path(path).parent / "artifacts"),
-                           prefix=p),
-                params={
-                    "path": {"type": "path", "default": "work/solution.py",
-                             "description": "Path to .py file to evaluate (default: work/solution.py)"},
-                },
-            ))
-
+            tools.append(_eval_stage_tool(stage))
     return tools
 
 
-def build_prior_tools(prior_attempt) -> list:
-    """Build tools for accessing files from the prior attempt.
+def build_prior_tools(
+    prior_attempt,
+    history=None,
+    scorer=None,
+    max_distance: Optional[int] = None,
+    scope: str = "lineage",
+) -> list:
+    """Build tools for browsing prior attempts.
 
-    Called per-attempt by the strategy (prior changes each attempt).
-    Returns empty list if prior_attempt is None.
+    Three tools, progressive disclosure:
+      ``get-priors``    — list metadata on N prior attempts (id, parent,
+                          distance, score). Used to discover what's there.
+      ``list-prior``    — given a prior id, list its files.
+      ``get-prior-file``— given a prior id + file, read its contents.
+
+    Args:
+        prior_attempt: the immediate parent of the current workspace. If
+            ``None``, no tools are built.
+        history: an :class:`AttemptHistory` for walking lineage / siblings.
+            Required for multi-prior reach. If ``None``, only the immediate
+            parent is reachable.
+        scorer: optional ``StageResult -> float`` for the score column in
+            ``get-priors`` output. If ``None``, scores are reported as
+            ``"?"``.
+        max_distance: optional cap on tree distance (1 = parent only, 2 =
+            grandparent, etc.). Strategy-level constraint that limits how
+            far the agent can reach. ``None`` means no cap.
+        scope: ``"lineage"`` (parent chain only, default) or ``"tree"``
+            (lineage + siblings of each ancestor). Strategies can pin this
+            to ``"lineage"`` if they don't want the agent exploring failed
+            sibling branches.
+
+    Returns empty list if ``prior_attempt`` is ``None``.
     """
     if prior_attempt is None:
         return []
 
-    tools = []
+    def _resolve(attempt_id: str):
+        """Resolve an agent-supplied id to an Attempt. Accepts ``"parent"``,
+        an integer string, or ``"attempt_<N>"``-style strings."""
+        if history is None:
+            if attempt_id in ("parent", str(prior_attempt.number),
+                              f"attempt_{prior_attempt.number}"):
+                return prior_attempt
+            return None
+        if attempt_id == "parent":
+            return prior_attempt
+        s = attempt_id
+        if s.startswith("attempt_"):
+            s = s[len("attempt_"):]
+        try:
+            num = int(s)
+        except ValueError:
+            return None
+        return history.get(num)
 
-    tools.append(agent_tool(
-        name="get-prior-file",
-        description=(
-            "Read a file from the previous attempt. "
-            "Use for prior artifacts, learnings, etc. "
-            "Example: get-prior-file work/artifacts/validate_results.json"
+    def _reachable_attempts():
+        """Yield (attempt, distance) pairs the agent is allowed to see."""
+        if history is None:
+            yield prior_attempt, 1
+            return
+
+        # Lineage = parent chain from the current workspace's parent up.
+        chain = history.lineage(prior_attempt)
+        # history.lineage(prior) returns [root, ..., prior].
+        # Distance 1 = prior_attempt itself (the immediate parent).
+        for offset, a in enumerate(reversed(chain), start=1):
+            if max_distance is not None and offset > max_distance:
+                break
+            yield a, offset
+
+        if scope != "tree":
+            return
+
+        # Tree extension: siblings of each ancestor (same parent, not the
+        # ancestor itself). Distance follows the ancestor.
+        seen_ids = {a.number for a, _ in [(c, 0) for c in chain]}
+        for offset, a in enumerate(reversed(chain), start=1):
+            if max_distance is not None and offset > max_distance:
+                break
+            if a.parent is None:
+                continue
+            for sib in history.list(only_done=False):
+                if sib.parent == a.parent and sib.number != a.number \
+                        and sib.number not in seen_ids:
+                    yield sib, offset
+                    seen_ids.add(sib.number)
+
+    def _score_of(attempt):
+        if scorer is None:
+            return None
+        try:
+            stages = list(attempt.result.stages.values())
+            if not stages:
+                return None
+            return scorer(stages[-1])
+        except Exception:
+            return None
+
+    def _get_priors(n: int = 5):
+        rows = []
+        for a, distance in _reachable_attempts():
+            score = _score_of(a)
+            score_str = f"{score:.4f}" if isinstance(score, float) else "?"
+            committed = "done" if a.path.name.endswith("_done") else \
+                        ("fail" if a.path.name.endswith("_fail") else "in-progress")
+            rows.append(
+                f"attempt_{a.number}\tparent={a.parent}\tdistance={distance}"
+                f"\tscore={score_str}\t{committed}"
+            )
+            if len(rows) >= n:
+                break
+        if not rows:
+            return "(no priors reachable)"
+        return "\n".join(["attempt\tparent\tdistance\tscore\tstatus", *rows])
+
+    def _list_prior(attempt: str = "parent"):
+        a = _resolve(attempt)
+        if a is None:
+            return f"(unknown attempt: {attempt!r})"
+        return "\n".join(a.list_files())
+
+    def _get_prior_file(attempt: str, file: str):
+        a = _resolve(attempt)
+        if a is None:
+            return f"(unknown attempt: {attempt!r})"
+        text = a.read_file(file)
+        if text is None:
+            return f"(file not found in attempt_{a.number}: {file!r})"
+        return text
+
+    return [
+        agent_tool(
+            name="get-priors",
+            description=(
+                "List metadata on prior attempts (attempt id, parent, "
+                "distance, score, status). Use to discover what's available "
+                f"before reading. Default: closest {('lineage' if scope == 'lineage' else 'lineage + sibling branches')} "
+                "in chain order."
+            ),
+            func=_get_priors,
+            params={
+                "n": {
+                    "type": "int", "default": 5,
+                    "description": "Max number of priors to list",
+                },
+            },
         ),
-        func=lambda path, a=prior_attempt: a.read_file(path),
-        params={
-            # type=str (not path): the path is relative to the prior attempt
-            # root, not the agent's CWD. Using type=path would abspath it
-            # against the current workspace, silently pointing nowhere.
-            "path": {"type": "str",
-                     "description": "File path relative to prior attempt root"},
-        },
-    ))
-
-    tools.append(agent_tool(
-        name="list-prior-files",
-        description="List all files from the previous attempt.",
-        func=lambda a=prior_attempt: "\n".join(a.list_files()),
-        params={},
-    ))
-
-    return tools
+        agent_tool(
+            name="list-prior",
+            description=(
+                "List files belonging to a prior attempt. "
+                "Pass attempt='parent' (default) or a specific id like "
+                "'attempt_42' or '42'."
+            ),
+            func=_list_prior,
+            params={
+                "attempt": {
+                    "type": "str", "default": "parent",
+                    "description": "Prior attempt id ('parent', '42', or 'attempt_42')",
+                },
+            },
+        ),
+        agent_tool(
+            name="get-prior-file",
+            description=(
+                "Read a file from a prior attempt. "
+                "Pass attempt='parent' or a specific id; file is relative "
+                "to the attempt root (e.g. 'work/learnings.md'). "
+                "Use list-prior first to see available files."
+            ),
+            func=_get_prior_file,
+            params={
+                "attempt": {
+                    "type": "str",
+                    "description": "Prior attempt id ('parent', '42', or 'attempt_42')",
+                },
+                "file": {
+                    "type": "str",
+                    "description": "File path relative to attempt root",
+                },
+            },
+        ),
+    ]

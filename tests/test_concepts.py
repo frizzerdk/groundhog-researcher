@@ -25,8 +25,10 @@ Concept → Test mapping:
 """
 
 import json
+import os
 import random
 import shutil
+import time
 import tempfile
 from pathlib import Path
 
@@ -378,6 +380,68 @@ def test_workspace_abort_leaves_no_trace():
         assert not ws.path.exists()
 
 
+def test_workspace_allocation_is_atomic_under_concurrency():
+    """Concurrent allocators against the same attempts dir produce unique numbers.
+
+    The bug being guarded against: pre-0.2.11, FolderAttemptHistory cached
+    `_count` at construction and incremented it in-memory. Two histories
+    pointing at the same directory would each return number 1, then 2, then
+    3 — a parallel optimizer setup silently produced duplicate attempt IDs.
+
+    We simulate parallel optimizers by spawning multiple threads, each with
+    its own history instance backed by the same directory. The fix must
+    handshake through the disk (scan + sentinel mkdir) to stay consistent.
+    """
+    import threading
+
+    with tempfile.TemporaryDirectory() as tmp:
+        results: list[list[int]] = []
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(4)
+
+        def alloc(count: int):
+            try:
+                h = FolderAttemptHistory(Path(tmp))  # one per "optimizer"
+                barrier.wait(timeout=10)             # release them together
+                nums = [h.workspace().number for _ in range(count)]
+                results.append(nums)
+            except BaseException as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=alloc, args=(5,)) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert not errors, f"allocator raised: {errors}"
+        all_nums = [n for batch in results for n in batch]
+        assert len(all_nums) == 20, f"expected 20 allocations, got {len(all_nums)}"
+        assert len(set(all_nums)) == 20, f"duplicate numbers: {sorted(all_nums)}"
+        assert sorted(all_nums) == list(range(1, 21)), \
+            f"expected dense 1..20, got {sorted(all_nums)}"
+
+
+def test_workspace_stale_claim_is_reclaimed():
+    """A leftover claim sentinel doesn't permanently lock its number."""
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+
+        # Plant a stale claim sentinel and age it past the TTL.
+        from groundhog.histories import folder as folder_mod
+        stale = history.base_path / ".claim_001"
+        stale.mkdir()
+        old = time.time() - (folder_mod._CLAIM_TTL_SECONDS + 60)
+        os.utime(stale, (old, old))
+
+        # First allocation should reclaim 001 (cleaning up the stale sentinel).
+        ws = history.workspace()
+        assert ws.number == 1
+        assert not stale.exists()
+
+
 # === Toolkit (toolkit.py) ===
 # Vault: Toolkit.md — dynamic attributes, override tracking, strategy handles missing
 
@@ -486,6 +550,403 @@ def test_optimizer_is_deterministic_with_seed():
             results.append(rng_values[:])
 
     assert results[0] == results[1]
+
+
+def test_optimizer_extras_registers_strategy_for_queue():
+    """extras=[...] makes a strategy reachable via the queue without rotating it."""
+    from groundhog.tools.queue import add as queue_add
+
+    with tempfile.TemporaryDirectory() as tmp:
+        task = FixtureTask()
+        history = FolderAttemptHistory(Path(tmp))
+        called = {"rotation": 0, "extra": 0}
+
+        class RotationStrat:
+            def __call__(self, toolkit, config=None):
+                called["rotation"] += 1
+                ws = toolkit.history.workspace()
+                (ws.path / "solution.py").write_text(make_code(1.0))
+                result = toolkit.task.evaluate(make_code(1.0))
+                write_result(ws.path, result)
+                ws.commit(success=result.completed)
+
+        class ExtraStrat:
+            def __call__(self, toolkit, config=None):
+                called["extra"] += 1
+                ws = toolkit.history.workspace()
+                (ws.path / "solution.py").write_text(make_code(2.0))
+                result = toolkit.task.evaluate(make_code(2.0))
+                write_result(ws.path, result)
+                ws.commit(success=result.completed)
+
+        opt = SimpleOptimizer(
+            task, strategy=RotationStrat(), extras=[ExtraStrat()],
+            seed=42, path=Path(tmp), history=history, seed_strategy=None,
+        )
+
+        # Queue the extra by name; first iteration should pick it up.
+        queue_add(Path(tmp), "extra_strat")
+        opt.run(n=2)
+
+        assert called["extra"] == 1, "extra was not invoked from queue"
+        assert called["rotation"] == 1, "rotation should still cover the second iteration"
+
+
+def test_optimizer_extras_does_not_overwrite_rotation():
+    """If an extras name collides with a rotation strategy, rotation wins."""
+    with tempfile.TemporaryDirectory() as tmp:
+        task = FixtureTask()
+        history = FolderAttemptHistory(Path(tmp))
+
+        class Improve:
+            def __call__(self, toolkit, config=None):
+                pass
+
+        rotation = Improve()
+        # Same class name, different instance — should not displace rotation's slot.
+        extra = Improve()
+
+        opt = SimpleOptimizer(
+            task, strategy=rotation, extras=[extra],
+            seed=42, path=Path(tmp), history=history, seed_strategy=None,
+        )
+
+        # Rotation registered "improve" first; extras must not clobber it.
+        assert opt._strategy_registry["improve"] is rotation
+
+
+def test_fresh_agent_strategy_returns_no_prior():
+    """FreshAgentStrategy._select_prior always returns None regardless of history."""
+    from groundhog import FreshAgentStrategy
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        result = EvaluationResult(stages={"eval": StageResult(metrics={"x": 1.0})})
+
+        # Seed the history so a real selector would pick *something*.
+        ws = history.workspace()
+        (ws.path / "solution.py").write_text("x = 1")
+        write_result(ws.path, result)
+        ws.commit(success=True)
+
+        # Mock toolkit: anything _select_prior touches is fine to leave undefined,
+        # since the override returns None before consulting any selector.
+        toolkit = Toolkit(history=history)
+        prior = FreshAgentStrategy()._select_prior(toolkit)
+        assert prior is None
+
+
+def test_agent_config_tier_default_and_override():
+    """AgentConfig.tier defaults to 'default'; explicit value flows through."""
+    from groundhog import AgentStrategy
+    s_default = AgentStrategy()
+    assert s_default.config.tier == "default"
+
+    s_budget = AgentStrategy(tier="budget")
+    assert s_budget.config.tier == "budget"
+
+
+def test_compacted_learnings_manual_distill_mode():
+    """No compactor → entries queue until distill() is called manually."""
+    from groundhog import Compacted, MarkdownLearnings
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inner = MarkdownLearnings(Path(tmp))
+        c = Compacted(
+            inner,
+            current_path=Path(tmp) / "current.md",
+        )
+        c.add("first observation")
+        c.add("second observation")
+
+        # Inner store has both.
+        assert "first observation" in inner.get()
+        assert "second observation" in inner.get()
+        # Queue holds both, current view is empty.
+        assert len(c.queued()) == 2
+        assert not (Path(tmp) / "current.md").exists() or \
+            not (Path(tmp) / "current.md").read_text().strip()
+
+        # get() falls back to inner when no current view exists.
+        assert "first observation" in c.get()
+
+        # Manually distill via a deterministic compactor.
+        def compactor(current, queue):
+            return "DIGEST: " + " | ".join(queue)
+
+        ok = c.distill(compactor)
+        assert ok
+        assert (Path(tmp) / "current.md").read_text().strip().startswith("DIGEST:")
+        assert c.queued() == []
+        # get() now returns the compacted view.
+        assert c.get().startswith("DIGEST:")
+
+
+def test_compacted_learnings_auto_compaction_on_add():
+    """compactor passed to ctor → every add() distills."""
+    from groundhog import Compacted, MarkdownLearnings
+
+    calls = []
+
+    def compactor(current, queue):
+        calls.append((current, list(queue)))
+        return f"v{len(calls)}: " + " | ".join(queue)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        c = Compacted(
+            MarkdownLearnings(Path(tmp)),
+            current_path=Path(tmp) / "current.md",
+            compactor=compactor,
+        )
+        c.add("first")
+        c.add("second")
+
+        # Compactor invoked once per add.
+        assert len(calls) == 2
+        # Queue cleared on success.
+        assert c.queued() == []
+        # Current reflects the most recent compaction.
+        assert c.get().startswith("v2:")
+
+
+def test_promote_best_snapshots_on_improvement():
+    """promote_best wraps a stage so its eval tool snapshots on score gain."""
+    from groundhog.agents.tools import promote_best
+    from groundhog import EvalStage, StageResult
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Stage that returns a score equal to int(code).
+        def call(code):
+            return StageResult(metrics={"score": float(int(code.strip()))})
+
+        stage = EvalStage(
+            name="evaluate", description="dummy",
+            call=call, scorer=lambda r: r.metrics["score"],
+        )
+        ws = Path(tmp)
+        (ws / "work").mkdir()
+        dest = ws / "solution.py"
+
+        tool = promote_best(stage, dest_path=dest)
+
+        # First eval: score 5. Should promote.
+        src = ws / "work" / "solution.py"
+        src.write_text("5")
+        tool.execute(path=str(src))
+        assert dest.exists()
+        assert dest.read_text() == "5"
+
+        # Lower score: should NOT promote.
+        src.write_text("3")
+        tool.execute(path=str(src))
+        assert dest.read_text() == "5"
+
+        # Higher score: should promote.
+        src.write_text("9")
+        tool.execute(path=str(src))
+        assert dest.read_text() == "9"
+
+
+def test_build_eval_tools_uses_promote_dest():
+    """promote_dest argument wraps the final stage; cheaper stages stay plain."""
+    from groundhog.agents.tools import build_eval_tools
+    from groundhog import Task, EvalStage, StageResult
+
+    class _Eval(Evaluator):
+        def get_stages(self, data):
+            return [
+                EvalStage(name="smoke", description="smoke",
+                          call=lambda c: StageResult(metrics={"score": 0.0}),
+                          scorer=lambda r: r.metrics["score"]),
+                EvalStage(name="evaluate", description="evaluate",
+                          call=lambda c: StageResult(metrics={"score": 1.0}),
+                          scorer=lambda r: r.metrics["score"]),
+            ]
+        def evaluate(self, code_or_path, data):
+            return StageResult(metrics={"score": 1.0})
+
+    with tempfile.TemporaryDirectory() as tmp:
+        toolkit = Toolkit(task=Task(
+            data=FixtureData(), context=FixtureContext(),
+            evaluator=_Eval(), name="t",
+        ))
+        tools = build_eval_tools(
+            toolkit, ws_path=Path(tmp), promote_dest=Path(tmp) / "solution.py"
+        )
+        # Both stages produce tools; the final one's description mentions
+        # the snapshot — that's how we tell promote_best wrapped it.
+        assert len(tools) == 2
+        assert "Snapshots" not in tools[0].description, "smoke should not promote"
+        assert "Snapshots" in tools[1].description, "evaluate should promote"
+
+
+def test_build_prior_tools_three_tool_progressive_disclosure():
+    """get-priors lists, list-prior shows files, get-prior-file reads."""
+    from groundhog.agents.tools import build_prior_tools
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        result = EvaluationResult(stages={"eval": StageResult(metrics={"score": 1.0})})
+
+        # Lineage: 1 -> 2 -> 3
+        ws1 = history.workspace()
+        (ws1.path / "solution.py").write_text("v1")
+        (ws1.path / "work" / "learnings.md").write_text("note from 1")
+        write_result(ws1.path, result)
+        a1 = ws1.commit(success=True)
+
+        ws2 = history.workspace(parent=a1.number)
+        (ws2.path / "solution.py").write_text("v2")
+        (ws2.path / "work" / "learnings.md").write_text("note from 2")
+        write_result(ws2.path, result)
+        a2 = ws2.commit(success=True)
+
+        ws3 = history.workspace(parent=a2.number)
+        (ws3.path / "solution.py").write_text("v3")
+        write_result(ws3.path, result)
+        a3 = ws3.commit(success=True)
+
+        # build_prior_tools called with prior=a3 (the immediate parent of a
+        # hypothetical fourth attempt).
+        tools = build_prior_tools(
+            a3, history=history,
+            scorer=lambda r: r.metrics.get("score", 0.0),
+        )
+        by_name = {t.name: t for t in tools}
+
+        # get-priors lists the chain in distance order.
+        listing = by_name["get-priors"].execute(n=10).output
+        # Distance 1 = a3 (the prior itself), 2 = a2, 3 = a1.
+        assert "attempt_3" in listing and "distance=1" in listing
+        assert "attempt_2" in listing and "distance=2" in listing
+        assert "attempt_1" in listing and "distance=3" in listing
+
+        # list-prior with default 'parent' lists a3's files.
+        files = by_name["list-prior"].execute().output
+        assert "solution.py" in files
+
+        # get-prior-file by id.
+        contents = by_name["get-prior-file"].execute(
+            attempt="2", file="work/learnings.md"
+        ).output
+        assert contents == "note from 2"
+
+        # Default 'parent' resolves to a3.
+        contents_parent = by_name["get-prior-file"].execute(
+            attempt="parent", file="solution.py"
+        ).output
+        assert contents_parent == "v3"
+
+
+def test_compacted_learnings_retains_queue_on_failure():
+    """Compactor exception → queue is preserved for the next add()."""
+    from groundhog import Compacted, MarkdownLearnings
+
+    fail_calls = [0]
+
+    def flaky(current, queue):
+        fail_calls[0] += 1
+        if fail_calls[0] == 1:
+            raise RuntimeError("backend transient error")
+        return "OK: " + " | ".join(queue)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        c = Compacted(
+            MarkdownLearnings(Path(tmp)),
+            current_path=Path(tmp) / "current.md",
+            compactor=flaky,
+            quiet=True,
+        )
+        c.add("first")
+        # First compaction failed; queue still holds entry.
+        assert "first" in c.queued()
+        assert not (Path(tmp) / "current.md").read_text().strip() if \
+            (Path(tmp) / "current.md").exists() else True
+
+        c.add("second")
+        # Second compaction succeeds and folds in BOTH entries.
+        assert c.queued() == []
+        result = c.get()
+        assert result.startswith("OK:")
+        assert "first" in result and "second" in result
+
+
+def test_user_agent_through_hook_is_respected():
+    """User-assigned toolkit.agent_through survives .run() across iterations."""
+    with tempfile.TemporaryDirectory() as tmp:
+        task = FixtureTask()
+        history = FolderAttemptHistory(Path(tmp))
+        seen = []
+
+        class WatchingStrategy:
+            def __call__(self, toolkit, config=None):
+                seen.append(getattr(toolkit, "agent_through", None))
+                ws = toolkit.history.workspace()
+                (ws.path / "solution.py").write_text(make_code(1.0))
+                result = toolkit.task.evaluate(make_code(1.0))
+                write_result(ws.path, result)
+                ws.commit(success=result.completed)
+
+        opt = SimpleOptimizer(
+            task, strategy=WatchingStrategy(),
+            seed=42, history=history, seed_strategy=None,
+        )
+        opt.toolkit.agent_through = "validate"
+        opt.run(n=3)
+
+        assert seen == ["validate", "validate", "validate"]
+
+
+def test_queue_wait_learnings_serializes_concurrent_writes():
+    """Concurrent add() calls don't drop entries when wrapped in QueueWaitLearnings."""
+    import threading
+    from groundhog import QueueWaitLearnings, MarkdownLearnings
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inner = MarkdownLearnings(Path(tmp))
+        l = QueueWaitLearnings(inner)
+
+        N = 20
+        barrier = threading.Barrier(N)
+        errors = []
+
+        def adder(i: int):
+            try:
+                barrier.wait(timeout=10)
+                l.add(f"entry-{i:02d}")
+            except BaseException as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=adder, args=(i,)) for i in range(N)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert not errors, f"adders raised: {errors}"
+        text = l.get()
+        for i in range(N):
+            assert f"entry-{i:02d}" in text, f"missing entry-{i:02d}"
+
+
+def test_queue_wait_reclaims_stale_markers():
+    """Markers older than the TTL are removed and don't block new claims."""
+    from groundhog import QueueWaitLearnings, MarkdownLearnings
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inner = MarkdownLearnings(Path(tmp))
+        l = QueueWaitLearnings(inner, ttl_seconds=0.5)
+
+        # Plant a stale marker as if a previous writer crashed.
+        stale = l.queue_dir / f"{0:020d}_999_deadbeef.intent"
+        stale.mkdir()
+        old = time.time() - 60
+        os.utime(stale, (old, old))
+
+        # add() should reclaim the stale marker and proceed.
+        l.add("after-recovery")
+        assert "after-recovery" in l.get()
+        assert not stale.exists()
 
 
 def test_user_get_prior_hook_is_respected():
@@ -633,6 +1094,45 @@ def test_folder_history_lineage():
         attempt2 = h.list()[-1]
         lineage = h.lineage(attempt2)
         assert [a.number for a in lineage] == [1, 2]
+
+
+# === Queue (tools/queue.py) ===
+
+def test_queue_preserves_file_when_drained():
+    """queue.json stays as `[]` after the last item is consumed.
+
+    Tools that treat the queue as visible persistent state (CLIs, editors)
+    can rely on the file always existing once it has been used.
+    """
+    from groundhog.tools.queue import add, read_next
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp)
+        add(path, "fresh_approach", config={"mode": "blank"})
+        add(path, "analyse")
+
+        item1 = read_next(path)
+        assert item1["strategy"] == "fresh_approach"
+        item2 = read_next(path)
+        assert item2["strategy"] == "analyse"
+
+        # Queue is drained but file still exists.
+        queue_file = path / "queue.json"
+        assert queue_file.exists()
+        assert json.loads(queue_file.read_text()) == []
+
+        # Subsequent reads return None without recreating or deleting the file.
+        assert read_next(path) is None
+        assert queue_file.exists()
+
+
+def test_queue_returns_none_when_file_absent():
+    """read_next is a no-op when no queue file has ever been created."""
+    from groundhog.tools.queue import read_next
+
+    with tempfile.TemporaryDirectory() as tmp:
+        assert read_next(Path(tmp)) is None
+        assert not (Path(tmp) / "queue.json").exists()
 
 
 # === MarkdownLearnings tests ===

@@ -15,7 +15,13 @@ from typing import Any, Dict, Optional
 
 
 def read_next(path: Path) -> Optional[Dict[str, Any]]:
-    """Pop and return the first queue item. Returns None if queue is empty."""
+    """Pop and return the first queue item. Returns None if queue is empty.
+
+    The queue file is preserved as ``[]`` after the last item is consumed
+    (rather than being unlinked), so tools that treat ``queue.json`` as
+    visible persistent state can rely on it always existing once the queue
+    has been used.
+    """
     queue_path = Path(path) / "queue.json"
     if not queue_path.exists():
         return None
@@ -29,11 +35,7 @@ def read_next(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
     item = items.pop(0)
-    if items:
-        queue_path.write_text(json.dumps(items, indent=2), encoding="utf-8")
-    else:
-        queue_path.unlink()
-
+    queue_path.write_text(json.dumps(items, indent=2), encoding="utf-8")
     return item
 
 
