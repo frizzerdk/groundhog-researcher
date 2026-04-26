@@ -44,17 +44,19 @@ class FreshApproach(Strategy):
         self._do_work(toolkit, ws)
         self.log.tock()
         self.log.inline("approach... ")
-        self._generate_approach(toolkit, ws)
+        self._generate_direction(toolkit, ws)
         self.log.tock()
         self.log.inline("evaluating... ")
         result = self._evaluate_with_retries(toolkit, ws)
         self.log.tock()
-        from groundhog.utils.results import write_result
-        write_result(ws.path, result, metadata={
+        metadata = {
             "strategy": "fresh_approach",
             "mode": self.cfg.mode,
             "cost": round(self.cost, 6),
-        })
+        }
+        self._apply_fresh_direction_gate(toolkit, ws, result, metadata)
+        from groundhog.utils.results import write_result
+        write_result(ws.path, result, metadata=metadata)
         attempt = ws.commit(success=result.completed)
         return self._build_log(attempt, result, toolkit)
 
@@ -146,26 +148,65 @@ Write complete, runnable code in a ```python block."""
         if code:
             (ws.path / "solution.py").write_text(code, encoding="utf-8")
 
-    # --- Approach description ---
+    # --- Core direction (family identity) ---
 
-    def _generate_approach(self, toolkit, ws):
-        """Ask LLM to describe the approach in 2-3 sentences. Written as attempt metadata."""
+    def _generate_direction(self, toolkit, ws):
+        """Mint the family's core direction from the freshly-generated code.
+
+        Written as ``core_direction.md`` at attempt root; descendants
+        (refine, agent, cross-pollinate) inherit it byte-for-byte.
+        """
         code_path = ws.path / "solution.py"
         if not code_path.exists() or not hasattr(toolkit, 'llm'):
             return
 
         code = code_path.read_text(encoding="utf-8")
         prompt = (
-            f"Describe the core approach of this code in 2-3 sentences. "
-            f"Focus on the algorithm and technique, not implementation details.\n\n"
+            "Describe this code's CORE DIRECTION in 1-2 short lines: the "
+            "algorithmic invariant a follow-up attempt should preserve "
+            '(e.g. "CNN architecture", "rollout-based search", '
+            '"rule-based with hand-tuned weights"). Narrow on purpose — '
+            "not a description of the whole implementation, just the "
+            "backbone that defines the family.\n\n"
             f"```python\n{code}\n```"
         )
         response = toolkit.llm.get("default").generate(
             prompt=prompt,
-            system_prompt="Write a brief, factual description of the algorithm. No preamble."
+            system_prompt=(
+                "Write the core direction as 1-2 lines. No preamble, no "
+                "code, no markdown headers."
+            ),
         )
         self.cost += response.cost
-        (ws.path / "approach.md").write_text(response.text.strip(), encoding="utf-8")
+        from groundhog.utils.direction import write_direction
+        write_direction(ws.path, response.text)
+
+    def _apply_fresh_direction_gate(self, toolkit, ws, result, metadata):
+        """Fresh directions must exist and must not duplicate history."""
+        from groundhog.utils.direction import (
+            attempt_number_from_path,
+            direction_exists,
+            mark_result_failed,
+            read_direction,
+        )
+
+        direction = read_direction(ws.path)
+        if not direction:
+            reason = "fresh attempt did not create core_direction.md"
+            metadata["gate_failure"] = reason
+            mark_result_failed(result, "core_direction", reason)
+            return
+
+        history = getattr(toolkit, "history", None)
+        if direction_exists(
+            history,
+            direction,
+            exclude=[attempt_number_from_path(ws.path)],
+            only_done=False,
+        ):
+            reason = "fresh attempt duplicated an existing core direction"
+            metadata["gate_failure"] = reason
+            mark_result_failed(result, "core_direction", reason)
 
     # --- Evaluation with retries ---
 

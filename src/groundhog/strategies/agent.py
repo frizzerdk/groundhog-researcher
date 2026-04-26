@@ -39,6 +39,17 @@ class AgentConfig(StrategyConfig):
     effort: Optional[str] = param(None, "Override agent effort/reasoning level")
     guidance: str = param("", "Additional guidance appended to agent prompt")
     tier: str = param("default", "Agent backend tier (default/high/budget)")
+    core_direction: str = param(
+        "",
+        "Optional initial core_direction.md text. Canonical name for fresh "
+        "direction families; initial_direction is kept as a legacy alias.",
+    )
+    initial_direction: str = param(
+        "",
+        "Optional initial core_direction.md text. If set, written to attempt "
+        "root before the agent runs (used by PlanApproaches to seed a new "
+        "fresh-direction family).",
+    )
 
 
 # --- Permissions (depth-based, deepest/last wins) ---
@@ -123,6 +134,8 @@ automatically move to a submission phase.
 - Edit work/solution.py directly — it will be submitted automatically
 - Run `{eval_command}` to evaluate (reads work/solution.py by default)
 - work/ is your writable area for solution, experiments, and artifacts
+- Preserve core_direction.md as the algorithmic backbone when it exists
+- Do not fall back to the parent solution; byte-identical children are non-promotable
 - Focus on understanding before changing — blind edits waste iterations
 {budget_info}{guidance}
 
@@ -179,6 +192,8 @@ You have one session to improve the solution.
 - Edit work/solution.py directly — it will be submitted automatically
 - Run `{eval_command}` to evaluate (reads work/solution.py by default)
 - work/ is your writable area for solution, experiments, and artifacts
+- Preserve core_direction.md as the algorithmic backbone when it exists
+- Do not fall back to the parent solution; byte-identical children are non-promotable
 - Focus on understanding before changing — blind edits waste iterations
 {budget_info}{guidance}
 
@@ -268,6 +283,9 @@ class AgentStrategy(Strategy):
         self.cost = 0.0
         self._event_line_len = 0
         self._event_count = 0
+        # Stash for use during finalize / subclass hooks (e.g. FreshAgent
+        # generates its core direction post-session and needs LLM access).
+        self._toolkit = toolkit
 
     def _on_event(self, event):
         """Live progress callback — overwrites a single status line with counter."""
@@ -333,12 +351,12 @@ class AgentStrategy(Strategy):
         # Strategy-managed files in attempt root
         (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get(), encoding="utf-8")
 
-        # Copy approach.md from prior (read-only for agent)
+        # Inherit core direction from prior (read-only for the agent during
+        # the session; re-enforced at commit so an agent can't fork the family
+        # by rewriting it).
         if prior is not None and hasattr(prior, 'path'):
-            approach_path = prior.path / "approach.md"
-            if approach_path.exists():
-                (ws.path / "approach.md").write_text(
-                    approach_path.read_text(encoding="utf-8"), encoding="utf-8")
+            from groundhog.utils.direction import inherit_direction
+            inherit_direction(prior.path, ws.path)
 
         # Seed work/solution.py from prior
         if prior:
@@ -380,8 +398,17 @@ class AgentStrategy(Strategy):
             from groundhog.agents.tools import build_eval_tools, build_prior_tools
 
             promote_dest = (ws.path / "solution.py") if phase == "explore" else None
+            parent_solution_path = (
+                Path(prior.path) / "solution.py"
+                if prior is not None and hasattr(prior, "path")
+                else None
+            )
             tools += build_eval_tools(
-                toolkit, ws.path, through=self.through, promote_dest=promote_dest,
+                toolkit,
+                ws.path,
+                through=self.through,
+                promote_dest=promote_dest,
+                parent_solution_path=parent_solution_path,
             )
 
             if prior is not None:
@@ -395,10 +422,15 @@ class AgentStrategy(Strategy):
                         prior,
                         history=getattr(toolkit, "history", None),
                         scorer=final_scorer,
+                        **self._prior_tool_options(toolkit, ws, prior),
                     )
                 )
 
         return tools
+
+    def _prior_tool_options(self, toolkit, ws, prior):
+        """Hook for subclasses that want wider/narrower prior visibility."""
+        return {}
 
     # --- Helpers ---
 
@@ -455,12 +487,18 @@ class AgentStrategy(Strategy):
         return ""
 
     def _build_approach_context(self, ws):
-        """Build optional approach section from approach.md."""
-        approach_path = ws.path / "approach.md"
-        if approach_path.exists():
-            text = approach_path.read_text(encoding="utf-8").strip()
-            if text:
-                return f"\n## Approach (preserve this direction)\n\n{text}\n"
+        """Build the optional 'core direction' section for the explore prompt."""
+        from groundhog.utils.direction import read_direction
+        text = read_direction(ws.path)
+        if text and text.strip():
+            return (
+                "\n## Core direction (preserve this — the algorithmic invariant "
+                "of this family)\n\n"
+                f"{text.strip()}\n\n"
+                "You may change implementation details, parameters, helpers, "
+                "preprocessing, and optimizations. Do not replace the core "
+                "direction unless this is a fresh-direction strategy.\n"
+            )
         return ""
 
     # --- Phases ---
@@ -651,9 +689,73 @@ class AgentStrategy(Strategy):
     def _finalize(self, ws, result, prior):
         """Write result.json. solution.py at root is maintained throughout the
         run by promote-best (explore) and the fix-loop copy — don't overwrite
-        it here or we'd regress to the agent's last edit."""
+        it here or we'd regress to the agent's last edit.
+
+        Direction handling:
+            - prior is None (fresh-direction strategy): promote any
+              ``work/core_direction.md`` the agent wrote to attempt root.
+            - prior is not None (inheritance strategy): re-copy parent's
+              ``core_direction.md`` to attempt root, overwriting anything
+              the agent might have written. This is the soft-gate that
+              keeps families from forking mid-session.
+
+        Solution-duplicate guard: if the committed ``solution.py`` is
+        byte-identical to the parent's, mark the attempt as non-promotable
+        in metadata so selectors skip it. Diversity > a few BT points.
+        """
+        from groundhog.utils.direction import (
+            attempt_number_from_path,
+            direction_exists,
+            enforce_inherited_direction,
+            inherited_direction_changed,
+            mark_result_failed,
+            promote_workspace_direction,
+            read_direction,
+        )
+        metadata = self._build_metadata(prior)
+
+        if prior is None:
+            promote_workspace_direction(ws.path)
+            direction = read_direction(ws.path)
+            history = getattr(getattr(self, "_toolkit", None), "history", None)
+            if not direction:
+                reason = "fresh attempt did not create core_direction.md"
+                metadata["gate_failure"] = reason
+                mark_result_failed(result, "core_direction", reason)
+            elif direction_exists(
+                history,
+                direction,
+                exclude=[attempt_number_from_path(ws.path)],
+                only_done=False,
+            ):
+                reason = "fresh attempt duplicated an existing core direction"
+                metadata["gate_failure"] = reason
+                mark_result_failed(result, "core_direction", reason)
+        elif hasattr(prior, "path"):
+            if inherited_direction_changed(ws.path, prior.path):
+                metadata["direction_restored"] = True
+            enforce_inherited_direction(ws.path, prior.path)
+
+        if self._is_solution_duplicate(ws, prior):
+            metadata["non_promotable"] = True
+            metadata["non_promotable_reason"] = "solution.py is byte-identical to parent"
+
         from groundhog.utils.results import write_result
-        write_result(ws.path, result, metadata=self._build_metadata(prior))
+        write_result(ws.path, result, metadata=metadata)
+
+    @staticmethod
+    def _is_solution_duplicate(ws, prior) -> bool:
+        """True iff the committed solution.py equals the parent's byte-for-byte."""
+        if prior is None or not hasattr(prior, "path"):
+            return False
+        ours = ws.path / "solution.py"
+        theirs = prior.path / "solution.py"
+        if not ours.exists() or not theirs.exists():
+            return False
+        try:
+            return ours.read_bytes() == theirs.read_bytes()
+        except OSError:
+            return False
 
     # --- Logging ---
 

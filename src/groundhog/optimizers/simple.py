@@ -42,7 +42,12 @@ class SimpleOptimizer(Optimizer):
                  learnings: Optional[Learnings] = None,
                  through: Optional[str] = None,
                  agent_through: Optional[str] = None,
-                 seed_strategy="default"):
+                 seed_strategy="default",
+                 direction_weight: float = 0.5,
+                 direction_decay: float = 0.1,
+                 exclude_non_promotable: bool = True,
+                 direction_bonus: Optional[float] = None,
+                 skip_non_promotable: Optional[bool] = None):
         """Configure the optimizer.
 
         ``extras`` registers strategies that are reachable from the queue but
@@ -56,6 +61,13 @@ class SimpleOptimizer(Optimizer):
         self.seed = seed
         self.through = through
         self.agent_through = agent_through
+        if direction_bonus is not None:
+            direction_weight = direction_bonus
+        if skip_non_promotable is not None:
+            exclude_non_promotable = skip_non_promotable
+        self.direction_weight = direction_weight
+        self.direction_decay = direction_decay
+        self.exclude_non_promotable = exclude_non_promotable
         self.path = Path(path) if path else Path(".")
         self.history = history or FolderAttemptHistory(self.path)
         self.learnings = learnings or MarkdownLearnings(self.path)
@@ -81,7 +93,7 @@ class SimpleOptimizer(Optimizer):
             self._register_strategy(s, allow_overwrite=False)
 
         # Build toolkit
-        self.toolkit = Toolkit(task=self.task, history=self.history)
+        self.toolkit = Toolkit(task=self.task, history=self.history, path=self.path)
         self.toolkit.learnings = self.learnings
         self.toolkit.log = StrategyLog()
         if self.through:
@@ -107,7 +119,14 @@ class SimpleOptimizer(Optimizer):
         # customise belongs on the toolkit at construction time.
         self.toolkit.rng = random.Random(self.seed)
         scorer = self._get_scorer()
-        self.toolkit.get_prior = lambda tk: select_prior(tk.history, scorer, tk.rng)
+        self.toolkit.get_prior = lambda tk: select_prior(
+            tk.history,
+            scorer,
+            tk.rng,
+            direction_weight=self.direction_weight,
+            direction_decay=self.direction_decay,
+            exclude_non_promotable=self.exclude_non_promotable,
+        )
 
     def _register_strategy(self, strategy: Strategy, allow_overwrite: bool = True) -> None:
         """Add a strategy to the queue-resolution registry under both its
@@ -267,16 +286,49 @@ class SimpleOptimizer(Optimizer):
         print("Trunks:")
         for trunk, best_score in scored_trunks:
             chain = " ->".join(f"#{a.number}" for a in trunk)
-            # Read approach from root attempt if available
+            # Show the family's core direction (1st line) from the trunk root.
             root = trunk[0]
-            approach = ""
-            if hasattr(root, 'path'):
-                approach_path = root.path / "approach.md"
-                if approach_path.exists():
-                    approach = approach_path.read_text(encoding="utf-8").strip().split('\n')[0][:80]
-            approach_str = f" | {approach}" if approach else ""
-            print(f"  {chain} (best: {best_score:.4f}, {len(trunk)} attempts){approach_str}")
+            from groundhog.utils.direction import read_direction, direction_title
+            text = read_direction(root.path) if hasattr(root, 'path') else None
+            direction = direction_title(text or "")
+            direction_str = f" | {direction}" if direction != "(no direction)" else ""
+            print(f"  {chain} (best: {best_score:.4f}, {len(trunk)} attempts){direction_str}")
         print()
+
+        # Direction families — orthogonal grouping (one direction may span
+        # multiple trunks; one trunk may contain multiple directions if a
+        # cross-pollinate child outscored a different-family parent).
+        families = self.history.derive_families()
+        if families and any(self._family_key(f) is not None for f in families):
+            from groundhog.utils.direction import read_direction, direction_title
+            print("Direction families:")
+            family_rows = []
+            for members in families:
+                key = self._family_key(members)
+                if key is None:
+                    title = "(no direction)"
+                else:
+                    sample = read_direction(members[0].path)
+                    title = direction_title(sample or "")
+                best_score = max(self._score_attempt(a, scorer) for a in members)
+                best_attempt = max(members, key=lambda a: self._score_attempt(a, scorer))
+                family_rows.append((title, len(members), best_score, best_attempt.number))
+            # Sort by best score descending; sentinel last.
+            family_rows.sort(
+                key=lambda r: (r[0] == "(no direction)", -r[2])
+            )
+            for title, count, best, best_num in family_rows:
+                print(f"  [{count:>3}] best #{best_num} ({best:.4f}) | {title}")
+            print()
+
+    @staticmethod
+    def _family_key(members):
+        """Return the family's normalized direction key (None for sentinel)."""
+        from groundhog.utils.direction import read_direction, normalize_direction
+        if not members:
+            return None
+        text = read_direction(members[0].path) if hasattr(members[0], "path") else None
+        return normalize_direction(text) if text else None
 
     def run(self, n: int = 10):
         scorer = self._get_scorer()

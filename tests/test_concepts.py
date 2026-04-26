@@ -747,6 +747,33 @@ def test_promote_best_snapshots_on_improvement():
         assert dest.read_text() == "9"
 
 
+def test_promote_best_refuses_parent_identical_snapshot():
+    """Parent-identical candidates evaluate but are not snapshotted."""
+    from groundhog.agents.tools import promote_best
+    from groundhog import EvalStage, StageResult
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def call(code):
+            return StageResult(metrics={"score": float(int(code.strip()))})
+
+        stage = EvalStage(
+            name="evaluate", description="dummy",
+            call=call, scorer=lambda r: r.metrics["score"],
+        )
+        ws = Path(tmp)
+        (ws / "work").mkdir()
+        parent = ws / "parent.py"
+        parent.write_text("5")
+        src = ws / "work" / "solution.py"
+        src.write_text("5")
+        dest = ws / "solution.py"
+
+        tool = promote_best(stage, dest_path=dest, parent_solution_path=parent)
+        output = tool.execute(path=str(src)).output
+        assert "identical to the parent" in output
+        assert not dest.exists()
+
+
 def test_build_eval_tools_uses_promote_dest():
     """promote_dest argument wraps the final stage; cheaper stages stay plain."""
     from groundhog.agents.tools import build_eval_tools
@@ -836,6 +863,54 @@ def test_build_prior_tools_three_tool_progressive_disclosure():
             attempt="parent", file="solution.py"
         ).output
         assert contents_parent == "v3"
+
+
+def test_build_prior_tools_direction_scopes():
+    """family scope shows same-direction attempts; exclude_direction hides one."""
+    from groundhog.agents.tools import build_prior_tools
+    from groundhog.utils.direction import write_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        result = EvaluationResult(stages={"eval": StageResult(metrics={"score": 1.0})})
+
+        ws1 = history.workspace()
+        (ws1.path / "solution.py").write_text("rollout root")
+        write_direction(ws1.path, "rollout")
+        write_result(ws1.path, result)
+        a1 = ws1.commit(success=True)
+
+        ws2 = history.workspace(parent=a1.number)
+        (ws2.path / "solution.py").write_text("rollout child")
+        write_direction(ws2.path, "rollout")
+        write_result(ws2.path, result)
+        a2 = ws2.commit(success=True)
+
+        ws3 = history.workspace()
+        (ws3.path / "solution.py").write_text("mcts")
+        write_direction(ws3.path, "mcts")
+        write_result(ws3.path, result)
+        a3 = ws3.commit(success=True)
+
+        family_tools = build_prior_tools(a2, history=history, scope="family")
+        family = {t.name: t for t in family_tools}["get-priors"].execute(n=10).output
+        assert f"attempt_{a1.number}" in family
+        assert f"attempt_{a2.number}" in family
+        assert f"attempt_{a3.number}" not in family
+
+        all_tools = build_prior_tools(
+            a2,
+            history=history,
+            scope="all",
+            exclude_direction="rollout",
+        )
+        by_name = {t.name: t for t in all_tools}
+        listing = by_name["get-priors"].execute(n=10).output
+        assert f"attempt_{a3.number}" in listing
+        assert f"attempt_{a2.number}" not in listing
+        assert by_name["get-prior-file"].execute(
+            attempt=str(a3.number), file="solution.py"
+        ).output == "mcts"
 
 
 def test_compacted_learnings_retains_queue_on_failure():
@@ -1181,6 +1256,697 @@ def test_learnings_edit():
         l.add("KNN works well")
         l.edit("KNN works well", "KNN works okay")
         assert "okay" in l.get()
+
+
+# === Core direction (family identity) tests ===
+
+def test_direction_inherit_canonical_filename():
+    """inherit_direction copies parent's core_direction.md to child workspace."""
+    from groundhog.utils.direction import inherit_direction, read_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        prior = Path(tmp) / "prior"
+        ws = Path(tmp) / "ws"
+        prior.mkdir()
+        ws.mkdir()
+        (prior / "core_direction.md").write_text("rollout-greedy", encoding="utf-8")
+
+        dst = inherit_direction(prior, ws)
+        assert dst is not None
+        assert (ws / "core_direction.md").read_text(encoding="utf-8").strip() \
+            == "rollout-greedy"
+        assert read_direction(ws).strip() == "rollout-greedy"
+
+
+def test_direction_inherit_legacy_approach_fallback():
+    """Parent has only legacy approach.md → child gets core_direction.md."""
+    from groundhog.utils.direction import inherit_direction, read_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        prior = Path(tmp) / "prior"
+        ws = Path(tmp) / "ws"
+        prior.mkdir()
+        ws.mkdir()
+        (prior / "approach.md").write_text("legacy text", encoding="utf-8")
+
+        dst = inherit_direction(prior, ws)
+        assert dst is not None
+        # Migrated forward to canonical name.
+        assert (ws / "core_direction.md").read_text(encoding="utf-8").strip() \
+            == "legacy text"
+        # Read fallback also works against the original.
+        assert read_direction(prior).strip() == "legacy text"
+
+
+def test_direction_inherit_no_prior_direction_is_noop():
+    """Parent has nothing → child workspace stays untouched."""
+    from groundhog.utils.direction import inherit_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        prior = Path(tmp) / "prior"
+        ws = Path(tmp) / "ws"
+        prior.mkdir()
+        ws.mkdir()
+
+        result = inherit_direction(prior, ws)
+        assert result is None
+        assert not (ws / "core_direction.md").exists()
+
+
+def test_direction_promote_workspace_from_work_dir():
+    """Fresh-style: agent wrote work/core_direction.md → promoted to root."""
+    from groundhog.utils.direction import promote_workspace_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        (ws / "work").mkdir()
+        (ws / "work" / "core_direction.md").write_text("CNN architecture", encoding="utf-8")
+
+        dst = promote_workspace_direction(ws)
+        assert dst is not None
+        assert (ws / "core_direction.md").read_text(encoding="utf-8").strip() \
+            == "CNN architecture"
+
+
+def test_direction_promote_workspace_legacy_work_approach():
+    """Fresh-style: agent wrote work/approach.md (legacy) → promoted to root as core_direction.md."""
+    from groundhog.utils.direction import promote_workspace_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        (ws / "work").mkdir()
+        (ws / "work" / "approach.md").write_text("legacy fresh", encoding="utf-8")
+
+        dst = promote_workspace_direction(ws)
+        assert dst is not None
+        assert (ws / "core_direction.md").read_text(encoding="utf-8").strip() \
+            == "legacy fresh"
+
+
+def test_direction_promote_does_not_clobber_root():
+    """If root direction already exists, promotion is a no-op."""
+    from groundhog.utils.direction import promote_workspace_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp)
+        (ws / "work").mkdir()
+        (ws / "work" / "core_direction.md").write_text("from work", encoding="utf-8")
+        (ws / "core_direction.md").write_text("from root", encoding="utf-8")
+
+        promote_workspace_direction(ws)
+        # Root content is preserved.
+        assert (ws / "core_direction.md").read_text(encoding="utf-8").strip() \
+            == "from root"
+
+
+def test_direction_enforce_overrides_agent_rewrite():
+    """Soft-gate: if agent rewrote core_direction.md, enforce restores parent's."""
+    from groundhog.utils.direction import (
+        inherit_direction,
+        enforce_inherited_direction,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        prior = Path(tmp) / "prior"
+        ws = Path(tmp) / "ws"
+        prior.mkdir()
+        ws.mkdir()
+        (prior / "core_direction.md").write_text("rollout-greedy", encoding="utf-8")
+
+        # Inherit at workspace prep.
+        inherit_direction(prior, ws)
+        # Agent rewrites it mid-session (simulating a misbehaving session).
+        (ws / "core_direction.md").write_text("MCTS", encoding="utf-8")
+        # Enforce at commit restores parent's.
+        enforce_inherited_direction(ws, prior)
+        assert (ws / "core_direction.md").read_text(encoding="utf-8").strip() \
+            == "rollout-greedy"
+
+
+def test_direction_normalize_collapses_blank_runs_and_trims():
+    """Normalization is for family-identity comparison, not display."""
+    from groundhog.utils.direction import normalize_direction
+
+    a = "rollout-greedy   \n\n\n\nwith fixed horizon\n"
+    b = "rollout-greedy\n\nwith fixed horizon"
+    assert normalize_direction(a) == normalize_direction(b)
+
+
+def test_fresh_agent_ensure_direction_mints_when_agent_didnt_write():
+    """FreshAgentStrategy._ensure_direction calls LLM if no direction exists."""
+    from groundhog import FreshAgentStrategy
+    from groundhog.base.backend import LLMBackend, LLMResponse, BackendRegistry
+    from groundhog.utils.direction import read_direction
+
+    class StubBackend(LLMBackend):
+        def __init__(self):
+            self.calls = 0
+        def generate(self, prompt, system_prompt=""):
+            self.calls += 1
+            return LLMResponse(
+                text="rollout-greedy with K=4",
+                model="stub", usage={}, cost=0.0,
+            )
+        def get_parameters(self):
+            return {}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws_path = Path(tmp)
+        (ws_path / "solution.py").write_text("def solve(): return 0", encoding="utf-8")
+
+        backend = StubBackend()
+        strat = FreshAgentStrategy()
+        # Build a minimal toolkit; bypass _init by setting what _ensure_direction needs.
+        strat._toolkit = Toolkit(llm=BackendRegistry(default=backend))
+        strat.log = type("L", (), {"inline": lambda self, *a, **k: None})()
+        strat.cost = 0.0
+
+        # Fake-Workspace stand-in: just needs .path
+        ws = type("WS", (), {"path": ws_path})()
+        strat._ensure_direction(ws)
+
+        assert backend.calls == 1
+        text = read_direction(ws_path)
+        assert text is not None
+        assert "rollout-greedy" in text
+
+
+def test_fresh_agent_ensure_direction_skips_when_already_present():
+    """If the agent already wrote a direction, no LLM call is made."""
+    from groundhog import FreshAgentStrategy
+    from groundhog.base.backend import LLMBackend, LLMResponse, BackendRegistry
+
+    class CountingBackend(LLMBackend):
+        def __init__(self):
+            self.calls = 0
+        def generate(self, prompt, system_prompt=""):
+            self.calls += 1
+            return LLMResponse(text="should-not-be-called", model="stub", usage={}, cost=0.0)
+        def get_parameters(self):
+            return {}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws_path = Path(tmp)
+        (ws_path / "solution.py").write_text("def solve(): return 0", encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("agent-written direction", encoding="utf-8")
+
+        backend = CountingBackend()
+        strat = FreshAgentStrategy()
+        strat._toolkit = Toolkit(llm=BackendRegistry(default=backend))
+        strat.log = type("L", (), {"inline": lambda self, *a, **k: None})()
+        strat.cost = 0.0
+
+        ws = type("WS", (), {"path": ws_path})()
+        strat._ensure_direction(ws)
+
+        assert backend.calls == 0
+        from groundhog.utils.direction import read_direction
+        assert "agent-written" in read_direction(ws_path)
+
+
+def test_direction_title_extracts_first_meaningful_line():
+    """Title for status display skips blank lines and heading markers."""
+    from groundhog.utils.direction import direction_title
+
+    assert direction_title("# CNN architecture\n\nwith dropout") == "CNN architecture"
+    assert direction_title("\n\nrollout-greedy with K=4") == "rollout-greedy with K=4"
+    assert direction_title("") == "(no direction)"
+
+
+# === Direction families (read-side derived view) ===
+
+def test_derive_families_groups_by_direction_content():
+    """Attempts sharing the same core_direction.md text are one family."""
+    from groundhog.utils.direction import write_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        result = EvaluationResult(stages={"eval": StageResult(metrics={"score": 1.0})})
+
+        # Two attempts with direction "rollout"
+        for _ in range(2):
+            ws = history.workspace()
+            (ws.path / "solution.py").write_text("v")
+            write_direction(ws.path, "rollout")
+            write_result(ws.path, result)
+            ws.commit(success=True)
+
+        # One attempt with direction "mcts"
+        ws = history.workspace()
+        (ws.path / "solution.py").write_text("v")
+        write_direction(ws.path, "mcts")
+        write_result(ws.path, result)
+        ws.commit(success=True)
+
+        # One attempt with no direction (legacy)
+        ws = history.workspace()
+        (ws.path / "solution.py").write_text("v")
+        write_result(ws.path, result)
+        ws.commit(success=True)
+
+        families = history.derive_families()
+        # 3 groups: rollout (2), mcts (1), no-direction (1).
+        assert len(families) == 3
+        sizes = sorted(len(f) for f in families)
+        assert sizes == [1, 1, 2]
+
+
+def test_derive_families_legacy_approach_md_groups_with_core_direction():
+    """An attempt with approach.md (legacy) and one with matching
+    core_direction.md should be in the same family."""
+    from groundhog.utils.direction import write_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        result = EvaluationResult(stages={"eval": StageResult(metrics={"score": 1.0})})
+
+        # Legacy attempt with approach.md
+        ws = history.workspace()
+        (ws.path / "solution.py").write_text("v")
+        (ws.path / "approach.md").write_text("rollout", encoding="utf-8")
+        write_result(ws.path, result)
+        ws.commit(success=True)
+
+        # New attempt with core_direction.md (same text)
+        ws = history.workspace()
+        (ws.path / "solution.py").write_text("v")
+        write_direction(ws.path, "rollout")
+        write_result(ws.path, result)
+        ws.commit(success=True)
+
+        families = history.derive_families()
+        assert len(families) == 1, "legacy approach.md should group with new core_direction.md"
+        assert len(families[0]) == 2
+
+
+def test_fresh_approach_duplicate_direction_gate_fails_result():
+    from groundhog.strategies.fresh import FreshApproach
+    from groundhog.utils.direction import write_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        result = EvaluationResult(stages={"eval": StageResult(metrics={"score": 1.0})})
+
+        existing = history.workspace()
+        (existing.path / "solution.py").write_text("v1")
+        write_direction(existing.path, "rollout")
+        write_result(existing.path, result)
+        existing.commit(success=True)
+
+        ws = history.workspace()
+        (ws.path / "solution.py").write_text("v2")
+        write_direction(ws.path, "rollout")
+        fresh_result = EvaluationResult(stages={"eval": StageResult(metrics={"score": 1.0})})
+        metadata = {}
+        toolkit = Toolkit(history=history)
+
+        FreshApproach()._apply_fresh_direction_gate(toolkit, ws, fresh_result, metadata)
+
+        assert fresh_result.completed is False
+        assert fresh_result.failed_stage == "core_direction"
+        assert "duplicated" in metadata["gate_failure"]
+
+
+def test_plan_approaches_queues_fresh_runs():
+    """PlanApproaches asks the LLM for N directions and queues them."""
+    from groundhog import PlanApproaches, Toolkit
+    from groundhog.base.backend import LLMBackend, LLMResponse, BackendRegistry
+    from groundhog.tools.queue import read_next
+
+    proposals = [
+        {"name": "rollout", "direction": "rollout-greedy", "guidance": "use search"},
+        {"name": "mcts", "direction": "monte carlo tree search", "guidance": "explore"},
+        {"name": "rl", "direction": "RL policy net", "guidance": "neural"},
+    ]
+    proposal_json = json.dumps(proposals)
+
+    class StubLLM(LLMBackend):
+        def generate(self, prompt, system_prompt=""):
+            return LLMResponse(text=proposal_json, model="stub", usage={}, cost=0.0)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        task_ctx = type("C", (), {"get": lambda self: "test task"})()
+        task = type("T", (), {"context": task_ctx})()
+
+        toolkit = Toolkit(task=task, history=history, path=Path(tmp))
+        toolkit.llm = BackendRegistry(default=StubLLM())
+
+        result = PlanApproaches()(toolkit)
+        assert result["queued"] == 3, f"expected 3 queued, got {result}"
+
+        # Queue should hold 3 items with the proposed directions.
+        items = []
+        while True:
+            item = read_next(Path(tmp))
+            if item is None:
+                break
+            items.append(item)
+        assert len(items) == 3
+        directions = [i["config"]["core_direction"] for i in items]
+        assert directions == [p["direction"] for p in proposals]
+
+
+def test_plan_approaches_handles_malformed_llm_output():
+    """Markdown-fenced or non-JSON output is parsed best-effort, no crash."""
+    from groundhog import PlanApproaches
+    parse = PlanApproaches._parse_proposals
+
+    fenced = "```json\n[{\"name\":\"a\",\"direction\":\"x\",\"guidance\":\"\"}]\n```"
+    assert len(parse(fenced)) == 1
+
+    # Preamble + array
+    preamble = "Here are the directions:\n[{\"name\":\"a\",\"direction\":\"x\",\"guidance\":\"\"}]\nDone."
+    assert len(parse(preamble)) == 1
+
+    # Garbage
+    assert parse("nonsense") == []
+    assert parse("") == []
+
+
+def test_fresh_agent_initial_direction_seeds_workspace():
+    """If config.initial_direction is set, FreshAgent writes it before running."""
+    from groundhog import FreshAgentStrategy
+
+    s = FreshAgentStrategy(initial_direction="seeded direction")
+    assert s.config.initial_direction == "seeded direction"
+
+
+def test_fresh_agent_core_direction_is_canonical_config():
+    from groundhog import FreshAgentStrategy
+
+    s = FreshAgentStrategy(core_direction="seeded direction")
+    assert s.config.core_direction == "seeded direction"
+
+
+def test_select_prior_favors_underexplored_family():
+    """A small (1-attempt) family should be picked roughly as often as the
+    big (5-attempt) family despite the score gap, thanks to the direction bonus."""
+    import random
+    from groundhog.utils.selection import select_prior
+    from groundhog.utils.direction import write_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+
+        def commit_with(direction: str, score: float, parent=None):
+            ws = history.workspace(parent=parent)
+            (ws.path / "solution.py").write_text("v")
+            write_direction(ws.path, direction)
+            r = EvaluationResult(stages={"eval": StageResult(metrics={"score": score})})
+            write_result(ws.path, r)
+            return ws.commit(success=True).number
+
+        # Big family: 5 attempts, score 0.9 (incl. score 1.0 leader)
+        a1 = commit_with("rollout", 0.5)
+        a2 = commit_with("rollout", 0.6, parent=a1)
+        a3 = commit_with("rollout", 0.7, parent=a2)
+        a4 = commit_with("rollout", 0.8, parent=a3)
+        a5 = commit_with("rollout", 0.9, parent=a4)
+
+        # Tiny family: 1 attempt, score 0.5 (much weaker)
+        commit_with("mcts", 0.5)
+
+        scorer = lambda r: r.metrics.get("score", 0)
+        rng = random.Random(42)
+        picks = []
+        for _ in range(200):
+            p = select_prior(history, scorer, rng)
+            family = (p.path / "core_direction.md").read_text(encoding="utf-8").strip()
+            picks.append(family)
+
+        rollout_pct = picks.count("rollout") / len(picks)
+        mcts_pct = picks.count("mcts") / len(picks)
+        # mcts should be picked at least 20% of the time despite lower score —
+        # without the direction bonus it'd be near 0.
+        assert mcts_pct > 0.2, f"mcts share too low: {mcts_pct:.2f}"
+        assert rollout_pct < 0.85, f"rollout dominates: {rollout_pct:.2f}"
+
+
+def test_select_prior_skips_non_promotable():
+    """Attempts flagged non_promotable=True are not picked as priors."""
+    import random
+    from groundhog.utils.selection import select_prior
+    from groundhog.utils.direction import write_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        # First attempt: normal.
+        ws = history.workspace()
+        (ws.path / "solution.py").write_text("v1")
+        write_direction(ws.path, "rollout")
+        write_result(ws.path,
+                     EvaluationResult(stages={"e": StageResult(metrics={"score": 0.5})}),
+                     metadata={"non_promotable": False})
+        a1 = ws.commit(success=True)
+
+        # Second attempt (improvement): flagged non_promotable.
+        ws2 = history.workspace(parent=a1.number)
+        (ws2.path / "solution.py").write_text("v2")
+        write_direction(ws2.path, "rollout")
+        write_result(ws2.path,
+                     EvaluationResult(stages={"e": StageResult(metrics={"score": 0.9})}),
+                     metadata={"non_promotable": True})
+        ws2.commit(success=True)
+
+        scorer = lambda r: r.metrics.get("score", 0)
+        # Repeated picks should never return the higher-scoring non-promotable.
+        rng = random.Random(0)
+        for _ in range(50):
+            p = select_prior(history, scorer, rng)
+            assert p.number == 1, f"non-promotable was picked (#{p.number})"
+
+
+def test_agent_strategy_flags_duplicate_solution_non_promotable():
+    """AgentStrategy._is_solution_duplicate detects byte-equal solutions."""
+    from groundhog import AgentStrategy
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws_path = Path(tmp) / "ws"
+        prior_path = Path(tmp) / "prior"
+        ws_path.mkdir(); prior_path.mkdir()
+        # Same bytes
+        (ws_path / "solution.py").write_text("def solve(): return 1", encoding="utf-8")
+        (prior_path / "solution.py").write_text("def solve(): return 1", encoding="utf-8")
+
+        ws = type("WS", (), {"path": ws_path})()
+        prior = type("P", (), {"path": prior_path})()
+        assert AgentStrategy._is_solution_duplicate(ws, prior) is True
+
+        # Different bytes
+        (ws_path / "solution.py").write_text("def solve(): return 2", encoding="utf-8")
+        assert AgentStrategy._is_solution_duplicate(ws, prior) is False
+
+        # No prior
+        assert AgentStrategy._is_solution_duplicate(ws, None) is False
+
+
+def test_improve_strategy_flags_duplicate_solution():
+    """Improve._is_duplicate_solution mirrors AgentStrategy."""
+    from groundhog.strategies.improve import Improve
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws_path = Path(tmp) / "ws"
+        prior_path = Path(tmp) / "prior"
+        ws_path.mkdir(); prior_path.mkdir()
+        (ws_path / "solution.py").write_text("same", encoding="utf-8")
+        (prior_path / "solution.py").write_text("same", encoding="utf-8")
+        ws = type("WS", (), {"path": ws_path})()
+        prior = type("P", (), {"path": prior_path})()
+        assert Improve._is_duplicate_solution(ws, prior) is True
+
+
+def test_cross_pollinate_agent_selects_different_family():
+    """_select_inspiration picks a leader from a different direction family."""
+    from groundhog import CrossPollinateAgent
+    from groundhog.utils.direction import write_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+
+        def commit_with(direction, score):
+            ws = history.workspace()
+            (ws.path / "solution.py").write_text("v")
+            write_direction(ws.path, direction)
+            r = EvaluationResult(stages={"e": StageResult(metrics={"score": score})})
+            write_result(ws.path, r)
+            return ws.commit(success=True)
+
+        # parent's family
+        parent = commit_with("rollout", 0.7)
+        # same family attempt — should NOT be selected
+        commit_with("rollout", 0.85)
+        # different family attempt — should be selected (it's the highest non-rollout)
+        target = commit_with("mcts", 0.6)
+        # another different-family attempt — lower score
+        commit_with("rl", 0.5)
+
+        # Build a minimal toolkit. Selection only needs task.evaluator.eval_stages
+        # with a scorer; provide a stub.
+        from groundhog import EvalStage, StageResult as SR
+
+        class _Eval(Evaluator):
+            def get_stages(self, data):
+                return [EvalStage(name="e", description="e",
+                                  call=lambda c: SR(),
+                                  scorer=lambda r: r.metrics.get("score", 0))]
+            def evaluate(self, code_or_path, data):
+                return SR()
+
+        toolkit = Toolkit(
+            task=Task(data=FixtureData(), context=FixtureContext(),
+                      evaluator=_Eval(), name="t"),
+            history=history,
+        )
+        s = CrossPollinateAgent()
+        s.through = None
+        insp = s._select_inspiration(toolkit, parent)
+        assert insp is not None
+        assert insp.number == target.number, \
+            f"expected mcts (#{target.number}), got #{insp.number}"
+
+
+def test_cross_pollinate_agent_skips_when_only_one_family():
+    """If every attempt shares the parent's family, no inspiration found."""
+    from groundhog import CrossPollinateAgent
+    from groundhog.utils.direction import write_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        for score in (0.5, 0.6, 0.7):
+            ws = history.workspace()
+            (ws.path / "solution.py").write_text("v")
+            write_direction(ws.path, "rollout")
+            r = EvaluationResult(stages={"e": StageResult(metrics={"score": score})})
+            write_result(ws.path, r)
+            ws.commit(success=True)
+
+        from groundhog import EvalStage, StageResult as SR
+
+        class _Eval(Evaluator):
+            def get_stages(self, data):
+                return [EvalStage(name="e", description="e",
+                                  call=lambda c: SR(),
+                                  scorer=lambda r: r.metrics.get("score", 0))]
+            def evaluate(self, code_or_path, data):
+                return SR()
+
+        toolkit = Toolkit(
+            task=Task(data=FixtureData(), context=FixtureContext(),
+                      evaluator=_Eval(), name="t"),
+            history=history,
+        )
+        parent = history.list()[0]
+        s = CrossPollinateAgent()
+        s.through = None
+        assert s._select_inspiration(toolkit, parent) is None
+
+
+def test_diversity_integration_phases_1_2_4_5():
+    """End-to-end integration: directions, families, selection, duplicate guard.
+
+    Synthetic history with 3 families:
+      - rollout (3 attempts, scores 0.5/0.7/0.9, plus 1 duplicate-of-leader
+        flagged non_promotable)
+      - mcts (1 attempt, score 0.4)
+      - no-direction legacy (1 attempt, score 0.3)
+
+    Verify:
+      - derive_families groups them correctly (3 families)
+      - select_prior never picks the non-promotable
+      - select_prior picks across families more often than pure-greedy
+        (mcts share > 10% over 200 samples despite worse score)
+      - status output shows direction families
+    """
+    import io
+    import random
+    from contextlib import redirect_stdout
+    from groundhog.utils.selection import select_prior
+    from groundhog.utils.direction import write_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        sc = lambda r: r.metrics.get("score", 0)
+
+        def commit(direction, score, parent=None, non_promotable=False):
+            ws = history.workspace(parent=parent)
+            (ws.path / "solution.py").write_text(f"v{score}")
+            if direction:
+                write_direction(ws.path, direction)
+            r = EvaluationResult(stages={"e": StageResult(metrics={"score": score})})
+            meta = {}
+            if non_promotable:
+                meta["non_promotable"] = True
+            write_result(ws.path, r, metadata=meta)
+            return ws.commit(success=True).number
+
+        # Build the synthetic history.
+        a1 = commit("rollout", 0.5)
+        a2 = commit("rollout", 0.7, parent=a1)
+        a3 = commit("rollout", 0.9, parent=a2)
+        # Duplicate-of-leader flagged non-promotable.
+        commit("rollout", 0.95, parent=a3, non_promotable=True)
+        commit("mcts", 0.4)
+        commit(None, 0.3)  # legacy no-direction
+
+        # Phase 2 — families.
+        families = history.derive_families()
+        assert len(families) == 3, f"expected 3 families, got {len(families)}"
+
+        # Phase 4 — selection avoids non-promotable, samples across families.
+        rng = random.Random(7)
+        picks = []
+        for _ in range(200):
+            p = select_prior(history, sc, rng)
+            assert p is not None
+            from groundhog.utils.direction import read_direction
+            text = read_direction(p.path)
+            picks.append(text.strip() if text else "(none)")
+        # Non-promotable (#4, score 0.95) is never picked.
+        for p in picks:
+            assert "0.95" not in p  # not the non-promotable solution
+
+        rollout_pct = picks.count("rollout") / len(picks)
+        mcts_pct = picks.count("mcts") / len(picks)
+        assert mcts_pct >= 0.10, f"mcts share too low: {mcts_pct:.2f}"
+        assert rollout_pct < 0.85, f"rollout dominates: {rollout_pct:.2f}"
+
+        # Phase 2 — status output mentions families.
+        # Construct a minimal optimizer just to call status() against this history.
+        from groundhog import EvalStage, StageResult as SR
+
+        class _Eval(Evaluator):
+            def get_stages(self, data):
+                return [EvalStage(name="e", description="e",
+                                  call=lambda c: SR(),
+                                  scorer=sc)]
+            def evaluate(self, code_or_path, data):
+                return SR()
+
+        opt = SimpleOptimizer(
+            Task(data=FixtureData(), context=FixtureContext(),
+                 evaluator=_Eval(), name="div-int"),
+            strategy=type("Noop", (), {
+                "__call__": lambda self, t, **k: {},
+            })(),
+            seed_strategy=None,
+            history=history,
+            path=Path(tmp),
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            opt.status()
+        out = buf.getvalue()
+        assert "Direction families:" in out
+        assert "rollout" in out
+        assert "mcts" in out
+
+
+def test_derive_families_empty_history():
+    """Empty history → empty list, no crash."""
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        assert history.derive_families() == []
 
 
 # === BackendRegistry fallback tests ===

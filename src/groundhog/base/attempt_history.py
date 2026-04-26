@@ -134,3 +134,26 @@ class AttemptHistory(ABC):
                 current_score = best_score
             trunks.append(trunk)
         return trunks
+
+    def derive_families(self) -> List[List[Attempt]]:
+        """Group attempts by their core direction (read-side derived view).
+
+        A family = attempts sharing the same normalized ``core_direction.md``
+        content. Falls back to legacy ``approach.md``. Attempts with no
+        direction file land in a "no-direction" sentinel family (stable key
+        ``None``). Families are returned sorted by attempt-number of the
+        oldest member, so the seed family appears first.
+
+        See ``Optimizer/Implementation Details/Family Identity.md``.
+        """
+        from groundhog.utils.direction import read_direction, normalize_direction
+
+        groups: dict = {}
+        for a in self.list():
+            text = read_direction(a.path) if hasattr(a, "path") else None
+            key = normalize_direction(text) if text else None
+            groups.setdefault(key, []).append(a)
+        # Sort each group by attempt number; sort families by oldest member.
+        for members in groups.values():
+            members.sort(key=lambda x: x.number)
+        return sorted(groups.values(), key=lambda g: g[0].number)

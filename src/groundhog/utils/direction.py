@@ -1,0 +1,230 @@
+"""Core direction helpers — the algorithmic invariant of a family.
+
+A family of attempts is identified by ``core_direction.md`` — a narrow,
+human-readable description of the algorithmic backbone (e.g. "CNN",
+"rollout-greedy"). Refine and cross-pollinate inherit it byte-for-byte
+from the parent; only fresh strategies mint new directions.
+
+Vault: ``Optimizer/Implementation Details/Family Identity.md``.
+
+The source of truth is the file content. Hashes for grouping/lookup may
+be computed at read time but are not persisted per attempt.
+
+Filename:
+    Primary:  ``core_direction.md`` at attempt root.
+    Legacy:   ``approach.md`` (fallback for older attempts) at attempt
+              root, or ``work/core_direction.md`` /
+              ``work/approach.md`` for fresh-style runs that wrote the
+              direction in the agent's workspace.
+"""
+
+from __future__ import annotations
+
+import re
+import shutil
+from pathlib import Path
+from typing import Iterable, Optional
+
+
+DIRECTION_FILENAME = "core_direction.md"
+LEGACY_FILENAMES = ("approach.md",)
+
+# Search order: prefer new filename at root, then legacy at root, then
+# work/ variants (agents write there during fresh sessions).
+_SEARCH_PATHS = (
+    DIRECTION_FILENAME,
+    *LEGACY_FILENAMES,
+    f"work/{DIRECTION_FILENAME}",
+    *(f"work/{name}" for name in LEGACY_FILENAMES),
+)
+
+
+def find_direction_path(attempt_dir: Path | str) -> Optional[Path]:
+    """Return the first existing direction file in ``attempt_dir``, or None.
+
+    Prefers the canonical name and root location over legacy / workspace
+    variants. Returns ``None`` if no direction file is present.
+    """
+    base = Path(attempt_dir)
+    for rel in _SEARCH_PATHS:
+        candidate = base / rel
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def read_direction(attempt_dir: Path | str) -> Optional[str]:
+    """Read the direction text from ``attempt_dir``, or None if absent.
+
+    Whitespace is preserved; use :func:`normalize_direction` before
+    comparing for family identity.
+    """
+    path = find_direction_path(attempt_dir)
+    if path is None:
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+def write_direction(attempt_dir: Path | str, text: str) -> Path:
+    """Write ``text`` to ``attempt_dir/core_direction.md``. Returns the path."""
+    base = Path(attempt_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    target = base / DIRECTION_FILENAME
+    target.write_text(text.strip() + "\n", encoding="utf-8")
+    return target
+
+
+def inherit_direction(prior_dir: Path | str, ws_dir: Path | str) -> Optional[Path]:
+    """Copy the parent's direction into the child workspace at canonical name.
+
+    Read-fallback applies (legacy ``approach.md`` is migrated forward to
+    ``core_direction.md``). Returns the destination path on success, or
+    ``None`` if the parent has no direction recorded.
+
+    Use at workspace prep time. Pair with :func:`enforce_inherited_direction`
+    at commit time to soft-gate against agents rewriting it mid-session.
+    """
+    text = read_direction(prior_dir)
+    if text is None:
+        return None
+    return write_direction(ws_dir, text)
+
+
+def enforce_inherited_direction(
+    ws_dir: Path | str, prior_dir: Path | str
+) -> Optional[Path]:
+    """Re-copy parent's direction into the workspace at commit, overwriting
+    any agent-written variant.
+
+    The same operation as :func:`inherit_direction` but explicitly named
+    for the commit-time soft-gate use case: refine, agent, and
+    cross-pollinate strategies call this just before
+    ``ws.commit(...)`` so the family invariant survives sessions where
+    the agent edited the file. Fresh strategies must NOT call this —
+    they're minting a new direction.
+    """
+    return inherit_direction(prior_dir, ws_dir)
+
+
+def promote_workspace_direction(ws_dir: Path | str) -> Optional[Path]:
+    """Move an agent-written ``work/core_direction.md`` to the attempt root.
+
+    Fresh strategies that delegate direction-writing to the agent should
+    call this at commit. If the agent wrote ``work/core_direction.md``
+    (or legacy ``work/approach.md``) and root has no direction yet,
+    promote it. Returns the destination path or ``None`` if nothing to
+    promote.
+    """
+    base = Path(ws_dir)
+    root_target = base / DIRECTION_FILENAME
+
+    # Don't clobber an existing root direction.
+    if root_target.exists():
+        return root_target
+
+    for rel in (
+        f"work/{DIRECTION_FILENAME}",
+        *(f"work/{name}" for name in LEGACY_FILENAMES),
+    ):
+        src = base / rel
+        if src.exists():
+            shutil.copy2(str(src), str(root_target))
+            return root_target
+    return None
+
+
+def _history_list(history, *, only_done: bool = True):
+    """Call ``history.list`` while tolerating older implementations."""
+    try:
+        return history.list(only_done=only_done)
+    except TypeError:
+        return history.list()
+
+
+def direction_exists(
+    history,
+    direction: str,
+    *,
+    exclude: Iterable[int] = (),
+    only_done: bool = False,
+) -> bool:
+    """Return True if history already contains this normalized direction."""
+    key = normalize_direction(direction)
+    if not key or history is None:
+        return False
+    excluded = set(exclude)
+    for attempt in _history_list(history, only_done=only_done):
+        if getattr(attempt, "number", None) in excluded:
+            continue
+        text = read_direction(attempt.path) if hasattr(attempt, "path") else None
+        if normalize_direction(text or "") == key:
+            return True
+    return False
+
+
+def attempt_number_from_path(path: Path | str) -> Optional[int]:
+    """Extract the leading attempt number from a workspace path name."""
+    try:
+        return int(Path(path).name.split("_", 1)[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def inherited_direction_changed(ws_dir: Path | str, prior_dir: Path | str) -> bool:
+    """True when the workspace root direction differs from its parent."""
+    parent = read_direction(prior_dir)
+    if parent is None:
+        return False
+    current = read_direction(ws_dir)
+    return normalize_direction(current or "") != normalize_direction(parent)
+
+
+def mark_result_failed(result, stage_name: str, reason: str) -> None:
+    """Mutate an EvaluationResult into a failed gate result."""
+    from groundhog.base.types import StageResult
+
+    result.stages[stage_name] = StageResult(errors={stage_name: reason})
+    result.completed = False
+    result.failed_stage = stage_name
+
+
+# --- Read-side: family grouping ----------------------------------------
+
+# Two or more consecutive blank lines collapse to one. Trailing whitespace
+# on each line is stripped. Leading/trailing whitespace on the whole
+# document is stripped. Used for family-identity comparison so trivial
+# formatting churn doesn't fragment a family.
+_BLANK_LINE_RUN = re.compile(r"\n\s*\n\s*\n+")
+_TRAILING_WS = re.compile(r"[ \t]+\n")
+
+
+def normalize_direction(text: str) -> str:
+    """Normalize direction text for family-identity comparison.
+
+    Strips trailing whitespace per line, collapses runs of blank lines
+    to a single blank line, and strips outer whitespace. Display the
+    original text; use the normalized form only as a comparison key.
+    """
+    if not text:
+        return ""
+    text = _TRAILING_WS.sub("\n", text)
+    text = _BLANK_LINE_RUN.sub("\n\n", text)
+    return text.strip()
+
+
+def direction_title(text: str, max_len: int = 60) -> str:
+    """First non-empty, non-heading-marker line of ``text``, for display."""
+    if not text:
+        return "(no direction)"
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Strip leading markdown heading markers for display.
+        line = line.lstrip("#").strip()
+        if not line:
+            continue
+        if len(line) > max_len:
+            return line[: max_len - 1] + "…"
+        return line
+    return "(no direction)"

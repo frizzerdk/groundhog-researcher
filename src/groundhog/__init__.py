@@ -1,4 +1,4 @@
-__version__ = "0.2.11"
+__version__ = "0.2.12"
 
 # Base types and interfaces
 from groundhog.base import (
@@ -39,8 +39,10 @@ from groundhog.strategies.improve import Improve
 from groundhog.strategies.fresh import FreshApproach
 from groundhog.strategies.cross_pollinate import CrossPollinate
 from groundhog.strategies.analyse import Analyse
+from groundhog.strategies.plan_approaches import PlanApproaches
 from groundhog.strategies.agent import AgentStrategy
 from groundhog.strategies.fresh_agent import FreshAgentStrategy
+from groundhog.strategies.cross_pollinate_agent import CrossPollinateAgent
 from groundhog.agents.claude_code import ClaudeCodeAgentBackend
 from groundhog.agents.gemini_cli import GeminiCliAgentBackend
 from groundhog.agents.copilot import CopilotAgentBackend

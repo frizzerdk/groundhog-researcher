@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from groundhog.base.agent import agent_tool
+from groundhog.utils.direction import normalize_direction, read_direction
 
 
 def _format_eval_result(result):
@@ -178,6 +179,7 @@ def promote_best(
     dest_path,
     src_relative: str = "work/solution.py",
     compare: Callable[[float, float], bool] = operator.gt,
+    parent_solution_path: Optional[Path] = None,
 ):
     """Build an eval tool for ``stage`` that ALSO snapshots the source file
     to ``dest_path`` whenever the eval's score beats this tool's session-local
@@ -199,12 +201,19 @@ def promote_best(
         compare: how to compare the new score against the session best.
             Defaults to strict ``>``; pass a different callable for
             multi-objective or "lower is better" cases.
+        parent_solution_path: optional parent solution file. When supplied,
+            byte-identical candidates are evaluated but not snapshotted.
 
     Returns an :class:`AgentTool` with the same name and parameter shape as
     a plain eval tool — drop-in replaceable.
     """
     best = [float("-inf")]
     dest = Path(dest_path)
+    parent_bytes = None
+    if parent_solution_path is not None:
+        parent_path = Path(parent_solution_path)
+        if parent_path.exists():
+            parent_bytes = parent_path.read_bytes()
     prefix = f"{stage.name}_"
 
     description = (
@@ -222,8 +231,11 @@ def promote_best(
         code = Path(path).read_text(encoding="utf-8")
         score = s.score(s.call(code))
         if cmp(score, best[0]):
-            best[0] = score
             src = Path(path)
+            if parent_bytes is not None and src.exists() \
+                    and src.read_bytes() == parent_bytes:
+                return result_str + "\n\nNot promoted: solution.py is identical to the parent."
+            best[0] = score
             if src.exists():
                 shutil.copy2(str(src), str(dest))
         return result_str
@@ -242,7 +254,8 @@ def promote_best(
     )
 
 
-def build_eval_tools(toolkit, ws_path, through=None, promote_dest=None):
+def build_eval_tools(toolkit, ws_path, through=None, promote_dest=None,
+                     parent_solution_path=None):
     """Wrap eval stages as agent tools. Called by the strategy per-attempt.
 
     Args:
@@ -253,6 +266,8 @@ def build_eval_tools(toolkit, ws_path, through=None, promote_dest=None):
             wrapped with :func:`promote_best` so its tool snapshots the
             source file to ``promote_dest`` on score improvement. Cheaper
             stages stay un-wrapped (their scores are noisy).
+        parent_solution_path: optional parent solution file used to block
+            identical promote-best snapshots.
 
     Returns list of agent tools, one per eval stage.
     """
@@ -272,7 +287,11 @@ def build_eval_tools(toolkit, ws_path, through=None, promote_dest=None):
     final_idx = len(stages) - 1
     for i, stage in enumerate(stages):
         if i == final_idx and promote_dest is not None:
-            tools.append(promote_best(stage, dest_path=promote_dest))
+            tools.append(promote_best(
+                stage,
+                dest_path=promote_dest,
+                parent_solution_path=parent_solution_path,
+            ))
         else:
             tools.append(_eval_stage_tool(stage))
     return tools
@@ -284,6 +303,7 @@ def build_prior_tools(
     scorer=None,
     max_distance: Optional[int] = None,
     scope: str = "lineage",
+    exclude_direction: Optional[str] = None,
 ) -> list:
     """Build tools for browsing prior attempts.
 
@@ -305,26 +325,48 @@ def build_prior_tools(
         max_distance: optional cap on tree distance (1 = parent only, 2 =
             grandparent, etc.). Strategy-level constraint that limits how
             far the agent can reach. ``None`` means no cap.
-        scope: ``"lineage"`` (parent chain only, default) or ``"tree"``
-            (lineage + siblings of each ancestor). Strategies can pin this
-            to ``"lineage"`` if they don't want the agent exploring failed
-            sibling branches.
+        scope: ``"lineage"`` (parent chain only, default), ``"tree"``
+            (lineage + siblings of each ancestor), ``"family"`` (same core
+            direction as the parent), or ``"all"``.
+        exclude_direction: optional direction text to hide from ``family`` /
+            ``all`` scopes, usually the parent's family when choosing
+            cross-pollination inspiration.
 
     Returns empty list if ``prior_attempt`` is ``None``.
     """
     if prior_attempt is None:
         return []
 
+    def _attempt_direction_key(attempt):
+        text = read_direction(attempt.path) if hasattr(attempt, "path") else None
+        key = normalize_direction(text or "")
+        return key or None
+
+    parent_direction_key = _attempt_direction_key(prior_attempt)
+    excluded_direction_key = normalize_direction(exclude_direction or "") or None
+
+    def _allowed_by_direction(attempt):
+        attempt_key = _attempt_direction_key(attempt)
+        if excluded_direction_key is not None and attempt_key == excluded_direction_key:
+            return False
+        if scope == "family":
+            return parent_direction_key is not None and attempt_key == parent_direction_key
+        return True
+
+    def _allowed_attempt_map():
+        return {a.number: a for a, _ in _reachable_attempts()}
+
     def _resolve(attempt_id: str):
         """Resolve an agent-supplied id to an Attempt. Accepts ``"parent"``,
         an integer string, or ``"attempt_<N>"``-style strings."""
+        allowed = _allowed_attempt_map()
         if history is None:
             if attempt_id in ("parent", str(prior_attempt.number),
                               f"attempt_{prior_attempt.number}"):
-                return prior_attempt
+                return prior_attempt if prior_attempt.number in allowed else None
             return None
         if attempt_id == "parent":
-            return prior_attempt
+            return prior_attempt if prior_attempt.number in allowed else None
         s = attempt_id
         if s.startswith("attempt_"):
             s = s[len("attempt_"):]
@@ -332,12 +374,20 @@ def build_prior_tools(
             num = int(s)
         except ValueError:
             return None
-        return history.get(num)
+        return allowed.get(num)
 
     def _reachable_attempts():
         """Yield (attempt, distance) pairs the agent is allowed to see."""
         if history is None:
-            yield prior_attempt, 1
+            if _allowed_by_direction(prior_attempt):
+                yield prior_attempt, 1
+            return
+
+        if scope in ("family", "all"):
+            distance = "family" if scope == "family" else "all"
+            for a in history.list(only_done=True):
+                if _allowed_by_direction(a):
+                    yield a, distance
             return
 
         # Lineage = parent chain from the current workspace's parent up.
@@ -347,7 +397,8 @@ def build_prior_tools(
         for offset, a in enumerate(reversed(chain), start=1):
             if max_distance is not None and offset > max_distance:
                 break
-            yield a, offset
+            if _allowed_by_direction(a):
+                yield a, offset
 
         if scope != "tree":
             return
@@ -363,7 +414,8 @@ def build_prior_tools(
             for sib in history.list(only_done=False):
                 if sib.parent == a.parent and sib.number != a.number \
                         and sib.number not in seen_ids:
-                    yield sib, offset
+                    if _allowed_by_direction(sib):
+                        yield sib, offset
                     seen_ids.add(sib.number)
 
     def _score_of(attempt):
@@ -415,8 +467,7 @@ def build_prior_tools(
             description=(
                 "List metadata on prior attempts (attempt id, parent, "
                 "distance, score, status). Use to discover what's available "
-                f"before reading. Default: closest {('lineage' if scope == 'lineage' else 'lineage + sibling branches')} "
-                "in chain order."
+                f"before reading. Scope: {scope}."
             ),
             func=_get_priors,
             params={

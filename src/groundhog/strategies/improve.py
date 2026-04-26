@@ -50,8 +50,23 @@ class Improve(Strategy):
         self.log.inline("learnings... ")
         self._record_learnings(toolkit, ws, prior, result)
         self.log.tock()
+        # Soft-gate: re-copy parent's core direction so a stray rewrite during
+        # the LLM session can't fork the family.
+        if hasattr(prior, "path"):
+            from groundhog.utils.direction import (
+                enforce_inherited_direction,
+                inherited_direction_changed,
+            )
+            direction_changed = inherited_direction_changed(ws.path, prior.path)
+            enforce_inherited_direction(ws.path, prior.path)
+        metadata = {"strategy": "improve", "prior": prior.number, "cost": round(self.cost, 6)}
+        if hasattr(prior, "path") and direction_changed:
+            metadata["direction_restored"] = True
+        if self._is_duplicate_solution(ws, prior):
+            metadata["non_promotable"] = True
+            metadata["non_promotable_reason"] = "solution.py is byte-identical to parent"
         from groundhog.utils.results import write_result
-        write_result(ws.path, result, metadata={"strategy": "improve", "prior": prior.number, "cost": round(self.cost, 6)})
+        write_result(ws.path, result, metadata=metadata)
         attempt = ws.commit(success=result.completed)
         return self._build_log(attempt, prior, result, toolkit)
 
@@ -82,10 +97,11 @@ class Improve(Strategy):
     def _prepare_workspace(self, toolkit, ws, prior):
         (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get(), encoding="utf-8")
         (ws.path / "solution.py").write_text(prior.code, encoding="utf-8")
-        # Copy approach from parent if it exists
-        prior_approach = prior.path / "approach.md" if hasattr(prior, 'path') else None
-        if prior_approach and prior_approach.exists():
-            (ws.path / "approach.md").write_text(prior_approach.read_text(encoding="utf-8"), encoding="utf-8")
+        # Inherit the family's core direction from the parent (legacy approach.md
+        # is migrated forward to core_direction.md).
+        if hasattr(prior, "path"):
+            from groundhog.utils.direction import inherit_direction
+            inherit_direction(prior.path, ws.path)
         # Learnings are included in the prompt via build_prompt(learnings=...),
         # and logged in conversation.json — no need to duplicate as a file.
 
@@ -120,11 +136,15 @@ class Improve(Strategy):
         )
         prompt += f"\n\n{prior_results}"
 
-        # Include approach description if available
-        approach_path = ws.path / "approach.md"
-        if approach_path.exists():
-            approach_text = approach_path.read_text(encoding="utf-8")
-            prompt += f"\n\n## Current approach\n{approach_text}"
+        # Include the family's core direction if available (legacy approach.md
+        # is read as a fallback by the helper).
+        from groundhog.utils.direction import read_direction
+        direction_text = read_direction(ws.path)
+        if direction_text and direction_text.strip():
+            prompt += (
+                "\n\n## Core direction (preserve — the algorithmic invariant)\n"
+                f"{direction_text.strip()}"
+            )
 
         if not hasattr(toolkit, 'llm'):
             return
@@ -223,6 +243,20 @@ Output your changes as SEARCH/REPLACE blocks."""
         self.log_conversation(ws.path, response, label="Learnings")
 
         toolkit.learnings.add(response.text)
+
+    @staticmethod
+    def _is_duplicate_solution(ws, prior) -> bool:
+        """True iff committed solution.py equals the parent's bytewise."""
+        if prior is None or not hasattr(prior, "path"):
+            return False
+        ours = ws.path / "solution.py"
+        theirs = prior.path / "solution.py"
+        if not ours.exists() or not theirs.exists():
+            return False
+        try:
+            return ours.read_bytes() == theirs.read_bytes()
+        except OSError:
+            return False
 
     def _score_result(self, result, toolkit):
         stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=self.through)

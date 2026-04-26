@@ -47,13 +47,29 @@ class CrossPollinate(Strategy):
         self.log.inline("evaluating... ")
         result = self._evaluate_with_retries(toolkit, ws)
         self.log.tock()
-        from groundhog.utils.results import write_result
-        write_result(ws.path, result, metadata={
+        # Soft-gate: re-copy parent's core direction so the borrowed ideas
+        # don't drift the family identity.
+        if hasattr(prior, "path"):
+            from groundhog.utils.direction import (
+                enforce_inherited_direction,
+                inherited_direction_changed,
+            )
+            direction_changed = inherited_direction_changed(ws.path, prior.path)
+            enforce_inherited_direction(ws.path, prior.path)
+        metadata = {
             "strategy": "cross_pollinate",
             "prior": prior.number,
             "inspiration": inspiration.number,
             "cost": round(self.cost, 6),
-        })
+        }
+        if hasattr(prior, "path") and direction_changed:
+            metadata["direction_restored"] = True
+        # Flag if we landed on byte-identical code to either source.
+        if self._is_duplicate_solution(ws, prior) or self._is_duplicate_solution(ws, inspiration):
+            metadata["non_promotable"] = True
+            metadata["non_promotable_reason"] = "solution.py is byte-identical to parent or inspiration"
+        from groundhog.utils.results import write_result
+        write_result(ws.path, result, metadata=metadata)
         attempt = ws.commit(success=result.completed)
         return self._build_log(attempt, prior, result, toolkit)
 
@@ -66,6 +82,20 @@ class CrossPollinate(Strategy):
         self.through = getattr(toolkit, 'through', None)
         self.log = toolkit.log if hasattr(toolkit, 'log') else StrategyLog()
         self.cost = 0.0
+
+    @staticmethod
+    def _is_duplicate_solution(ws, other) -> bool:
+        """True iff ws/solution.py == other/solution.py byte-for-byte."""
+        if other is None or not hasattr(other, "path"):
+            return False
+        ours = ws.path / "solution.py"
+        theirs = other.path / "solution.py"
+        if not ours.exists() or not theirs.exists():
+            return False
+        try:
+            return ours.read_bytes() == theirs.read_bytes()
+        except OSError:
+            return False
 
     # --- Selection ---
 
@@ -101,10 +131,12 @@ class CrossPollinate(Strategy):
     def _prepare_workspace(self, toolkit, ws, prior):
         (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get(), encoding="utf-8")
         (ws.path / "solution.py").write_text(prior.code, encoding="utf-8")
-        # Copy approach from parent if it exists
-        prior_approach = prior.path / "approach.md" if hasattr(prior, 'path') else None
-        if prior_approach and prior_approach.exists():
-            (ws.path / "approach.md").write_text(prior_approach.read_text(encoding="utf-8"), encoding="utf-8")
+        # Cross-pollinate stays in the parent's family: inherit the core
+        # direction; borrow ideas from the inspiration's solution / artifacts
+        # but keep the algorithmic backbone.
+        if hasattr(prior, "path"):
+            from groundhog.utils.direction import inherit_direction
+            inherit_direction(prior.path, ws.path)
 
     # --- Core work ---
 
