@@ -2009,6 +2009,125 @@ def test_mock_task_end_to_end():
             assert (a.path / "solution.py").exists()
 
 
+# === Permission overrides (sandbox tightening) ===
+
+
+def test_agent_strategy_default_permissions_match_base():
+    """Default AgentStrategy still resolves to BASE_PERMISSIONS."""
+    from groundhog import AgentStrategy
+    from groundhog.strategies.agent import BASE_PERMISSIONS
+
+    s = AgentStrategy()
+    allow, deny = s._resolve_permissions("explore")
+    expected_allow = [r for a, r in BASE_PERMISSIONS if a == "allow"]
+    expected_deny = [r for a, r in BASE_PERMISSIONS if a == "deny"]
+    assert allow == expected_allow
+    assert deny == expected_deny
+
+
+def test_agent_strategy_permissions_overridable_by_subclass():
+    """Subclass-level permissions reassignment is honored."""
+    from groundhog import AgentStrategy
+
+    class TightAgent(AgentStrategy):
+        permissions = [
+            ("allow", "Read(./**)"),
+            ("allow", "Read(../**)"),
+            ("deny",  "Read(*)"),
+            ("deny",  "Write(*)"),
+            ("allow", "Write(work/*)"),
+        ]
+
+    s = TightAgent()
+    allow, deny = s._resolve_permissions("explore")
+    assert "Read(./**)" in allow
+    assert "Read(../**)" in allow
+    assert "Write(work/*)" in allow
+    assert "Read(*)" not in allow      # narrowed
+    assert "Read(*)" in deny
+    assert "Write(*)" in deny
+
+
+def test_agent_strategy_permissions_overridable_per_instance():
+    """Instance-level permissions reassignment is honored."""
+    from groundhog import AgentStrategy
+
+    s = AgentStrategy()
+    s.permissions = [("allow", "Read(./**)"), ("deny", "Write(*)")]
+    allow, deny = s._resolve_permissions("explore")
+    assert allow == ["Read(./**)"]
+    assert deny == ["Write(*)"]
+
+
+def test_agent_strategy_phase_overrides_compose():
+    """phase_overrides are appended after base; deepest/last wins is the
+    backend's job, but ordering must reach the spec intact."""
+    from groundhog import AgentStrategy
+
+    class FixSandboxed(AgentStrategy):
+        permissions = [("allow", "Read(*)")]
+        phase_overrides = {
+            "explore": [],
+            "fix":     [("deny", "Bash(rm -rf *)")],
+            "submit":  [],
+            "reflect": [],
+        }
+
+    s = FixSandboxed()
+    explore_allow, explore_deny = s._resolve_permissions("explore")
+    fix_allow, fix_deny = s._resolve_permissions("fix")
+    assert "Read(*)" in explore_allow and explore_deny == []
+    assert "Bash(rm -rf *)" in fix_deny
+
+
+def test_permissions_propagate_to_all_agent_backends():
+    """Acceptance: each backend translates spec.allowed_tools/denied_tools
+    according to its own contract. The strategy-level override only needs
+    to land them in AgentSpec — backends are downstream consumers."""
+    from pathlib import Path
+    import tempfile
+    from groundhog.base.agent import AgentSpec
+    from groundhog.agents.claude_code import ClaudeCodeAgentBackend
+    from groundhog.agents.gemini_cli import GeminiCliAgentBackend
+    from groundhog.agents.copilot import CopilotAgentBackend
+
+    with tempfile.TemporaryDirectory() as d:
+        spec = AgentSpec(
+            goal="test goal",
+            workspace_path=Path(d),
+            allowed_tools=["Read(./**)"],
+            denied_tools=["Read(*)", "Bash(rm -rf *)", "Write(*)"],
+        )
+
+        # 1) claude_code: full enforcement via --allowedTools / --disallowedTools.
+        cmd = ClaudeCodeAgentBackend()._build_command(spec)
+        assert "--allowedTools" in cmd
+        ai = cmd.index("--allowedTools")
+        assert "Read(./**)" in cmd[ai + 1:]
+        assert "--disallowedTools" in cmd
+        di = cmd.index("--disallowedTools")
+        deny_args = cmd[di + 1:]
+        assert "Read(*)" in deny_args
+        assert "Bash(rm -rf *)" in deny_args
+        assert "Write(*)" in deny_args
+
+        # 2) gemini_cli: deny rules surface in the prompt as advisory text.
+        prompt = GeminiCliAgentBackend()._build_prompt(spec)
+        assert "Read(*)" in prompt
+        assert "Bash(rm -rf *)" in prompt
+
+        # 3) copilot: path-specific denies become --deny-tool args; blanket
+        #    denies (Read(*)/Write(*)) are intentionally dropped because they
+        #    would override --allow-all-tools. Path-specific Bash() rule
+        #    survives via shell(...) translation.
+        cmd = CopilotAgentBackend()._build_command(spec)
+        # rm -rf becomes shell(rm -rf *) and stays
+        assert any("shell(rm -rf *)" in arg for arg in cmd)
+        # Blanket denies should NOT appear as --deny-tool args
+        assert "read" not in cmd  # would be the translated blanket Read(*)
+        assert "write" not in cmd  # ditto for Write(*)
+
+
 # === Run all tests ===
 
 if __name__ == "__main__":

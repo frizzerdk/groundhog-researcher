@@ -53,6 +53,11 @@ class AgentConfig(StrategyConfig):
 
 
 # --- Permissions (depth-based, deepest/last wins) ---
+#
+# Class-level defaults live here so a subclass can opt into a tighter
+# sandbox by reassigning ``permissions`` (or ``phase_overrides``) without
+# touching module globals. Backend enforcement varies — see
+# ``AgentStrategy.permissions`` docstring for the per-backend reality.
 
 BASE_PERMISSIONS = [
     ("allow", "Read(*)"),
@@ -67,15 +72,6 @@ PHASE_OVERRIDES = {
     "fix": [],
     "reflect": [],
 }
-
-
-def _resolve_permissions(phase):
-    """Merge base + phase overrides into allow/deny lists."""
-    rules = BASE_PERMISSIONS + PHASE_OVERRIDES.get(phase, [])
-    return (
-        [r for a, r in rules if a == "allow"],
-        [r for a, r in rules if a == "deny"],
-    )
 
 
 # --- Tool filtering per phase ---
@@ -208,9 +204,54 @@ class AgentStrategy(Strategy):
     Composed method pattern:
         init → select prior → workspace → prepare → explore → submit
         → evaluate → fix loop → reflect → log → commit
+
+    Sandboxing
+    ----------
+    ``permissions`` and ``phase_overrides`` are overridable rule sets that
+    populate ``AgentSpec.allowed_tools`` / ``AgentSpec.denied_tools`` per
+    phase. Override them at the subclass or instance level for tighter
+    sandboxes — e.g. workspace-only reads:
+
+    .. code-block:: python
+
+        class TightAgent(AgentStrategy):
+            permissions = [
+                ("allow", "Read(./**)"),       # workspace-relative
+                ("allow", "Read(../**)"),      # priors / shared tools
+                ("deny",  "Read(*)"),          # everything else
+                ("deny",  "Write(*)"),
+                ("allow", "Write(work/*)"),
+                ("allow", "Edit(work/*)"),
+            ]
+
+    Per-backend enforcement reality (the rule list is built the same way
+    for all of them; what each backend does with it differs):
+
+    - ``ClaudeCodeAgentBackend``: full enforcement via ``--allowedTools``
+      / ``--disallowedTools`` (deny-broad-allow-narrow works).
+    - ``GeminiCliAgentBackend``: deny rules are injected into the prompt
+      as a "you must not use" instruction (advisory, not enforced).
+      ``allowed_tools`` is not consumed.
+    - ``CopilotAgentBackend``: tool-name allow via ``--available-tools``;
+      path-specific denies via ``--deny-tool``; **blanket** denies like
+      ``Read(*)`` / ``Write(*)`` are silently dropped because they would
+      override copilot's required ``--allow-all-tools`` flag.
     """
 
     Config = AgentConfig
+
+    # Default permission rules. Override at class or instance level for a
+    # tighter sandbox; see class docstring.
+    permissions = BASE_PERMISSIONS
+    phase_overrides = PHASE_OVERRIDES
+
+    def _resolve_permissions(self, phase):
+        """Merge class-level base + phase overrides into allow/deny lists."""
+        rules = list(self.permissions) + self.phase_overrides.get(phase, [])
+        return (
+            [r for a, r in rules if a == "allow"],
+            [r for a, r in rules if a == "deny"],
+        )
 
     def __call__(self, toolkit, config=None):
         self._init(toolkit, config)
@@ -537,7 +578,7 @@ class AgentStrategy(Strategy):
         self.log.start(f"--- Agent | {'prior=#' + str(prior.number) if prior else 'fresh'} | budget={budget_str}")
 
         tools = self._get_tools(toolkit, ws, prior, phase="explore")
-        allow, deny = _resolve_permissions("explore")
+        allow, deny = self._resolve_permissions("explore")
 
         spec = AgentSpec(
             goal=goal,
@@ -565,7 +606,7 @@ class AgentStrategy(Strategy):
         self.log.start(f"--- Agent (per-request) | {'prior=#' + str(prior.number) if prior else 'fresh'}")
 
         tools = self._get_tools(toolkit, ws, prior, phase="explore")
-        allow, deny = _resolve_permissions("explore")
+        allow, deny = self._resolve_permissions("explore")
 
         spec = AgentSpec(
             goal=goal,
@@ -633,7 +674,7 @@ class AgentStrategy(Strategy):
             error_text = f"Stage '{result.failed_stage}': {error_stage.errors}"
 
             self.log.inline(f"fix {retry + 1}... ")
-            allow, deny = _resolve_permissions("fix")
+            allow, deny = self._resolve_permissions("fix")
             goal = FIX_PROMPT.format(error=error_text, eval_command=eval_command)
             spec = AgentSpec(
                 goal=goal,
@@ -664,7 +705,7 @@ class AgentStrategy(Strategy):
 
     def _reflect(self, toolkit, ws, session_id):
         """Agent writes learnings to work/learnings.md."""
-        allow, deny = _resolve_permissions("reflect")
+        allow, deny = self._resolve_permissions("reflect")
         spec = AgentSpec(
             goal=REFLECT_PROMPT,
             workspace_path=ws.path,
