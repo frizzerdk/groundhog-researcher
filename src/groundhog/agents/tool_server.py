@@ -170,6 +170,16 @@ def generate_wrappers(tools: List[AgentTool], bin_dir: Path, port: int) -> None:
                 f'@set PYTHONIOENCODING=utf-8\n@"{python_path}" "%~dp0{tool.name}.py" %*\n',
                 encoding="utf-8",
             )
+            # PowerShell launcher (for codex/copilot CLIs on Windows that use
+            # pwsh as their shell — they don't auto-resolve .cmd via PATHEXT
+            # when invoked as `pwsh -Command <name>`).
+            ps1_path = bin_dir / f"{tool.name}.ps1"
+            ps1_python = python_path.replace("\\", "/")
+            ps1_path.write_text(
+                f'$env:PYTHONIOENCODING = "utf-8"\n'
+                f'& "{ps1_python}" "$PSScriptRoot/{tool.name}.py" @args\n',
+                encoding="utf-8",
+            )
             # Extensionless bash wrapper for Git Bash (Claude Code on Windows)
             bash_path = bin_dir / tool.name
             bash_python = python_path.replace("\\", "/")

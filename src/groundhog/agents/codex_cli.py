@@ -1,4 +1,4 @@
-"""CodexCliAgentBackend — runs OpenAI's Codex CLI as a subprocess with tool access.
+r"""CodexCliAgentBackend — runs OpenAI's Codex CLI as a subprocess with tool access.
 
 Uses ``codex exec --json`` for one-shot non-interactive runs. Streams
 JSONL events; captures the session id from the first ``thread.started``
@@ -19,18 +19,18 @@ allow/deny pattern equivalent to claude's ``--allowedTools`` /
 ``spec.allowed_tools`` / ``spec.denied_tools`` are surfaced as
 **advisory prompt text** only. The hard floor is the sandbox flag.
 
-Tool exposure on Windows
--------------------------
-The same HTTP tool-server + PATH-injected bash/cmd wrappers used by the
-Copilot adapter are wired up here, plus
-``-c shell_environment_policy.inherit=all`` to forward our PATH into
-the codex subprocess. **Caveat**: in practice, codex's spawned
-PowerShell (the default shell on Windows) does not always resolve
-unqualified wrapper names like ``smoke`` — observed in e2e: half of
-``pwsh -Command <wrapper>`` invocations report "not recognized" even
-with PATH inheritance enabled. Native binaries (``cmd``, ``Get-*``)
-work fine. Tracking; works around itself today by the agent reading
-the source files directly when wrappers fail.
+Tool exposure
+-------------
+The HTTP tool server + multi-format wrappers (`.ps1` / `.cmd` /
+`.py` / extensionless bash) are written to a workspace-local bin dir
+``<workspace>/.groundhog_tools/``. Workspace-local placement is
+deliberate — temp-dir bins under ``%TEMP%`` aren't reliably
+visible/executable inside codex's sandbox even with
+``shell_environment_policy.inherit=all``, but anything inside the
+agent's cwd is automatically accessible. The agent invokes wrappers
+via relative path: ``& .\.groundhog_tools\smoke.ps1``. The HTTP tool
+server (port in ``TOOL_SERVER_PORT`` env) also works as a fallback
+the agent can call via ``Invoke-RestMethod`` if needed.
 
 Cost
 ----
@@ -94,7 +94,15 @@ class CodexCliAgentBackend(AgentBackend):
         server = None
         bin_dir = None
         try:
-            bin_dir = Path(tempfile.mkdtemp(prefix="codex_tools_"))
+            # Place the wrapper bin dir INSIDE the workspace so codex's
+            # sandbox automatically grants visibility/execute permissions.
+            # A %TEMP%-rooted bin (the default for other backends) doesn't
+            # propagate reliably into codex's spawned PowerShell, even with
+            # shell_environment_policy.inherit=all — the wrappers exist on
+            # PATH but are reported "not recognized" by `pwsh -Command`.
+            # Workspace-local sidesteps the question entirely.
+            bin_dir = spec.workspace_path / ".groundhog_tools"
+            bin_dir.mkdir(parents=True, exist_ok=True)
             server = self._start_tool_server(spec)
             port = server.port if server else None
             if spec.tools and port is not None:
@@ -110,8 +118,9 @@ class CodexCliAgentBackend(AgentBackend):
         finally:
             if server:
                 server.stop()
-            if bin_dir:
-                cleanup_wrappers(bin_dir)
+            # Don't delete bin_dir — it lives inside the committed attempt
+            # for post-mortem inspection. Workspace cleanup handles it if
+            # the attempt is aborted.
 
     def _start_tool_server(self, spec: AgentSpec) -> Optional[ToolServer]:
         if not spec.tools:
