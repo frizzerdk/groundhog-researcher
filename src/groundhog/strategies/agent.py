@@ -236,6 +236,12 @@ class AgentStrategy(Strategy):
       path-specific denies via ``--deny-tool``; **blanket** denies like
       ``Read(*)`` / ``Write(*)`` are silently dropped because they would
       override copilot's required ``--allow-all-tools`` flag.
+    - ``CodexCliAgentBackend``: deny rules injected into the prompt as
+      advisory text (like Gemini). ``allowed_tools`` is not consumed.
+      The hard floor is the OS-level ``--sandbox workspace-write``
+      (writes confined to attempt-root tree, network blocked) — reads
+      remain unrestricted at the sandbox level regardless of what's in
+      ``denied_tools``.
     """
 
     Config = AgentConfig

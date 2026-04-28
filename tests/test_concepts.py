@@ -2090,6 +2090,7 @@ def test_permissions_propagate_to_all_agent_backends():
     from groundhog.agents.claude_code import ClaudeCodeAgentBackend
     from groundhog.agents.gemini_cli import GeminiCliAgentBackend
     from groundhog.agents.copilot import CopilotAgentBackend
+    from groundhog.agents.codex_cli import CodexCliAgentBackend
 
     with tempfile.TemporaryDirectory() as d:
         spec = AgentSpec(
@@ -2126,6 +2127,67 @@ def test_permissions_propagate_to_all_agent_backends():
         # Blanket denies should NOT appear as --deny-tool args
         assert "read" not in cmd  # would be the translated blanket Read(*)
         assert "write" not in cmd  # ditto for Write(*)
+
+        # 4) codex_cli: no native allow/deny flags. Deny rules injected into
+        #    the prompt as advisory text (like gemini). Hard floor is the
+        #    OS-level --sandbox workspace-write flag.
+        codex_cmd = CodexCliAgentBackend()._build_command(spec)
+        assert "exec" in codex_cmd
+        assert "--json" in codex_cmd
+        assert "-s" in codex_cmd and "workspace-write" in codex_cmd
+        assert any("approval_policy=never" in a for a in codex_cmd)
+        # Deny rules end up in the prompt (last positional arg)
+        assert "Read(*)" in codex_cmd[-1]
+        assert "Bash(rm -rf *)" in codex_cmd[-1]
+        assert "Write(*)" in codex_cmd[-1]
+
+
+def test_codex_resume_command_uses_resume_subcommand():
+    """Resume path: ``codex exec resume <session_id> <prompt>``."""
+    from pathlib import Path
+    import tempfile
+    from groundhog.base.agent import AgentSpec
+    from groundhog.agents.codex_cli import CodexCliAgentBackend
+
+    with tempfile.TemporaryDirectory() as d:
+        spec = AgentSpec(
+            goal="follow up",
+            workspace_path=Path(d),
+            session_id="abc-123",
+        )
+        cmd = CodexCliAgentBackend()._build_command(spec)
+        assert "resume" in cmd
+        assert "abc-123" in cmd
+        # Final positional is the follow-up prompt
+        assert cmd[-1] == "follow up"
+
+
+def test_codex_event_parsing_extracts_session_and_output():
+    """Verify _parse_result picks session_id from thread.started and the
+    final agent_message text as output."""
+    from groundhog.agents.codex_cli import CodexCliAgentBackend
+
+    events = [
+        {"type": "thread.started", "thread_id": "uuid-1"},
+        {"type": "turn.started"},
+        {"type": "item.completed",
+         "item": {"id": "i1", "type": "agent_message", "text": "first"}},
+        {"type": "item.completed",
+         "item": {"id": "i2", "type": "command_execution",
+                  "command": "ls", "exit_code": 0, "status": "completed"}},
+        {"type": "item.completed",
+         "item": {"id": "i3", "type": "agent_message", "text": "final answer"}},
+        {"type": "turn.completed",
+         "usage": {"input_tokens": 100, "output_tokens": 20,
+                   "cached_input_tokens": 0, "reasoning_output_tokens": 5}},
+    ]
+    result = CodexCliAgentBackend()._parse_result(events)
+    assert result.success is True
+    assert result.session_id == "uuid-1"
+    assert result.output == "final answer"
+    assert result.turns == 1
+    # Steps include the command_execution and both agent_message items
+    assert len(result.steps) == 3
 
 
 # === Run all tests ===
