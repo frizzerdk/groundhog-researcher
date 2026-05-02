@@ -134,8 +134,16 @@ class ClaudeCodeAgentBackend(AgentBackend):
         if allow_rules:
             cmd += ["--allowedTools"] + allow_rules
 
-        if spec.denied_tools:
-            cmd += ["--disallowedTools"] + list(spec.denied_tools)
+        # Claude resolves rule conflicts as ``deny > allow``: a broad
+        # ``Read(*)`` deny disables the Read tool entirely even when
+        # specific ``Read(./**)`` allows are present (same for Write/Edit).
+        # When the spec has narrow allows for a tool, drop the broad deny —
+        # the allow patterns themselves act as the boundary in claude.
+        deny_rules = _filter_redundant_broad_denies(
+            list(spec.denied_tools), allow_rules
+        )
+        if deny_rules:
+            cmd += ["--disallowedTools"] + deny_rules
 
         return cmd
 
@@ -162,7 +170,8 @@ class ClaudeCodeAgentBackend(AgentBackend):
 
         events = []
         try:
-            with open(jsonl_path, "a") as raw_file, open(summary_path, "a") as summary_file:
+            with open(jsonl_path, "a", encoding="utf-8") as raw_file, \
+                 open(summary_path, "a", encoding="utf-8") as summary_file:
                 # Write initial prompt — the CLI doesn't emit it
                 actual_prompt = cmd[cmd.index("-p") + 1] if "-p" in cmd else spec.goal
                 prompt_event = {
@@ -248,6 +257,29 @@ class ClaudeCodeAgentBackend(AgentBackend):
             error=result_text if is_error else None,
             steps=_extract_steps(events),
         )
+
+
+def _filter_redundant_broad_denies(deny_rules: List[str], allow_rules: List[str]) -> List[str]:
+    """Strip broad ``Tool(*)`` denies when narrow ``Tool(<pattern>)`` allows
+    exist for the same tool. Claude treats deny as higher precedence than
+    allow, so a broad deny would shadow the narrow allow and disable the
+    tool entirely. The narrow allow is itself the boundary — paths not
+    matching it are already denied by default.
+    """
+    def _tool_name(rule: str) -> Optional[str]:
+        if "(" in rule and rule.endswith(")"):
+            return rule.split("(", 1)[0]
+        return None
+
+    def _is_broad(rule: str) -> bool:
+        return rule.endswith("(*)")
+
+    narrow_allow_tools = {
+        _tool_name(r) for r in allow_rules
+        if _tool_name(r) and not _is_broad(r)
+    }
+    return [r for r in deny_rules
+            if not (_is_broad(r) and _tool_name(r) in narrow_allow_tools)]
 
 
 # --- Event parsing (module-level, reusable) ---

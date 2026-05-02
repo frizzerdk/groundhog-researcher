@@ -2091,6 +2091,7 @@ def test_permissions_propagate_to_all_agent_backends():
     from groundhog.agents.gemini_cli import GeminiCliAgentBackend
     from groundhog.agents.copilot import CopilotAgentBackend
     from groundhog.agents.codex_cli import CodexCliAgentBackend
+    from groundhog.agents.opencode import OpenCodeAgentBackend
 
     with tempfile.TemporaryDirectory() as d:
         spec = AgentSpec(
@@ -2108,9 +2109,13 @@ def test_permissions_propagate_to_all_agent_backends():
         assert "--disallowedTools" in cmd
         di = cmd.index("--disallowedTools")
         deny_args = cmd[di + 1:]
-        assert "Read(*)" in deny_args
-        assert "Bash(rm -rf *)" in deny_args
-        assert "Write(*)" in deny_args
+        # Claude resolves rule conflicts as ``deny > allow``: a broad
+        # ``Read(*)`` deny would shadow the narrow ``Read(./**)`` allow and
+        # disable the Read tool entirely. The adapter strips broad denies
+        # for tools that have a narrow allow — see _filter_redundant_broad_denies.
+        assert "Read(*)" not in deny_args  # dropped because Read has narrow allow
+        assert "Write(*)" in deny_args     # no narrow Write allow → kept
+        assert "Bash(rm -rf *)" in deny_args  # path-specific, not broad
 
         # 2) gemini_cli: deny rules surface in the prompt as advisory text.
         prompt = GeminiCliAgentBackend()._build_prompt(spec)
@@ -2130,16 +2135,109 @@ def test_permissions_propagate_to_all_agent_backends():
 
         # 4) codex_cli: no native allow/deny flags. Deny rules injected into
         #    the prompt as advisory text (like gemini). Hard floor is the
-        #    OS-level --sandbox workspace-write flag.
-        codex_cmd = CodexCliAgentBackend()._build_command(spec)
+        #    OS-level --sandbox workspace-write flag. Prompt comes via stdin
+        #    (last argv is the literal ``-``), so check the resolved prompt
+        #    text directly.
+        codex_backend = CodexCliAgentBackend()
+        codex_cmd = codex_backend._build_command(spec)
         assert "exec" in codex_cmd
         assert "--json" in codex_cmd
         assert "-s" in codex_cmd and "workspace-write" in codex_cmd
         assert any("approval_policy=never" in a for a in codex_cmd)
-        # Deny rules end up in the prompt (last positional arg)
-        assert "Read(*)" in codex_cmd[-1]
-        assert "Bash(rm -rf *)" in codex_cmd[-1]
-        assert "Write(*)" in codex_cmd[-1]
+        assert codex_cmd[-1] == "-"  # prompt fed via stdin
+        prompt = codex_backend._resolve_prompt(spec)
+        assert "Read(*)" in prompt
+        assert "Bash(rm -rf *)" in prompt
+        assert "Write(*)" in prompt
+
+        # 5) opencode: no OS sandbox flag. Hard enforcement comes from a
+        # temporary per-attempt opencode.json; deny rules are also repeated in
+        # the prompt so the model sees the strategy-level intent.
+        opencode = OpenCodeAgentBackend()
+        opencode_cmd = opencode._build_command(spec)
+        assert "run" in opencode_cmd
+        assert "--format" in opencode_cmd and "json" in opencode_cmd
+        assert "--agent" in opencode_cmd and "build" in opencode_cmd
+        assert "--dir" in opencode_cmd and str(Path(d)) in opencode_cmd
+        assert "--pure" in opencode_cmd
+        assert "--dangerously-skip-permissions" in opencode_cmd
+        assert "openrouter/deepseek/deepseek-v4-flash" in opencode_cmd
+        assert "Read(*)" in opencode_cmd[-1]
+        assert "Bash(rm -rf *)" in opencode_cmd[-1]
+        assert "Write(*)" in opencode_cmd[-1]
+
+        config = opencode._build_config(spec)
+        permissions = config["permission"]
+        # external_directory and read share the same path-rule dict so the
+        # workspace's absolute-path allow patterns work identically against
+        # both. The dict has a broad ``*: deny`` floor plus workspace-rooted
+        # allows generated from ``Read(./**)``.
+        assert isinstance(permissions["external_directory"], dict)
+        assert permissions["external_directory"]["*"] == "deny"
+        assert permissions["read"] == permissions["external_directory"]
+        assert permissions["read"] == permissions["list"]
+        assert permissions["webfetch"] == "deny"
+        assert permissions["bash"]["*"] == "deny"
+        # No Write/Edit allows in this spec → edit collapses to flat "deny".
+        assert permissions["edit"] == "deny"
+        assert "write" not in permissions
+
+
+def test_opencode_workspace_config_is_temporary():
+    """OpenCode gets a local config file, and existing files are restored."""
+    from pathlib import Path
+    import tempfile
+    from groundhog.base.agent import AgentSpec
+    from groundhog.agents.opencode import OpenCodeAgentBackend
+
+    with tempfile.TemporaryDirectory() as d:
+        workspace = Path(d)
+        spec = AgentSpec(goal="test", workspace_path=workspace)
+        backend = OpenCodeAgentBackend()
+
+        snapshot = backend._write_workspace_config(spec)
+        config_path = workspace / "opencode.json"
+        assert config_path.exists()
+        config = json.loads(config_path.read_text())
+        # With no allow/deny rules in the spec the read/external_directory
+        # configs collapse to the flat default "allow". The presence of the
+        # ``permission`` block is what we're really verifying here.
+        assert "permission" in config
+        backend._restore_workspace_config(snapshot)
+        assert not config_path.exists()
+
+        config_path.write_text("user config", encoding="utf-8")
+        snapshot = backend._write_workspace_config(spec)
+        assert "openrouter/deepseek/deepseek-v4-flash" in config_path.read_text()
+        backend._restore_workspace_config(snapshot)
+        assert config_path.read_text(encoding="utf-8") == "user config"
+
+
+def test_opencode_write_rules_are_scoped_to_attempt_under_parent_git():
+    """Write(work/*) must not become repo-root work/* when OpenCode climbs."""
+    from pathlib import Path
+    import tempfile
+    from groundhog.base.agent import AgentSpec
+    from groundhog.agents.opencode import OpenCodeAgentBackend
+
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d)
+        (repo / ".git").mkdir()
+        workspace = repo / "attempt_001"
+        workspace.mkdir()
+        spec = AgentSpec(
+            goal="test",
+            workspace_path=workspace,
+            allowed_tools=["Write(work/*)", "Edit(work/*)"],
+            denied_tools=["Write(*)"],
+        )
+
+        config = OpenCodeAgentBackend()._build_config(spec)
+        edit_rules = config["permission"]["edit"]
+        assert edit_rules["*"] == "deny"
+        assert edit_rules["attempt_001/work/*"] == "allow"
+        assert edit_rules[".\\attempt_001\\work\\*"] == "allow"
+        assert "work/*" not in edit_rules
 
 
 def test_codex_resume_command_uses_resume_subcommand():
@@ -2155,11 +2253,36 @@ def test_codex_resume_command_uses_resume_subcommand():
             workspace_path=Path(d),
             session_id="abc-123",
         )
-        cmd = CodexCliAgentBackend()._build_command(spec)
+        backend = CodexCliAgentBackend()
+        cmd = backend._build_command(spec)
         assert "resume" in cmd
         assert "abc-123" in cmd
-        # Final positional is the follow-up prompt
-        assert cmd[-1] == "follow up"
+        # Prompt is fed via stdin (last argv is the literal ``-``); verify the
+        # follow-up text is what _resolve_prompt returns for the resume path.
+        assert cmd[-1] == "-"
+        assert backend._resolve_prompt(spec) == "follow up"
+
+
+def test_codex_command_includes_add_dir_when_bin_supplied():
+    """``--add-dir <bin_dir>`` is what makes %TEMP%-rooted wrapper bins
+    visible to codex's sandboxed shell. Verifying it actually lands in argv."""
+    from pathlib import Path
+    import tempfile
+    from groundhog.base.agent import AgentSpec
+    from groundhog.agents.codex_cli import CodexCliAgentBackend
+
+    with tempfile.TemporaryDirectory() as d:
+        spec = AgentSpec(goal="hi", workspace_path=Path(d))
+        bin_dir = Path(d) / "_bin"
+        bin_dir.mkdir()
+        cmd = CodexCliAgentBackend()._build_command(spec, bin_dir=bin_dir)
+        assert "--add-dir" in cmd
+        idx = cmd.index("--add-dir")
+        assert cmd[idx + 1] == str(bin_dir)
+        # Without bin_dir the flag is absent (back-compat for callers that
+        # don't have a bin yet).
+        cmd_no_bin = CodexCliAgentBackend()._build_command(spec)
+        assert "--add-dir" not in cmd_no_bin
 
 
 def test_codex_event_parsing_extracts_session_and_output():
@@ -2188,6 +2311,57 @@ def test_codex_event_parsing_extracts_session_and_output():
     assert result.turns == 1
     # Steps include the command_execution and both agent_message items
     assert len(result.steps) == 3
+
+
+def test_opencode_resume_command_uses_session_flag():
+    """Resume path: ``opencode run --session <session_id> <prompt>``."""
+    from pathlib import Path
+    import tempfile
+    from groundhog.base.agent import AgentSpec
+    from groundhog.agents.opencode import OpenCodeAgentBackend
+
+    with tempfile.TemporaryDirectory() as d:
+        spec = AgentSpec(
+            goal="follow up",
+            workspace_path=Path(d),
+            session_id="ses_123",
+        )
+        cmd = OpenCodeAgentBackend()._build_command(spec)
+        assert "--session" in cmd
+        assert "ses_123" in cmd
+        # The last argv is the prompt — it always contains the workspace
+        # context header plus the goal, so the goal text appears as a
+        # substring rather than the entire arg.
+        assert "follow up" in cmd[-1]
+
+
+def test_opencode_event_parsing_extracts_session_output_and_cost():
+    """Verify the generic OpenCode parser handles JSONL text/result events."""
+    from groundhog.agents.opencode import OpenCodeAgentBackend
+
+    events = [
+        {"type": "step_start", "sessionID": "ses_123"},
+        {"type": "text", "sessionID": "ses_123", "text": "first"},
+        {"type": "tool_use", "sessionID": "ses_123",
+         "part": {"type": "tool", "tool": "bash",
+                  "state": {"status": "completed",
+                            "input": {"command": ".groundhog_tools/evaluate solution.py"},
+                            "output": "score=0.8"}}},
+        {"type": "tool_result", "sessionID": "ses_123", "content": "score=0.8"},
+        {"type": "text", "sessionID": "ses_123", "text": "final answer"},
+        {"type": "step_finish", "sessionID": "ses_123",
+         "part": {"type": "step-finish",
+                  "tokens": {"input": 100, "output": 20, "reasoning": 0,
+                             "cache": {"read": 0, "write": 0}},
+                  "cost": 0.001}},
+    ]
+    result = OpenCodeAgentBackend()._parse_result(events)
+    assert result.success is True
+    assert result.session_id == "ses_123"
+    assert result.output == "first\nfinal answer"
+    assert result.turns == 1
+    assert result.cost == 0.001
+    assert len(result.steps) == 4
 
 
 # === Run all tests ===

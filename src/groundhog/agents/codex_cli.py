@@ -6,10 +6,17 @@ event for resume; sums token usage from ``turn.completed`` events.
 
 Sandboxing
 ----------
-``--sandbox workspace-write`` confines **writes** to the agent's cwd
-(filesystem floor enforced by the OS — verified on Windows: writes to
-absolute system paths return "access denied"; writes inside the
-attempt directory tree succeed) and blocks network by default.
+``--sandbox workspace-write`` blocks network and blocks writes to
+absolute system paths (verified on Windows: ``C:\\tmp\\...`` returns
+access-denied). **However**, the writable area is broader than the
+``cwd`` we set — empirically, writes to ``../sibling/`` succeed even
+with ``sandbox_workspace_write.writable_roots=[]`` and even when no
+``.git/`` exists at any level. There's no observed config knob on
+Windows that tightens the writable area to ``cwd``-only short of
+switching to ``-s read-only`` (which then blocks legitimate writes
+inside ``cwd`` too). Implication for parallel optimization: an agent
+in ``attempts/NNN_M/`` can write to ``attempts/<sibling>/`` — caller
+must isolate each attempt's parent directory if that matters.
 ``-c approval_policy=never`` makes the run non-interactive.
 
 **Codex does not restrict reads** in workspace-write mode — the agent
@@ -21,16 +28,19 @@ allow/deny pattern equivalent to claude's ``--allowedTools`` /
 
 Tool exposure
 -------------
-The HTTP tool server + multi-format wrappers (`.ps1` / `.cmd` /
-`.py` / extensionless bash) are written to a workspace-local bin dir
-``<workspace>/.groundhog_tools/``. Workspace-local placement is
-deliberate — temp-dir bins under ``%TEMP%`` aren't reliably
-visible/executable inside codex's sandbox even with
-``shell_environment_policy.inherit=all``, but anything inside the
-agent's cwd is automatically accessible. The agent invokes wrappers
-via relative path: ``& .\.groundhog_tools\smoke.ps1``. The HTTP tool
-server (port in ``TOOL_SERVER_PORT`` env) also works as a fallback
-the agent can call via ``Invoke-RestMethod`` if needed.
+The HTTP tool server + multi-format wrappers (``.ps1`` / ``.cmd`` /
+``.py`` / extensionless bash) are written to a ``%TEMP%`` bin dir,
+matching the convention the other backends use. Two flags make this
+work inside codex's sandbox on Windows:
+
+- ``--add-dir <bin_dir>`` grants the sandbox visibility into the
+  wrapper directory so PowerShell can resolve ``.cmd`` / ``.ps1``
+  files via PATHEXT lookup.
+- ``-c shell_environment_policy.inherit=all`` propagates our parent
+  ``PATH`` (with ``bin_dir`` prepended) into the spawned shell.
+
+The HTTP tool server (port in ``TOOL_SERVER_PORT`` env) also works
+as a fallback that the agent can call via ``Invoke-RestMethod``.
 
 Cost
 ----
@@ -94,21 +104,17 @@ class CodexCliAgentBackend(AgentBackend):
         server = None
         bin_dir = None
         try:
-            # Place the wrapper bin dir INSIDE the workspace so codex's
-            # sandbox automatically grants visibility/execute permissions.
-            # A %TEMP%-rooted bin (the default for other backends) doesn't
-            # propagate reliably into codex's spawned PowerShell, even with
-            # shell_environment_policy.inherit=all — the wrappers exist on
-            # PATH but are reported "not recognized" by `pwsh -Command`.
-            # Workspace-local sidesteps the question entirely.
-            bin_dir = spec.workspace_path / ".groundhog_tools"
-            bin_dir.mkdir(parents=True, exist_ok=True)
+            # Wrappers live in a %TEMP% bin dir, matching the other backends.
+            # Codex's sandbox normally hides %TEMP% from the spawned shell,
+            # so we pass ``--add-dir <bin_dir>`` (see _build_command) to
+            # grant the sandbox visibility into the wrapper directory.
+            bin_dir = Path(tempfile.mkdtemp(prefix="codex_tools_"))
             server = self._start_tool_server(spec)
             port = server.port if server else None
             if spec.tools and port is not None:
                 generate_wrappers(spec.tools, bin_dir, port)
             env = self._build_env(spec, bin_dir, port)
-            cmd = self._build_command(spec)
+            cmd = self._build_command(spec, bin_dir=bin_dir)
             events = self._run_subprocess(cmd, env, spec)
             return self._parse_result(events)
         except TimeoutError as e:
@@ -118,9 +124,8 @@ class CodexCliAgentBackend(AgentBackend):
         finally:
             if server:
                 server.stop()
-            # Don't delete bin_dir — it lives inside the committed attempt
-            # for post-mortem inspection. Workspace cleanup handles it if
-            # the attempt is aborted.
+            if bin_dir is not None:
+                cleanup_wrappers(bin_dir)
 
     def _start_tool_server(self, spec: AgentSpec) -> Optional[ToolServer]:
         if not spec.tools:
@@ -140,64 +145,73 @@ class CodexCliAgentBackend(AgentBackend):
         return env
 
     def _build_prompt(self, spec: AgentSpec) -> str:
-        """Goal + tool docs + (advisory) deny rules. Codex has no native
-        deny-pattern flag, so the prompt is the only place denies show up."""
+        """Goal + tool docs + the resolved permission policy.
+
+        Codex has no native allow/deny tool flags, so the policy is
+        advisory text. Include BOTH allow and deny lists (with the
+        narrow-allow-overrides-broad-deny explanation) — without the
+        allow side, models see ``Write(*)`` deny and refuse all writes
+        including the ``Write(work/*)`` ones the strategy permits.
+        """
+        from groundhog.agents.gemini_cli import _format_permission_policy
+
         prompt = spec.goal
         docs = build_tool_docs(spec.tools)
         if docs:
             prompt += "\n\n" + docs
-        if spec.denied_tools:
-            lines = ["\n\n## Restrictions",
-                     "You MUST NOT use the following tools or actions:"]
-            for rule in spec.denied_tools:
-                lines.append(f"- {rule}")
-            prompt += "\n".join(lines)
+        if spec.allowed_tools or spec.denied_tools:
+            prompt += "\n\n" + _format_permission_policy(
+                spec.allowed_tools, spec.denied_tools
+            )
         return prompt
 
-    def _build_command(self, spec: AgentSpec) -> list:
+    def _resolve_prompt(self, spec: AgentSpec) -> str:
+        """Pick the prompt text for the current run. On resume the goal
+        is the follow-up; on first turn it's the full prompt with tool
+        docs + denies attached."""
+        if spec.session_id:
+            return spec.goal
+        return self._build_prompt(spec)
+
+    def _build_command(self, spec: AgentSpec, bin_dir: Optional[Path] = None) -> list:
         model = spec.model or self.model
         effort = spec.effort or self.effort
 
+        # Common flags for both new-session and resume paths. ``--add-dir``
+        # exposes the %TEMP% wrapper bin to the sandbox; without it,
+        # ``pwsh -Command <wrapper>`` reports "not recognized" because the
+        # sandbox hides paths outside cwd from the spawned shell.
+        # ``shell_environment_policy.inherit=all`` propagates our PATH
+        # (which has bin_dir prepended) into the spawned shell's env.
+        # ``project_root_markers=[]`` disables codex's walk-up search for
+        # ``.git`` (etc.) when computing the sandbox workspace boundary —
+        # without this, codex uses the enclosing repo as the project root
+        # and writes to ``../sibling/`` succeed because they're inside the
+        # repo. Anchoring the boundary at cwd is what we want for parallel
+        # attempts that share a parent directory.
+        common = [
+            _resolve_codex_bin(), "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "-s", self.sandbox,
+            "-c", "approval_policy=never",
+            "-c", "shell_environment_policy.inherit=all",
+            "-c", "project_root_markers=[]",
+        ]
+        if bin_dir is not None:
+            common += ["--add-dir", str(bin_dir)]
+        if model:
+            common += ["-m", model]
+        if effort:
+            common += ["-c", f"model_reasoning_effort={effort}"]
+
+        # Prompt is fed via stdin (handled in _run_subprocess) — passing it
+        # as a positional argv on Windows truncates at the first newline
+        # because the codex.cmd npm wrapper splits on \n. Using ``-`` reads
+        # from stdin per the codex-exec docs.
         if spec.session_id:
-            # Resume an existing thread. The follow-up prompt is short — no
-            # need to re-attach tool docs (the tools are still on PATH).
-            cmd = [
-                _resolve_codex_bin(), "exec",
-                "--json",
-                "--skip-git-repo-check",
-                "-s", self.sandbox,
-                "-c", "approval_policy=never",
-                # Inherit parent PATH (etc.) so the agent's shell can find
-                # bash wrappers we put on PATH for tool exposure. Without
-                # this, codex's shell_environment_policy strips PATH and
-                # tools become invisible.
-                "-c", "shell_environment_policy.inherit=all",
-            ]
-            if model:
-                cmd += ["-m", model]
-            if effort:
-                cmd += ["-c", f"model_reasoning_effort={effort}"]
-            cmd += ["resume", spec.session_id, spec.goal]
-        else:
-            prompt = self._build_prompt(spec)
-            cmd = [
-                _resolve_codex_bin(), "exec",
-                "--json",
-                "--skip-git-repo-check",
-                "-s", self.sandbox,
-                "-c", "approval_policy=never",
-                # Inherit parent PATH (etc.) so the agent's shell can find
-                # bash wrappers we put on PATH for tool exposure. Without
-                # this, codex's shell_environment_policy strips PATH and
-                # tools become invisible.
-                "-c", "shell_environment_policy.inherit=all",
-            ]
-            if model:
-                cmd += ["-m", model]
-            if effort:
-                cmd += ["-c", f"model_reasoning_effort={effort}"]
-            cmd += [prompt]
-        return cmd
+            return common + ["resume", spec.session_id, "-"]
+        return common + ["-"]
 
     def _run_subprocess(self, cmd: list, env: dict, spec: AgentSpec) -> List[dict]:
         """Run subprocess with --json, writing events live to workspace."""
@@ -205,15 +219,28 @@ class CodexCliAgentBackend(AgentBackend):
         summary_path = spec.workspace_path / "agent_summary.jsonl"
         deadline = time.monotonic() + spec.timeout if spec.timeout else None
 
+        # encoding="utf-8" + errors="replace" — same Windows fix as the
+        # copilot adapter. Default cp1252 locale chokes on JSON bytes
+        # codex emits (observed: 0x9d at position 139 → UnicodeDecodeError).
+        # stdin=PIPE so we can feed the prompt (avoids argv newline
+        # truncation on Windows via the codex.cmd npm wrapper).
+        prompt = self._resolve_prompt(spec)
         proc = subprocess.Popen(
             cmd,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=None,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=str(spec.workspace_path),
             env=env,
         )
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except (OSError, BrokenPipeError):
+            pass
 
         events: List[dict] = []
         try:

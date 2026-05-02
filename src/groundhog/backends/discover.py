@@ -39,6 +39,22 @@ def _save_preferences(prefs):
 _auth_warnings = []
 
 
+def _has_opencode_cli():
+    if shutil.which("opencode"):
+        return True
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            try:
+                if (Path(appdata) / "npm" / "opencode.cmd").exists():
+                    return True
+            except OSError:
+                # Some sandboxed contexts cannot stat AppData even though the
+                # user shell can run the npm shim. Avoid crashing discovery.
+                return True
+    return False
+
+
 def discover_backends() -> Dict[str, LLMBackend]:
     """Check what LLM tools are available on this machine.
 
@@ -65,7 +81,7 @@ def discover_backends() -> Dict[str, LLMBackend]:
         from groundhog.backends.gemini_cli import GeminiCLIBackend
         backends["gemini_cli"] = GeminiCLIBackend()
 
-    if shutil.which("opencode"):
+    if _has_opencode_cli():
         from groundhog.backends.opencode import OpenCodeBackend
         backends["opencode"] = OpenCodeBackend()
 
@@ -140,7 +156,7 @@ def _create_backend(backend_name, model=None):
         "claude_code": lambda m: ClaudeCodeBackend(model=m or "sonnet"),
         "copilot":     lambda m: CopilotBackend(model=m or "gpt-5-mini"),
         "gemini_cli":  lambda m: GeminiCLIBackend(model=m or "gemini-2.5-flash"),
-        "opencode":    lambda m: OpenCodeBackend(model=m or "anthropic/claude-sonnet-4-6-20260217"),
+        "opencode":    lambda m: OpenCodeBackend(model=m or "openrouter/deepseek/deepseek-v4-flash"),
         "anthropic":   lambda m: AnthropicBackend(model=m or "claude-sonnet-4-6-20260217"),
         "gemini":      lambda m: GeminiBackend(model=m or "gemini-2.5-flash"),
         "openai":      lambda m: OpenAICompatibleBackend.openai(model=m or "gpt-5.4-mini"),
@@ -337,13 +353,35 @@ def discover_agent_backends():
         except Exception:
             pass
 
+    if _has_opencode_cli():
+        try:
+            from groundhog.agents.opencode import OpenCodeAgentBackend
+            backends["opencode"] = OpenCodeAgentBackend()
+        except Exception:
+            pass
+
+    if shutil.which("codex"):
+        try:
+            from groundhog.agents.codex_cli import CodexCliAgentBackend
+            backends["codex_cli"] = CodexCliAgentBackend()
+        except Exception:
+            pass
+
     return backends
 
 
+# Codex is intentionally absent from the tier defaults below: on Windows
+# its sandbox uses ACL-based isolation that *cannot* prevent writes to
+# directories where the user account already has write permissions
+# (per OpenAI's own docs). Sibling-attempt and parent-dir writes leak,
+# which is unsafe for the parallel-attempt loop. It's still discovered
+# above so users who explicitly opt in (``toolkit.agent.set("default",
+# "codex_cli")``) or whose tasks accept the risk can use it. See
+# ``docs/sandboxing.md`` for the full per-backend matrix.
 _AGENT_TIER_DEFS = {
-    "default": ["claude_code", "copilot", "gemini_cli"],
-    "high":    ["claude_code", "copilot", "gemini_cli"],
-    "budget":  ["gemini_cli", "copilot", "claude_code"],
+    "default": ["claude_code", "opencode", "copilot", "gemini_cli"],
+    "high":    ["claude_code", "opencode", "copilot", "gemini_cli"],
+    "budget":  ["opencode", "gemini_cli", "copilot", "claude_code"],
 }
 
 

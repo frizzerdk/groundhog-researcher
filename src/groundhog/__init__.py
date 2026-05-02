@@ -47,4 +47,5 @@ from groundhog.agents.claude_code import ClaudeCodeAgentBackend
 from groundhog.agents.gemini_cli import GeminiCliAgentBackend
 from groundhog.agents.copilot import CopilotAgentBackend
 from groundhog.agents.codex_cli import CodexCliAgentBackend
+from groundhog.agents.opencode import OpenCodeAgentBackend
 from groundhog.backends.discover import discover_agent_backends, auto_agent_registry

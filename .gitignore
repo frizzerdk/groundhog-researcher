@@ -9,4 +9,7 @@ workspace/
 tests/e2e_mnist_agent/attempts/*
 tests/e2e_mnist_agent/learnings.md
 tmp/*
+.tmp/
+.claude/
 tests/e2e_mnist_agent/*
+probe_results/

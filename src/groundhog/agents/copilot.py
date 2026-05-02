@@ -178,19 +178,25 @@ class CopilotAgentBackend(AgentBackend):
         summary_path = spec.workspace_path / "agent_summary.jsonl"
         deadline = time.monotonic() + spec.timeout if spec.timeout else None
 
+        # encoding="utf-8" + errors="replace" prevents the default cp1252
+        # locale on Windows from blowing up on non-cp1252 bytes in copilot's
+        # JSON stream (observed: 0x90 in position 993 → UnicodeDecodeError).
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=None,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=str(spec.workspace_path),
             env=env,
         )
 
         events = []
         try:
-            with open(jsonl_path, "a") as raw_file, open(summary_path, "a") as summary_file:
+            with open(jsonl_path, "a", encoding="utf-8") as raw_file, \
+                 open(summary_path, "a", encoding="utf-8") as summary_file:
                 # Don't write initial prompt — copilot emits user.message with it
 
                 for line in proc.stdout:

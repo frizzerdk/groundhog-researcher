@@ -1,15 +1,3 @@
-# /// script
-# dependencies = [
-#     "groundhog-researcher",
-#     "python-dotenv",
-#     "numpy",
-#     "scikit-learn",
-#     "torch",
-# ]
-#
-# [tool.uv.sources]
-# groundhog-researcher = { path = "../.." }
-# ///
 """E2E test: MNIST + AgentStrategy across backends.
 
 Usage:
@@ -33,6 +21,7 @@ from groundhog import (
     BackendRegistry,
     ClaudeCodeAgentBackend,
     CopilotAgentBackend,
+    CodexCliAgentBackend,
 )
 from groundhog.base.agent import AgentRegistry
 
@@ -43,10 +32,12 @@ if backend_name == "claude":
     agent_backend = ClaudeCodeAgentBackend(model="haiku", max_budget_usd=0.25)
 elif backend_name == "copilot":
     agent_backend = CopilotAgentBackend(model="gpt-5-mini")
+elif backend_name == "codex":
+    agent_backend = CodexCliAgentBackend(effort="medium")
 elif backend_name == "status":
     agent_backend = None
 else:
-    raise SystemExit(f"Unknown backend: {backend_name!r} (expected: claude, copilot, status)")
+    raise SystemExit(f"Unknown backend: {backend_name!r} (expected: claude, copilot, codex, status)")
 
 task = MNISTTask()
 agent_strategy = AgentStrategy()

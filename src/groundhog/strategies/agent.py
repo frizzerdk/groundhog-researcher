@@ -50,6 +50,15 @@ class AgentConfig(StrategyConfig):
         "root before the agent runs (used by PlanApproaches to seed a new "
         "fresh-direction family).",
     )
+    force_prior_attempt: Optional[int] = param(
+        None,
+        "If set, pin this attempt number as the prior, bypassing the "
+        "strategy's default selector entirely. Use whenever you want a "
+        "specific parent rather than whatever the rating system picks — "
+        "common cases: refining a known clean baseline, reproducing a "
+        "previous result, deliberately exploring a non-best branch, or "
+        "feeding a queue item targeted at a specific attempt.",
+    )
 
 
 # --- Permissions (depth-based, deepest/last wins) ---
@@ -60,7 +69,14 @@ class AgentConfig(StrategyConfig):
 # ``AgentStrategy.permissions`` docstring for the per-backend reality.
 
 BASE_PERMISSIONS = [
-    ("allow", "Read(*)"),
+    # Reads: workspace tree + sibling/prior tree only. Absolute paths
+    # outside the attempt root are denied so an agent can't drift into
+    # site-packages, the parent repo, or system files.
+    ("allow", "Read(./**)"),
+    ("allow", "Read(../**)"),
+    ("deny",  "Read(*)"),
+    # Writes: only inside work/. Everything else (attempt root, outside,
+    # system) is denied.
     ("deny",  "Write(*)"),
     ("allow", "Write(work/*)"),
     ("allow", "Edit(work/*)"),
@@ -101,6 +117,47 @@ earlier work, use the get-priors / list-prior / get-prior-file tools to
 read them on demand.
 """
 
+
+# Human-readable sandbox contract injected into every phase prompt.
+# Mirrors the rules encoded in BASE_PERMISSIONS. Some backends enforce
+# these at the OS or CLI level; others rely on the prompt as the only
+# signal. Either way, an explicit statement here keeps the agent from
+# wasting turns probing the boundary and documents the contract for the
+# transcript reader.
+SANDBOX_RULES = """\
+## Sandbox & rules
+
+You are running in a sandboxed workspace. The boundaries below are
+enforced by the host on backends that support it; on the rest, the
+host audits transcripts. **Do not under any circumstances attempt to circumvent them.**
+
+**You may:**
+- Read any file inside the attempt directory tree, including
+  `work/`, the attempt root, and parent dirs (`../`) for sibling
+  attempts and shared materials.
+- Write or edit files **inside `work/` only**. This is the area that
+  will be submitted at the end of the session.
+- Run the registered Groundhog tools (e.g., `evaluate`,
+  `get-learnings`, `get-priors`) and your CLI's own Read/Edit tools.
+
+**You may NOT:**
+- Read files outside the attempt directory — system paths
+  (`C:\\Windows\\...`, `/etc/...`), the parent repository's source,
+  user dotfiles, unrelated projects, etc.
+- Write or edit anywhere outside `work/` — including the attempt
+  root (no `solution.py` rewrites at the root; that's auto-submitted
+  from `work/solution.py`), sibling attempts, parent directories, or
+  any system path.
+- Use shell commands or scripting tricks to circumvent the above —
+  no `cp`/`copy` to exfiltrate data, no symlinks pointing outside
+  `work/`, no embedding absolute paths in code that gets executed
+  later, no spawning sub-processes that bypass the constraints.
+
+If a tool call is blocked, that is the intended behavior. Note it and
+move on — do not retry, do not work around. If you believe a rule
+prevents legitimate work for this task, say so explicitly in your
+response so a human can adjust the policy."""
+
 EXPLORE_PROMPT = """\
 {session_header}
 
@@ -135,6 +192,8 @@ automatically move to a submission phase.
 - Focus on understanding before changing — blind edits waste iterations
 {budget_info}{guidance}
 
+{sandbox_rules}
+
 ## Files
 
 {file_listing}"""
@@ -148,7 +207,9 @@ Your work/solution.py failed evaluation with this error:
 
 {error}
 
-Fix the issue in work/solution.py and run `{eval_command}` to verify."""
+Fix the issue in work/solution.py and run `{eval_command}` to verify.
+
+{sandbox_rules}"""
 
 REFLECT_PROMPT = """\
 Update work/learnings.md with what you learned this session:
@@ -192,6 +253,8 @@ You have one session to improve the solution.
 - Do not fall back to the parent solution; byte-identical children are non-promotable
 - Focus on understanding before changing — blind edits waste iterations
 {budget_info}{guidance}
+
+{sandbox_rules}
 
 ## Files
 
@@ -242,6 +305,10 @@ class AgentStrategy(Strategy):
       (writes confined to attempt-root tree, network blocked) — reads
       remain unrestricted at the sandbox level regardless of what's in
       ``denied_tools``.
+    - ``OpenCodeAgentBackend``: maps read/edit/bash rules into a generated
+      OpenCode permission config. There is no OS sandbox, so this is
+      stronger than prompt-only adapters but weaker than Codex's filesystem
+      floor.
     """
 
     Config = AgentConfig
@@ -380,6 +447,14 @@ class AgentStrategy(Strategy):
     # --- Selection ---
 
     def _select_prior(self, toolkit):
+        # Explicit pinning via config. Bypasses any auto-selection so queue
+        # items (or task code) can target a specific attempt for any
+        # reason — known clean baseline, reproducing a result, exploring
+        # a non-best branch, etc. Returns None if the named attempt
+        # doesn't exist — caller treats that as "no prior available".
+        forced = getattr(self.cfg, "force_prior_attempt", None)
+        if forced is not None:
+            return toolkit.history.get(int(forced))
         if self.cfg.target == "best":
             stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=self.through)
             return toolkit.history.best(stages[-1].score)
@@ -573,6 +648,7 @@ class AgentStrategy(Strategy):
             approach_context=approach_context,
             budget_info=budget_info,
             guidance=guidance,
+            sandbox_rules=SANDBOX_RULES,
             file_listing=self._build_file_listing(ws),
         )
 
@@ -681,7 +757,11 @@ class AgentStrategy(Strategy):
 
             self.log.inline(f"fix {retry + 1}... ")
             allow, deny = self._resolve_permissions("fix")
-            goal = FIX_PROMPT.format(error=error_text, eval_command=eval_command)
+            goal = FIX_PROMPT.format(
+                error=error_text,
+                eval_command=eval_command,
+                sandbox_rules=SANDBOX_RULES,
+            )
             spec = AgentSpec(
                 goal=goal,
                 workspace_path=ws.path,

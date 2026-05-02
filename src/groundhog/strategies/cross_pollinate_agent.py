@@ -12,14 +12,37 @@ applies as usual (parent's ``core_direction.md`` is inherited and
 re-enforced at commit). The inspiration's files are reachable via the
 existing ``get-prior-file`` tool with the inspiration's attempt id.
 
+Targeted variant: pass ``force_prior_attempt`` (inherited from
+``AgentConfig``) and/or ``inspiration_attempt`` in the strategy config
+to force a specific pair, bypassing the default "best leader of
+different family" selection. Useful when a non-transitive matchup
+(e.g. attempt X beats Y but loses to Z; same family) shows there's
+something X has that Y lost — explicit pinning surfaces the delta.
+
 Vault: Strategy — Types of Action.md (Combine), Implementation Details/
 Family Identity.md.
 """
 
 from __future__ import annotations
 
-from groundhog.strategies.agent import AgentStrategy
+from dataclasses import dataclass
+from typing import Optional
+
+from groundhog.base.strategy import StrategyConfig, param
+from groundhog.strategies.agent import AgentConfig, AgentStrategy
 from groundhog.utils.selection import get_trunk_leaders
+
+
+@dataclass
+class CrossPollinateAgentConfig(AgentConfig):
+    """Inherit AgentConfig (which provides ``force_prior_attempt``) and
+    add the cross-pollinate-specific ``inspiration_attempt`` pin."""
+    inspiration_attempt: Optional[int] = param(
+        None,
+        "If set, force this attempt number as the inspiration, bypassing the "
+        "default 'best leader of a different family' pick. Allows same-family "
+        "cross-pollinate (e.g. surface a non-transitive matchup edge).",
+    )
 
 
 _INSPIRATION_PROMPT = """\
@@ -51,6 +74,8 @@ class CrossPollinateAgent(AgentStrategy):
     prompt and reachable via the standard prior-reader tools.
     """
 
+    Config = CrossPollinateAgentConfig
+
     def __call__(self, toolkit, config=None):
         # Initialize so we have access to scorer / log; defer the parent
         # __call__ until after we've located the inspiration so we can
@@ -61,11 +86,29 @@ class CrossPollinateAgent(AgentStrategy):
         if not hasattr(toolkit, "history"):
             return {"skipped": "no history on toolkit"}
 
-        prior = self._select_prior(toolkit)
+        # Targeted pinning via config (force_prior_attempt /
+        # inspiration_attempt). Falls through to default pickers when
+        # not set.
+        forced_prior_num = getattr(self.cfg, "force_prior_attempt", None)
+        forced_insp_num = getattr(self.cfg, "inspiration_attempt", None)
+
+        prior = None
+        if forced_prior_num is not None:
+            prior = toolkit.history.get(int(forced_prior_num))
+            if prior is None:
+                return {"skipped": f"forced force_prior_attempt={forced_prior_num} not found"}
+        if prior is None:
+            prior = self._select_prior(toolkit)
         if prior is None:
             return {"skipped": "no prior available — cross-pollinate needs a parent"}
 
-        inspiration = self._select_inspiration(toolkit, prior)
+        inspiration = None
+        if forced_insp_num is not None:
+            inspiration = toolkit.history.get(int(forced_insp_num))
+            if inspiration is None:
+                return {"skipped": f"forced inspiration_attempt={forced_insp_num} not found"}
+        if inspiration is None:
+            inspiration = self._select_inspiration(toolkit, prior)
         if inspiration is None:
             return {"skipped": "no different-family attempt to draw inspiration from"}
 

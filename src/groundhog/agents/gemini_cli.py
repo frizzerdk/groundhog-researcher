@@ -14,6 +14,7 @@ Ported from EvaluatableExperiments/src/agents/implementations/gemini_cli.py.
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -27,6 +28,35 @@ from groundhog.agents.tool_server import (
     cleanup_wrappers,
     generate_wrappers,
 )
+
+
+def _format_permission_policy(allowed: List[str], denied: List[str]) -> str:
+    """Render the resolved allow/deny rules as a permission section for
+    advisory backends (gemini, codex). Including both lists is critical:
+    when only the deny side is shown, models see e.g. ``Write(*)`` and
+    refuse every write — even the ``Write(work/*)`` writes the strategy
+    actually allows. The short explanation up top tells the model how
+    the two interact.
+    """
+    lines = ["## Permission policy"]
+    lines.append(
+        "These rules describe what your tools may and may not do. Narrow "
+        "ALLOWs override broader DENYs (e.g. ``Write(work/*)`` allow + "
+        "``Write(*)`` deny means: only writes inside ``work/`` are "
+        "permitted; everything else is denied). When in doubt, prefer "
+        "the most specific rule that matches your intended action."
+    )
+    if allowed:
+        lines.append("")
+        lines.append("**Allowed:**")
+        for rule in allowed:
+            lines.append(f"- {rule}")
+    if denied:
+        lines.append("")
+        lines.append("**Denied** (subject to the narrower allows above):")
+        for rule in denied:
+            lines.append(f"- {rule}")
+    return "\n".join(lines)
 
 
 class GeminiCliAgentBackend(AgentBackend):
@@ -100,41 +130,86 @@ class GeminiCliAgentBackend(AgentBackend):
         self._temp_config_dir = config_dir
 
     def _build_prompt(self, spec: AgentSpec) -> str:
-        """Augment goal with tool docs and deny rules (encoded in prompt)."""
+        """Augment goal with tool docs and the resolved permission policy.
+
+        Gemini has no native ``--allowedTools`` / ``--disallowedTools``
+        flags, so the policy is advisory — encoded as prompt text. We
+        include BOTH allows and denies (and a short explanation that
+        narrow allows override broader denies), otherwise the model sees
+        e.g. ``- Write(*)`` in deny list and refuses every write,
+        including the ``Write(work/*)`` ones the strategy actually
+        allows.
+        """
         prompt = spec.goal
         docs = build_tool_docs(spec.tools)
         if docs:
             prompt += "\n\n" + docs
 
-        # Gemini has no --disallowedTools flag — encode in prompt
-        if spec.denied_tools:
-            lines = ["\n\n## Restrictions\n"]
-            lines.append("You MUST NOT use the following tools or actions:")
-            for rule in spec.denied_tools:
-                lines.append(f"- {rule}")
-            prompt += "\n".join(lines)
+        if spec.allowed_tools or spec.denied_tools:
+            prompt += "\n\n" + _format_permission_policy(
+                spec.allowed_tools, spec.denied_tools
+            )
 
         return prompt
+
+    @staticmethod
+    def _resolve_gemini_invocation() -> List[str]:
+        """Return the argv prefix to launch gemini-cli without the cmd shim.
+
+        On Windows the npm install is ``gemini.cmd`` (which forwards to
+        ``node ...\\bundle\\gemini.js %*`` via cmd.exe). cmd.exe truncates
+        argv at the first newline, mangling multi-line prompts. Resolve
+        the bundle JS path and call node directly when we can; fall back
+        to the .cmd shim only when the bundle isn't where we expect.
+        """
+        if os.name == "nt":
+            npm_root = os.environ.get("APPDATA")
+            if npm_root:
+                bundle = (
+                    Path(npm_root) / "npm" / "node_modules" / "@google"
+                    / "gemini-cli" / "bundle" / "gemini.js"
+                )
+                try:
+                    if bundle.exists():
+                        node = shutil.which("node") or "node"
+                        return [node, str(bundle)]
+                except OSError:
+                    pass
+        # POSIX, or Windows without the bundled .js: rely on the shim and
+        # accept the multi-line argv risk on Windows.
+        found = shutil.which("gemini")
+        return [found] if found else ["gemini"]
 
     def _build_command(self, spec: AgentSpec) -> list:
         model = spec.model or self.model
 
+        # Resolve gemini-cli binary. On Windows the npm install is just a
+        # ``gemini.cmd`` shim that invokes ``node ...\gemini.js %*``. The
+        # ``%*`` expansion goes through cmd.exe, which truncates argv at
+        # the first newline — so a multi-line prompt (goal + tool docs +
+        # deny rules) reaches gemini as just the first line. Invoke node
+        # directly with the bundle .js to bypass cmd.exe entirely.
+        gemini_argv0 = self._resolve_gemini_invocation()
+
+        # Skip the "trusted directory" gate. Without this, gemini exits with
+        # code 55 in headless invocations from a directory it doesn't
+        # recognise as trusted (the per-attempt workspaces are always new).
+        skip_trust = ["--skip-trust"]
+
+        prompt = self._build_prompt(spec)
         if spec.session_id:
-            # Resuming — still need tool docs and deny rules in prompt
-            prompt = self._build_prompt(spec)
-            cmd = [
-                "gemini", "-p", prompt,
+            cmd = gemini_argv0 + [
+                "-p", prompt,
                 "--output-format", "stream-json",
                 "-m", model,
                 "--resume", spec.session_id,
-            ]
+            ] + skip_trust
         else:
-            prompt = self._build_prompt(spec)
-            cmd = [
-                "gemini", "-p", prompt,
+            cmd = gemini_argv0 + [
+                "-p", prompt,
                 "--output-format", "stream-json",
                 "-m", model,
-            ]
+            ] + skip_trust
 
         if self.approval_mode != "default":
             cmd += ["--approval-mode", self.approval_mode]
@@ -150,19 +225,34 @@ class GeminiCliAgentBackend(AgentBackend):
         summary_path = spec.workspace_path / "agent_summary.jsonl"
         deadline = time.monotonic() + spec.timeout if spec.timeout else None
 
+        # encoding="utf-8" + errors="replace": same Windows guard as the
+        # codex_cli/copilot adapters. Default cp1252 locale can crash the
+        # decode of JSON bytes the CLI emits.
+        # GEMINI_CLI_TRUST_WORKSPACE bypasses the trusted-folder gate that
+        # otherwise exits with code 55 on per-attempt fresh workspaces.
+        env = dict(env)
+        env.setdefault("GEMINI_CLI_TRUST_WORKSPACE", "true")
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=None,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=str(spec.workspace_path),
             env=env,
         )
 
         events = []
         try:
-            with open(jsonl_path, "a") as raw_file, open(summary_path, "a") as summary_file:
+            # encoding="utf-8" is critical: without it, the default cp1252
+            # locale on Windows fails to encode characters that gemini's
+            # JSONL stream emits (e.g. tz suffixes, non-ASCII text in
+            # tool results). The exception aborts the read loop silently
+            # before any events are saved.
+            with open(jsonl_path, "a", encoding="utf-8") as raw_file, \
+                 open(summary_path, "a", encoding="utf-8") as summary_file:
                 actual_prompt = cmd[cmd.index("-p") + 1] if "-p" in cmd else spec.goal
                 prompt_event = {
                     "type": "user",
