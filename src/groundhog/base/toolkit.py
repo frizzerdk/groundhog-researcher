@@ -48,7 +48,13 @@ class Toolkit(SimpleNamespace):
     """
 
     def __setattr__(self, name, value):
-        if hasattr(self, name) and name != '_overrides':
+        # Skip override tracking for private attributes — these are internal
+        # bookkeeping (e.g. the optimizer's per-iteration queue label) that
+        # can change every loop and would otherwise spam the console.
+        if name.startswith('_') or name == '_overrides':
+            super().__setattr__(name, value)
+            return
+        if hasattr(self, name):
             if not hasattr(self, '_overrides'):
                 super().__setattr__('_overrides', {})
             old = getattr(self, name)

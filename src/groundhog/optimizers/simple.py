@@ -13,6 +13,7 @@ from groundhog.histories.folder import FolderAttemptHistory
 from groundhog.base.toolkit import Toolkit
 from groundhog.base.learnings import Learnings
 from groundhog.learnings.markdown import MarkdownLearnings
+from groundhog.tools.attempt_log import AttemptLog
 from groundhog.tools.log import StrategyLog
 from groundhog.tools.queue import read_next as read_queue
 from groundhog.utils.selection import select_prior
@@ -96,6 +97,10 @@ class SimpleOptimizer(Optimizer):
         self.toolkit = Toolkit(task=self.task, history=self.history, path=self.path)
         self.toolkit.learnings = self.learnings
         self.toolkit.log = StrategyLog()
+        # Per-attempt log: status box + scrolling event tail. Auto-disables
+        # ANSI/heartbeat on non-TTY so CI logs stay clean. See
+        # groundhog.tools.attempt_log for the full event/render contract.
+        self.toolkit.attempt_log = AttemptLog()
         if self.through:
             self.toolkit.through = self.through
 
@@ -223,23 +228,67 @@ class SimpleOptimizer(Optimizer):
             return 0.0
 
     def _log_attempt(self, attempt, scorer, best_score, cumulative_cost):
+        """Print per-attempt summary via AttemptLog so the score is fresh
+        (computed via the current scorer) and the metric dump compresses
+        to a single highlight line. The full metrics still live in
+        result.json for anyone who wants the dump."""
         cost = self._get_attempt_cost(attempt)
         result = attempt.result
+        log = getattr(self.toolkit, "attempt_log", None)
+
         if not result.completed:
             errors = result.stages[result.failed_stage].errors
-            print(f"  [{attempt.number:3d}] FAIL  {result.failed_stage}: {errors}  ${cost:.4f} (${cumulative_cost:.4f})")
-            print()
+            if log is not None:
+                log.attempt_failed(
+                    attempt_num=attempt.number,
+                    stage=result.failed_stage,
+                    errors=str(errors),
+                    total_cost=cost,
+                    cumulative_cost=cumulative_cost,
+                )
+            else:
+                print(f"  [{attempt.number:3d}] FAIL  {result.failed_stage}: {errors}  "
+                      f"${cost:.4f} (${cumulative_cost:.4f})")
+                print()
             return
 
         score = self._score_attempt(attempt, scorer)
         delta = score - best_score if best_score is not None else 0
-        marker = " *" if delta > 0 else ""
-        sign = "+" if delta >= 0 else ""
-        print(f"  [{attempt.number:3d}] {score:.4f} ({sign}{delta:.4f}){marker}  ${cost:.4f} (${cumulative_cost:.4f})")
-
         last = list(result.stages.values())[-1]
-        print(self._format_metrics(last))
-        print()
+
+        if log is not None:
+            log.attempt_done(
+                attempt_num=attempt.number,
+                score=score, delta=delta,
+                total_cost=cost, cumulative_cost=cumulative_cost,
+                summary_line=self._summary_line(last),
+            )
+        else:
+            marker = " *" if delta > 0 else ""
+            sign = "+" if delta >= 0 else ""
+            print(f"  [{attempt.number:3d}] {score:.4f} ({sign}{delta:.4f}){marker}  "
+                  f"${cost:.4f} (${cumulative_cost:.4f})")
+            print(self._format_metrics(last))
+            print()
+
+    def _summary_line(self, stage_result, max_pairs: int = 5) -> str:
+        """Compress a stage's metrics dict to a single short line.
+
+        Picks the first ``max_pairs`` items from the dict (insertion order =
+        the task's preferred ordering) and joins them with ``|``. ASCII-only
+        on purpose: Windows consoles vary by codepage and ``·`` renders as
+        ``?`` / ``�`` on cp437 (default cmd.exe). The full dict still
+        ends up in result.json — this is just the at-a-glance summary."""
+        m = stage_result.metrics
+        if not m:
+            return ""
+        parts = []
+        for k, v in list(m.items())[:max_pairs]:
+            if isinstance(v, float):
+                parts.append(f"{k}={v:.2f}")
+            else:
+                parts.append(f"{k}={v}")
+        return " | ".join(parts)
 
     def status(self):
         """Print current optimization status — best score, attempt count, trunks."""
@@ -367,12 +416,14 @@ class SimpleOptimizer(Optimizer):
         for i in range(n):
             # Check queue first — override rotation if there's a queued item
             queue_item = read_queue(queue_path)
+            queue_label = ""
             if queue_item:
                 strategy_name = queue_item.get("strategy", "")
                 strategy = self._strategy_registry.get(strategy_name)
                 if strategy:
                     config = queue_item.get("config")
-                    self.toolkit.log.info(f"[queue] {strategy_name} from {queue_item.get('source', '?')}")
+                    queue_label = f"{strategy_name} from {queue_item.get('source', '?')}"
+                    self.toolkit.log.info(f"[queue] {queue_label}")
                 else:
                     self.toolkit.log.info(f"[queue] unknown strategy: {strategy_name}, skipping")
                     strategy = next(rotation)
@@ -380,6 +431,9 @@ class SimpleOptimizer(Optimizer):
             else:
                 strategy = next(rotation)
                 config = None
+            # Stash the queue label so AgentStrategy can pass it to
+            # attempt_log.attempt_start. Empty string when not from queue.
+            self.toolkit._current_queue_label = queue_label
 
             count_before = len(self.history.list())
             try:

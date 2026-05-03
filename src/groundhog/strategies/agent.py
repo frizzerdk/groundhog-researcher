@@ -261,6 +261,120 @@ You have one session to improve the solution.
 {file_listing}"""
 
 
+def _normalize_agent_event(event: dict) -> Optional[tuple]:
+    """Map a raw backend event to ``(source, kind, summary)`` for AttemptLog.
+
+    Recognised shapes (all five backends emit different keys):
+
+    - copilot:    ``{"type": "tool.execution_start", "data": {"toolName": ...}}``
+                  ``{"type": "assistant.message", "data": {"content": ...}}``
+    - claude_code:``{"type": "assistant", "message": {"content": [tool_use blocks]}}``
+    - opencode:   ``{"type": "tool_use", "part": {"tool": ..., "state": {...}}}``
+    - gemini_cli: ``{"type": "tool_use", "tool_name": ..., "parameters": {...}}``
+    - codex_cli:  ``{"type": "item.completed", "item": {"type": "command_execution"}}``
+
+    Returns ``None`` for events that aren't worth surfacing (deltas, init
+    pings, step boundaries). Anything more nuanced is the renderer's job.
+    """
+    et = event.get("type", "")
+
+    def _short_path(p: str) -> str:
+        """Long absolute paths bury the actual filename in the live tail.
+        Reduce ``C:\\repo\\.../work/solution.py`` to ``solution.py``.
+        Bare relative names pass through unchanged."""
+        if not isinstance(p, str) or not p:
+            return ""
+        return p.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+    # ---- copilot ----
+    if et == "tool.execution_start":
+        data = event.get("data", {}) or {}
+        name = data.get("toolName", "")
+        if name in ("report_intent", "task_complete"):
+            return None
+        args = data.get("arguments", {}) or {}
+        path_detail = args.get("path") or ""
+        if path_detail:
+            detail = _short_path(path_detail)
+        else:
+            cmd = args.get("command", "")
+            detail = cmd.split("\n")[0][:60] if isinstance(cmd, str) else ""
+        summary = f"{name} {detail}".strip() if detail else name
+        return ("agent", "tool_call", summary)
+
+    if et == "assistant.message":
+        content = (event.get("data", {}) or {}).get("content", "")
+        first = content.strip().split("\n")[0] if content else ""
+        return ("agent", "thinking", first) if first else None
+
+    # ---- claude_code (stream-json assistant blocks) ----
+    if et == "assistant":
+        msg = event.get("message", {}) or {}
+        for block in msg.get("content", []) if isinstance(msg.get("content"), list) else []:
+            bt = block.get("type")
+            if bt == "tool_use":
+                name = block.get("name", "tool")
+                inp = block.get("input", {}) or {}
+                path_detail = inp.get("file_path") or inp.get("path") or ""
+                if path_detail:
+                    detail = _short_path(path_detail)
+                else:
+                    cmd = inp.get("command", "")
+                    detail = cmd.split("\n")[0][:60] if isinstance(cmd, str) else ""
+                summary = f"{name} {detail}".strip() if detail else name
+                kind = "edit" if name in ("Edit", "Write") else "tool_call"
+                return ("agent", kind, summary)
+            if bt == "thinking":
+                text = block.get("thinking", "") or ""
+                first = text.strip().split("\n")[0]
+                if first:
+                    return ("agent", "thinking", first[:120])
+
+    # ---- opencode (part-shape) ----
+    if et == "tool_use":
+        # opencode shape
+        part = event.get("part", {}) or {}
+        if part.get("type") == "tool":
+            tool = part.get("tool", "tool")
+            state = part.get("state", {}) or {}
+            inp = state.get("input", {}) or {}
+            path_detail = inp.get("filePath") or inp.get("path") or ""
+            if path_detail:
+                detail = _short_path(path_detail)
+            else:
+                cmd = inp.get("command", "")
+                detail = cmd.split("\n")[0][:60] if isinstance(cmd, str) else ""
+            summary = f"{tool} {detail}".strip() if detail else tool
+            return ("agent", "tool_call", summary)
+        # gemini_cli shape (tool_name + parameters at top level)
+        tool = event.get("tool_name", "")
+        if tool:
+            params = event.get("parameters", {}) or {}
+            path_detail = params.get("file_path") or ""
+            if path_detail:
+                detail = _short_path(path_detail)
+            else:
+                cmd = params.get("command", "")
+                detail = cmd.split("\n")[0][:60] if isinstance(cmd, str) else ""
+            kind = "edit" if tool in ("write_file", "replace") else "tool_call"
+            summary = f"{tool} {detail}".strip() if detail else tool
+            return ("agent", kind, summary)
+
+    # ---- codex_cli (item.* events) ----
+    if et == "item.completed":
+        item = event.get("item", {}) or {}
+        itype = item.get("type")
+        if itype == "command_execution":
+            cmd = (item.get("command", "") or "").split("\n")[0][:80]
+            return ("agent", "tool_call", cmd)
+        if itype == "agent_message":
+            text = (item.get("text", "") or "").strip().split("\n")[0]
+            if text:
+                return ("agent", "thinking", text[:120])
+
+    return None
+
+
 class AgentStrategy(Strategy):
     """Delegate optimization work to an autonomous agent.
 
@@ -335,6 +449,18 @@ class AgentStrategy(Strategy):
         prior = self._select_prior(toolkit)
         ws = self._start_workspace(toolkit, prior)
 
+        # Open the per-attempt log box so the user sees the run starting
+        # before the agent backend produces its first event. Optimizer
+        # finalizes with attempt_done/attempt_failed in _log_attempt.
+        attempt_log = getattr(toolkit, "attempt_log", None)
+        if attempt_log is not None:
+            attempt_log.attempt_start(
+                num=ws.number,
+                prior=prior.number if prior else None,
+                queue_label=getattr(toolkit, "_current_queue_label", "") or "",
+                budget_total=self.cfg.budget_usd or 0.0,
+            )
+
         try:
             self._prepare_workspace(toolkit, ws, prior)
 
@@ -353,9 +479,8 @@ class AgentStrategy(Strategy):
     def _run_per_token(self, toolkit, ws, prior):
         """Multi-phase: explore → submit → evaluate → fix → reflect."""
         session_id = self._explore(toolkit, ws, prior)
+        self._update_attempt_log(toolkit, phase="submit")
         self._submit_best(toolkit, ws)
-        self.log.inline("submit... ")
-        self.log.tock()
         result = self._evaluate(toolkit, ws)
         result = self._fix_loop(toolkit, ws, session_id, result)
         self._reflect(toolkit, ws, session_id)
@@ -402,47 +527,35 @@ class AgentStrategy(Strategy):
         self._toolkit = toolkit
 
     def _on_event(self, event):
-        """Live progress callback — overwrites a single status line with counter."""
-        event_type = event.get("type")
-        data = event.get("data", {})
-        text = None
+        """Live progress callback fired by every agent backend.
 
-        if event_type == "assistant.message":
-            content = data.get("content", "")
-            if content and content.strip():
-                first_line = content.strip().split("\n")[0][:60]
-                self._event_count += 1
-                text = f"> {first_line}"
-
-        elif event_type == "tool.execution_start":
-            tool_name = data.get("toolName", "")
-            if tool_name in ("report_intent",):
-                return
-            self._event_count += 1
-            args = data.get("arguments", {})
-            if tool_name in ("view", "glob", "grep"):
-                detail = args.get("path", "").split("\\")[-1].split("/")[-1]
-            elif tool_name == "powershell":
-                detail = args.get("command", "")[:50].split("\n")[0]
-            elif tool_name in ("edit", "create"):
-                detail = args.get("path", "").split("\\")[-1].split("/")[-1]
-            else:
-                detail = ""
-            text = f"[{tool_name}] {detail}" if detail else f"[{tool_name}]"
-
-        if text:
-            line = f"{self.log.INDENT}  #{self._event_count} {text}"
-            pad = max(0, self._event_line_len - len(line))
-            sys.stdout.write(f"\r{line}{' ' * pad}")
-            sys.stdout.flush()
-            self._event_line_len = len(line)
+        Forwards to ``toolkit.attempt_log`` (the unified per-attempt event
+        stream). Each backend's raw event shape is normalized via its own
+        ``normalize_event`` helper — see the per-backend module. Backends
+        without a normalizer (or events that aren't worth surfacing) are
+        silently ignored.
+        """
+        attempt_log = getattr(self._toolkit, "attempt_log", None) if self._toolkit else None
+        if attempt_log is None:
+            return
+        ev = _normalize_agent_event(event)
+        if ev is None:
+            return
+        source, kind, summary = ev
+        attempt_log.event(source=source, kind=kind, summary=summary)
+        self._event_count += 1
 
     def _clear_event_line(self):
-        """Clear the in-place event status line."""
-        if self._event_line_len > 0:
-            sys.stdout.write(f"\r{' ' * self._event_line_len}\r")
-            sys.stdout.flush()
-            self._event_line_len = 0
+        """Legacy hook — the AttemptLog renderer manages its own region.
+        Kept as a no-op so subclasses calling it don't break."""
+        self._event_line_len = 0
+
+    def _update_attempt_log(self, toolkit, **kwargs):
+        """Push a partial state update to the per-attempt log (no-op when
+        the optimizer didn't install one)."""
+        attempt_log = getattr(toolkit, "attempt_log", None)
+        if attempt_log is not None:
+            attempt_log.update(**kwargs)
 
     # --- Selection ---
 
@@ -655,9 +768,7 @@ class AgentStrategy(Strategy):
     def _explore(self, toolkit, ws, prior):
         """Main work phase — agent works in work/."""
         goal = EXPLORE_PROMPT.format(**self._build_prompt_vars(toolkit, ws, prior))
-
-        budget_str = f"${self.cfg.budget_usd:.2f}" if self.cfg.budget_usd else "unlimited"
-        self.log.start(f"--- Agent | {'prior=#' + str(prior.number) if prior else 'fresh'} | budget={budget_str}")
+        self._update_attempt_log(toolkit, phase="explore")
 
         tools = self._get_tools(toolkit, ws, prior, phase="explore")
         allow, deny = self._resolve_permissions("explore")
@@ -675,17 +786,17 @@ class AgentStrategy(Strategy):
             on_event=self._on_event,
         )
         result = toolkit.agent.get(self.cfg.tier).run(spec)
-        self._clear_event_line()
         self.cost += result.cost
-        self.log.tock()
+        self._update_attempt_log(
+            toolkit, budget_used=self.cost, turns=result.turns or 0,
+        )
 
         return result.session_id
 
     def _explore_full(self, toolkit, ws, prior):
         """Per-request explore — agent does everything in one call."""
         goal = EXPLORE_PROMPT_FULL.format(**self._build_prompt_vars(toolkit, ws, prior))
-
-        self.log.start(f"--- Agent (per-request) | {'prior=#' + str(prior.number) if prior else 'fresh'}")
+        self._update_attempt_log(toolkit, phase="explore")
 
         tools = self._get_tools(toolkit, ws, prior, phase="explore")
         allow, deny = self._resolve_permissions("explore")
@@ -705,9 +816,10 @@ class AgentStrategy(Strategy):
         # default while allowing tier= to override.
         per_request_tier = self.cfg.tier if self.cfg.tier != "default" else "high"
         result = toolkit.agent.get(per_request_tier).run(spec)
-        self._clear_event_line()
         self.cost += result.cost
-        self.log.tock()
+        self._update_attempt_log(
+            toolkit, budget_used=self.cost, turns=result.turns or 0,
+        )
 
         return result.session_id
 
@@ -740,13 +852,20 @@ class AgentStrategy(Strategy):
 
     def _evaluate(self, toolkit, ws):
         """Run the task evaluator on solution.py."""
-        self.log.inline("evaluating... ")
+        self._update_attempt_log(toolkit, phase="evaluate")
         result = toolkit.task.evaluate(ws.path, through=self.through)
-        self.log.tock()
         return result
 
-    def _fix_loop(self, toolkit, ws, session_id, result):
-        """Retry on evaluation failure."""
+    def _fix_loop(self, toolkit, ws, session_id, result, prior=None):
+        """Retry on evaluation failure.
+
+        ``prior`` is threaded through so the fix agent gets the full
+        prior-attempt toolset (``get-priors`` / ``list-prior`` /
+        ``get-prior-file``). Without it, fix-phase wrappers omit those
+        tools, and any agent that tries ``Bash(get-prior-file ...)`` in
+        fix mode hits ``command not found`` — defeating the most
+        direct path for "diff against parent to debug a regression."
+        """
         eval_command = self._get_eval_command(toolkit)
         for retry in range(self.cfg.max_retries):
             if result.completed:
@@ -755,7 +874,7 @@ class AgentStrategy(Strategy):
             error_stage = result.stages[result.failed_stage]
             error_text = f"Stage '{result.failed_stage}': {error_stage.errors}"
 
-            self.log.inline(f"fix {retry + 1}... ")
+            self._update_attempt_log(toolkit, phase=f"fix {retry + 1}")
             allow, deny = self._resolve_permissions("fix")
             goal = FIX_PROMPT.format(
                 error=error_text,
@@ -765,7 +884,7 @@ class AgentStrategy(Strategy):
             spec = AgentSpec(
                 goal=goal,
                 workspace_path=ws.path,
-                tools=self._get_tools(toolkit, ws, prior=None, phase="fix"),
+                tools=self._get_tools(toolkit, ws, prior=prior, phase="fix"),
                 model=self.cfg.model,
                 effort=self.cfg.effort,
                 allowed_tools=allow,
@@ -775,7 +894,6 @@ class AgentStrategy(Strategy):
             )
             fix_result = toolkit.agent.get(self.cfg.tier).run(spec)
             self.cost += fix_result.cost
-            self.log.tock()
 
             # Root is known-failed here; fix replaces it unconditionally so
             # the re-eval sees the fix even if the agent didn't run the eval
@@ -791,6 +909,7 @@ class AgentStrategy(Strategy):
 
     def _reflect(self, toolkit, ws, session_id):
         """Agent writes learnings to work/learnings.md."""
+        self._update_attempt_log(toolkit, phase="reflect")
         allow, deny = self._resolve_permissions("reflect")
         spec = AgentSpec(
             goal=REFLECT_PROMPT,
@@ -805,8 +924,6 @@ class AgentStrategy(Strategy):
         )
         result = toolkit.agent.get(self.cfg.tier).run(spec)
         self.cost += result.cost
-        self.log.inline("reflect... ")
-        self.log.tock()
 
         # Promote local learnings to task-level store
         self._collect_learnings(toolkit, ws)

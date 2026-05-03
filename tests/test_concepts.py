@@ -2364,6 +2364,153 @@ def test_opencode_event_parsing_extracts_session_output_and_cost():
     assert len(result.steps) == 4
 
 
+# === AttemptLog ===
+
+
+def test_attempt_log_event_normalizer_dispatches_each_backend_shape():
+    """Each backend has a distinct event shape; the strategy's normalizer
+    must turn all five into a uniform (source, kind, summary) triple. Noise
+    events (deltas, init, step boundaries) return None so the live tail
+    stays high-signal."""
+    from groundhog.strategies.agent import _normalize_agent_event as n
+
+    # claude_code stream-json — paths truncate to basename so the live
+    # tail isn't dominated by the long absolute prefix groundhog passes
+    # through to the agent (e.g. C:\repo\...\attempts\021_20\work\...).
+    out = n({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Read", "input": {"file_path": "work/solution.py"}}
+    ]}})
+    assert out == ("agent", "tool_call", "Read solution.py")
+
+    # absolute Windows-style path in file_path → still truncates to basename
+    out = n({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Read",
+         "input": {"file_path": r"C:\repo\groundhog-researcher\attempts\021_20\work\solution.py"}}
+    ]}})
+    assert out == ("agent", "tool_call", "Read solution.py")
+
+    # claude_code Write/Edit → "edit" kind so the renderer can use the ✎ glyph
+    out = n({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Write", "input": {"file_path": "work/solution.py"}}
+    ]}})
+    assert out == ("agent", "edit", "Write solution.py")
+
+    # opencode part-shape
+    out = n({"type": "tool_use", "part": {
+        "type": "tool", "tool": "read",
+        "state": {"input": {"filePath": "work/solution.py"}}
+    }})
+    assert out == ("agent", "tool_call", "read solution.py")
+
+    # gemini_cli — top-level tool_name + parameters
+    out = n({"type": "tool_use", "tool_name": "run_shell_command",
+             "parameters": {"command": "evaluate-fast"}})
+    assert out == ("agent", "tool_call", "run_shell_command evaluate-fast")
+    out = n({"type": "tool_use", "tool_name": "write_file",
+             "parameters": {"file_path": "work/solution.py"}})
+    assert out == ("agent", "edit", "write_file solution.py")
+
+    # codex_cli item.completed wrappers
+    out = n({"type": "item.completed", "item": {
+        "type": "command_execution", "command": "happy-info"
+    }})
+    assert out == ("agent", "tool_call", "happy-info")
+
+    # copilot tool start — path field also truncates to basename
+    out = n({"type": "tool.execution_start", "data": {
+        "toolName": "view", "arguments": {"path": "work/solution.py"}
+    }})
+    assert out == ("agent", "tool_call", "view solution.py")
+    out = n({"type": "tool.execution_start", "data": {
+        "toolName": "view",
+        "arguments": {"path": r"C:\repo\groundhog\attempts\042\work\solution.py"}
+    }})
+    assert out == ("agent", "tool_call", "view solution.py")
+
+    # Noise — must return None so the live tail isn't flooded with deltas
+    assert n({"type": "message_delta", "data": {}}) is None
+    assert n({"type": "init", "model": "x"}) is None
+    assert n({"type": "step_start"}) is None
+
+
+def test_attempt_log_renderer_truncation_and_width_clamp():
+    """Renderer respects the configured width, truncates over-long titles
+    with `…`, and produces a fixed-height region (header + tail)."""
+    import io
+    from groundhog.tools.attempt_log import (
+        AttemptLog, AttemptLogConfig, TwoPaneRenderer,
+    )
+
+    buf = io.StringIO()
+    cfg = AttemptLogConfig(color=False, glyphs=False, width=60,
+                           tail_lines=4, heartbeat_seconds=0.0)
+    log = AttemptLog(cfg, out=buf)
+    log.renderer = TwoPaneRenderer(log)
+    log.attempt_start(
+        num=42, prior=10,
+        queue_label="a-very-long-queue-label-that-must-truncate",
+        budget_total=12.0,
+    )
+    log.update(phase="explore", elapsed_s=125.0, budget_used=4.0,
+               tokens_in=18000, tokens_out=2100, turns=4)
+    log.event("agent", "tool_call", "read solution.py")
+
+    output = buf.getvalue()
+    # Width clamp: each box line fits the configured 60 chars
+    box_lines = [ln for ln in output.splitlines() if ln.startswith(("╭", "│", "╰"))]
+    for line in box_lines:
+        # ANSI is disabled in this config so length math is direct.
+        assert len(line) == 60, f"box line wrong width: {line!r} ({len(line)})"
+    # The over-long queue label gets the … truncation glyph
+    assert "…" in output
+
+
+def test_attempt_log_appended_renderer_no_ansi_for_ci_logs():
+    """Non-TTY renderer emits plain text only — no ANSI sequences. This is
+    what gets captured in CI logs / file redirects."""
+    import io
+    from groundhog.tools.attempt_log import (
+        AttemptLog, AttemptLogConfig, AppendedRenderer,
+    )
+
+    buf = io.StringIO()
+    cfg = AttemptLogConfig(color=False, glyphs=False, heartbeat_seconds=0.0)
+    log = AttemptLog(cfg, out=buf)
+    log.renderer = AppendedRenderer(log)
+    log.attempt_start(num=7, prior=None, queue_label="seed", budget_total=0.0)
+    log.update(phase="explore")
+    log.event("agent", "tool_call", "read solution.py")
+    log.attempt_done(attempt_num=7, score=0.5, delta=0.05,
+                     total_cost=0.01, cumulative_cost=0.01,
+                     summary_line="metric=0.5")
+
+    text = buf.getvalue()
+    assert "\033" not in text, "ANSI escape leaked into non-TTY output"
+    assert "[  7] start" in text
+    assert "phase: explore" in text
+    assert "tool_call" in text
+    assert "[  7] 0.5 (+0.0500)" in text
+
+
+def test_attempt_log_done_does_not_require_attempt_start():
+    """Non-Agent strategies (seed, deterministic) skip attempt_start.
+    attempt_done must still print correctly using the explicit attempt_num
+    arg — the optimizer always knows the number from the committed attempt."""
+    import io
+    from groundhog.tools.attempt_log import (
+        AttemptLog, AttemptLogConfig, AppendedRenderer,
+    )
+
+    buf = io.StringIO()
+    cfg = AttemptLogConfig(color=False, glyphs=False, heartbeat_seconds=0.0)
+    log = AttemptLog(cfg, out=buf)
+    log.renderer = AppendedRenderer(log)
+    # Note: NO attempt_start call.
+    log.attempt_done(attempt_num=99, score=1.0, delta=0.0,
+                     total_cost=0.0, cumulative_cost=0.0)
+    assert "[ 99] 1.0" in buf.getvalue()
+
+
 # === Run all tests ===
 
 if __name__ == "__main__":

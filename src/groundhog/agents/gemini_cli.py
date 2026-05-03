@@ -281,6 +281,17 @@ class GeminiCliAgentBackend(AgentBackend):
                         summary_file.write(json.dumps(summary_line) + "\n")
                     summary_file.flush()
 
+                    # Forward to the strategy's live progress callback.
+                    # Other backends do this; gemini was silently skipping
+                    # it, so the strategy never saw any gemini events
+                    # during a run. Errors in on_event must not kill the
+                    # subprocess loop.
+                    if spec.on_event:
+                        try:
+                            spec.on_event(event)
+                        except Exception:
+                            pass
+
                     if deadline and time.monotonic() > deadline:
                         proc.kill()
                         raise TimeoutError(f"Agent timed out after {spec.timeout}s")
