@@ -1417,9 +1417,11 @@ def test_fresh_agent_ensure_direction_mints_when_agent_didnt_write():
         backend = StubBackend()
         strat = FreshAgentStrategy()
         # Build a minimal toolkit; bypass _init by setting what _ensure_direction needs.
+        from groundhog.tools.attempt_logger import MarkdownAttemptLogger
         strat._toolkit = Toolkit(llm=BackendRegistry(default=backend))
         strat.log = type("L", (), {"inline": lambda self, *a, **k: None})()
-        strat.cost = 0.0
+        strat.logger = MarkdownAttemptLogger()
+        strat.logger.attempt_start(ws_path)
 
         # Fake-Workspace stand-in: just needs .path
         ws = type("WS", (), {"path": ws_path})()
@@ -2369,63 +2371,69 @@ def test_opencode_event_parsing_extracts_session_output_and_cost():
 
 def test_attempt_log_event_normalizer_dispatches_each_backend_shape():
     """Each backend has a distinct event shape; the strategy's normalizer
-    must turn all five into a uniform (source, kind, summary) triple. Noise
-    events (deltas, init, step boundaries) return None so the live tail
-    stays high-signal."""
+    must turn all five into typed LogEvents for the attempt log. The full
+    path is preserved in args (the structured record); the console summary
+    truncates to basename so the live tail stays high-signal. Noise events
+    (deltas, init, step boundaries) return None."""
     from groundhog.strategies.agent import _normalize_agent_event as n
+    from groundhog.tools.attempt_logger import AssistantEvent, ToolCallEvent
 
-    # claude_code stream-json — paths truncate to basename so the live
-    # tail isn't dominated by the long absolute prefix groundhog passes
-    # through to the agent (e.g. C:\repo\...\attempts\021_20\work\...).
+    # claude_code stream-json
     out = n({"type": "assistant", "message": {"content": [
         {"type": "tool_use", "name": "Read", "input": {"file_path": "work/solution.py"}}
     ]}})
-    assert out == ("agent", "tool_call", "Read solution.py")
+    assert isinstance(out, ToolCallEvent)
+    assert out.name == "Read"
+    assert out.args == {"path": "work/solution.py"}
+    assert out.to_console() == ("agent", "tool_call", "Read solution.py")
 
-    # absolute Windows-style path in file_path → still truncates to basename
+    # absolute Windows-style path — full path kept in args, basename on console
     out = n({"type": "assistant", "message": {"content": [
-        {"type": "tool_use", "name": "Read",
+        {"type": "tool_use", "name": "Write",
          "input": {"file_path": r"C:\repo\groundhog-researcher\attempts\021_20\work\solution.py"}}
     ]}})
-    assert out == ("agent", "tool_call", "Read solution.py")
+    assert out.args["path"].endswith("solution.py")
+    assert out.to_console() == ("agent", "tool_call", "Write solution.py")
 
-    # claude_code Write/Edit → "edit" kind so the renderer can use the ✎ glyph
+    # claude_code thinking block → AssistantEvent on the thinking channel
     out = n({"type": "assistant", "message": {"content": [
-        {"type": "tool_use", "name": "Write", "input": {"file_path": "work/solution.py"}}
+        {"type": "thinking", "thinking": "Considering a CNN.\nMore detail."}
     ]}})
-    assert out == ("agent", "edit", "Write solution.py")
+    assert isinstance(out, AssistantEvent)
+    assert out.data.get("channel") == "thinking"
 
     # opencode part-shape
     out = n({"type": "tool_use", "part": {
         "type": "tool", "tool": "read",
         "state": {"input": {"filePath": "work/solution.py"}}
     }})
-    assert out == ("agent", "tool_call", "read solution.py")
+    assert isinstance(out, ToolCallEvent)
+    assert out.to_console() == ("agent", "tool_call", "read solution.py")
 
     # gemini_cli — top-level tool_name + parameters
     out = n({"type": "tool_use", "tool_name": "run_shell_command",
              "parameters": {"command": "evaluate-fast"}})
-    assert out == ("agent", "tool_call", "run_shell_command evaluate-fast")
-    out = n({"type": "tool_use", "tool_name": "write_file",
-             "parameters": {"file_path": "work/solution.py"}})
-    assert out == ("agent", "edit", "write_file solution.py")
+    assert out.name == "run_shell_command"
+    assert out.args == {"command": "evaluate-fast"}
+    assert out.to_console() == ("agent", "tool_call", "run_shell_command evaluate-fast")
 
     # codex_cli item.completed wrappers
     out = n({"type": "item.completed", "item": {
         "type": "command_execution", "command": "happy-info"
     }})
-    assert out == ("agent", "tool_call", "happy-info")
+    assert out.name == "shell"
+    assert out.args == {"command": "happy-info"}
 
-    # copilot tool start — path field also truncates to basename
+    # copilot tool start
     out = n({"type": "tool.execution_start", "data": {
         "toolName": "view", "arguments": {"path": "work/solution.py"}
     }})
-    assert out == ("agent", "tool_call", "view solution.py")
-    out = n({"type": "tool.execution_start", "data": {
-        "toolName": "view",
-        "arguments": {"path": r"C:\repo\groundhog\attempts\042\work\solution.py"}
-    }})
-    assert out == ("agent", "tool_call", "view solution.py")
+    assert isinstance(out, ToolCallEvent)
+    assert out.to_console() == ("agent", "tool_call", "view solution.py")
+
+    # noise events return None
+    assert n({"type": "tool.execution_start",
+              "data": {"toolName": "report_intent"}}) is None
 
     # Noise — must return None so the live tail isn't flooded with deltas
     assert n({"type": "message_delta", "data": {}}) is None
@@ -2509,6 +2517,24 @@ def test_attempt_log_done_does_not_require_attempt_start():
     log.attempt_done(attempt_num=99, score=1.0, delta=0.0,
                      total_cost=0.0, cumulative_cost=0.0)
     assert "[ 99] 1.0" in buf.getvalue()
+
+
+def test_learnings_with_markdown_tables_survive_retrieval():
+    """Entries containing markdown tables must not be shredded on get() —
+    the entry separator is the exact one add() writes, not any bare "---"
+    (which would also match |---| table rows). Regression: a 53KB live
+    learnings file read as 94 entries, 54 of them table fragments."""
+    from groundhog.learnings.markdown import MarkdownLearnings
+
+    with tempfile.TemporaryDirectory() as tmp:
+        learnings = MarkdownLearnings(Path(tmp))
+        table = "| k | acc |\n|---|-----|\n| 7 | 75.0 |"
+        learnings.add(f"results so far:\n{table}")
+        learnings.add("cosine beats euclidean")
+
+        assert learnings.count() == 2
+        assert "| 7 | 75.0 |" in learnings.get()
+        assert learnings.get(last=1) == "cosine beats euclidean"
 
 
 # === Run all tests ===

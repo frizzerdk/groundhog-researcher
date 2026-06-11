@@ -157,10 +157,10 @@ def _create_backend(backend_name, model=None):
         "copilot":     lambda m: CopilotBackend(model=m or "gpt-5-mini"),
         "gemini_cli":  lambda m: GeminiCLIBackend(model=m or "gemini-2.5-flash"),
         "opencode":    lambda m: OpenCodeBackend(model=m or "openrouter/deepseek/deepseek-v4-flash"),
-        "anthropic":   lambda m: AnthropicBackend(model=m or "claude-sonnet-4-6-20260217"),
+        "anthropic":   lambda m: AnthropicBackend(model=m or "claude-sonnet-4-6"),
         "gemini":      lambda m: GeminiBackend(model=m or "gemini-2.5-flash"),
         "openai":      lambda m: OpenAICompatibleBackend.openai(model=m or "gpt-5.4-mini"),
-        "openrouter":  lambda m: OpenAICompatibleBackend.openrouter(model=m or "anthropic/claude-sonnet-4-6-20260217"),
+        "openrouter":  lambda m: OpenAICompatibleBackend.openrouter(model=m or "anthropic/claude-sonnet-4.6"),
         "deepseek":    lambda m: OpenAICompatibleBackend.deepseek(model=m or "deepseek-chat"),
         "groq":        lambda m: OpenAICompatibleBackend.groq(model=m or "llama-3.3-70b-versatile"),
         "ollama":      lambda m: OpenAICompatibleBackend.ollama(model=m or "llama3"),
@@ -236,13 +236,13 @@ def _get_max_variant(name, backend):
     from groundhog.backends.copilot import CopilotBackend
 
     variants = {
-        "anthropic": lambda: AnthropicBackend(model="claude-opus-4-6-20260205"),
-        "openai":    lambda: OpenAICompatibleBackend.openai(model="gpt-5.4"),
+        "anthropic": lambda: AnthropicBackend(model="claude-opus-4-8"),
+        "openai":    lambda: OpenAICompatibleBackend.openai(model="gpt-5.5"),
         "gemini":    lambda: GeminiBackend(model="gemini-3.1-pro-preview"),
         "gemini_cli": lambda: GeminiCLIBackend(model="gemini-3.1-pro-preview"),
         "claude_code": lambda: ClaudeCodeBackend(model="opus"),
         "copilot":   lambda: CopilotBackend(model="claude-sonnet-4.6"),
-        "openrouter": lambda: OpenAICompatibleBackend.openrouter(model="anthropic/claude-opus-4-6-20260205"),
+        "openrouter": lambda: OpenAICompatibleBackend.openrouter(model="anthropic/claude-opus-4.8"),
     }
     return variants.get(name, lambda: None)()
 
@@ -259,7 +259,7 @@ def _get_high_variant(name, backend):
     variants = {
         "gemini":    lambda: GeminiBackend(model="gemini-3-flash-preview"),
         "gemini_cli": lambda: GeminiCLIBackend(model="gemini-3-flash-preview"),
-        "anthropic": lambda: AnthropicBackend(model="claude-sonnet-4-6-20260217"),
+        "anthropic": lambda: AnthropicBackend(model="claude-sonnet-4-6"),
         "openai":    lambda: OpenAICompatibleBackend.openai(model="gpt-5.4-mini"),
         "claude_code": lambda: ClaudeCodeBackend(model="sonnet"),
         "copilot":   lambda: CopilotBackend(model="gpt-5-mini"),

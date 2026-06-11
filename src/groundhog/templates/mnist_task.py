@@ -239,7 +239,7 @@ if __name__ == "__main__":
     # See what's available with command: 'groundhog backends'
     # Override specific tiers after auto-discovery:
     # from groundhog import GeminiBackend, AnthropicBackend, OpenAICompatibleBackend
-    # optimizer.toolkit.llm.set("high", AnthropicBackend(model="claude-opus-4-6-20260205"))
+    # optimizer.toolkit.llm.set("high", AnthropicBackend(model="claude-opus-4-6"))
     # optimizer.toolkit.llm.set("cheap", OpenAICompatibleBackend.ollama(model="llama3"))
 
     if len(sys.argv) > 1 and sys.argv[1] == "status":

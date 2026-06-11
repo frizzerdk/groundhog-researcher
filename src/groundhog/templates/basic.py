@@ -93,7 +93,7 @@ if __name__ == "__main__":
     # Or configure manually — uncomment and customize:
     # from groundhog import BackendRegistry, GeminiBackend, AnthropicBackend, OpenAICompatibleBackend, ClaudeCodeBackend
     # optimizer.toolkit.llm = BackendRegistry(
-    #     high=AnthropicBackend(model="claude-opus-4-6-20260205"),      # best reasoning
+    #     high=AnthropicBackend(model="claude-opus-4-6"),                # best reasoning
     #     default=ClaudeCodeBackend(model="sonnet"),                     # via Claude Code CLI
     #     cheap=OpenAICompatibleBackend.ollama(model="llama3"),          # free local model
     # )

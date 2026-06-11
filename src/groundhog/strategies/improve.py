@@ -10,7 +10,9 @@ on error with error feedback.
 from dataclasses import dataclass
 
 from groundhog.base.strategy import Strategy, StrategyConfig, param
-from groundhog.tools.conversation_log import conversation_log
+from groundhog.tools.attempt_logger import (
+    AssistantEvent, MarkdownAttemptLogger, SystemEvent, UserEvent, eval_event,
+)
 from groundhog.utils.codegen import extract_code, build_prompt
 
 
@@ -40,6 +42,7 @@ class Improve(Strategy):
         learnings_count = toolkit.learnings.count() if hasattr(toolkit, 'learnings') else 0
         self.log.start(f"--- Improve | prior=#{prior.number} ({prior_score:.3f}) | retries={self.cfg.max_retries} | learnings={learnings_count}")
         ws = self._start_workspace(toolkit, prior)
+        self.logger.attempt_start(ws.path)
         self._prepare_workspace(toolkit, ws, prior)
         self.log.inline("generating... ")
         self._do_work(toolkit, ws, prior)
@@ -59,7 +62,8 @@ class Improve(Strategy):
             )
             direction_changed = inherited_direction_changed(ws.path, prior.path)
             enforce_inherited_direction(ws.path, prior.path)
-        metadata = {"strategy": "improve", "prior": prior.number, "cost": round(self.cost, 6)}
+        metadata = {"strategy": "improve", "prior": prior.number,
+                    "cost": round(self.logger.total_cost(), 6)}
         if hasattr(prior, "path") and direction_changed:
             metadata["direction_restored"] = True
         if self._is_duplicate_solution(ws, prior):
@@ -76,10 +80,9 @@ class Improve(Strategy):
         """Setup from toolkit and config."""
         from groundhog.tools.log import StrategyLog
         self.cfg = self._resolve_config(config)
-        self.log_conversation = toolkit.conversation_log if hasattr(toolkit, 'conversation_log') else conversation_log
+        self.logger = getattr(toolkit, 'attempt_logger', None) or MarkdownAttemptLogger()
         self.through = getattr(toolkit, 'through', None)
         self.log = toolkit.log if hasattr(toolkit, 'log') else StrategyLog()
-        self.cost = 0.0
 
     # --- Selection ---
 
@@ -163,12 +166,12 @@ Rules:
 5. Be bold and creative. Prefer untried approaches over tweaking what exists. Large rewrites are welcome — just address one problem per iteration.
 
 Output your changes as SEARCH/REPLACE blocks."""
-        self.log_conversation(ws.path, prompt, role="User")
-        self.log_conversation(ws.path, system_prompt, role="System")
+        self.logger.log(UserEvent(content=prompt))
+        self.logger.log(SystemEvent(content=system_prompt))
 
         response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
-        self.cost += response.cost
-        self.log_conversation(ws.path, response)
+        self.logger.log(AssistantEvent(content=response.text, role=response.model,
+                                       cost=response.cost, usage=response.usage))
 
         new_code, diff = extract_code(response.text, prior_code)
         if new_code:
@@ -182,6 +185,7 @@ Output your changes as SEARCH/REPLACE blocks."""
     def _evaluate_with_retries(self, toolkit, ws, prior):
         for attempt_num in range(self.cfg.max_retries + 1):
             result = toolkit.task.evaluate(ws.path, through=self.through)
+            self.logger.log(eval_event(result, self._score_result(result, toolkit)))
 
             if result.completed:
                 return result
@@ -204,12 +208,12 @@ Output your changes as SEARCH/REPLACE blocks."""
         prompt += f"\n\nERROR — PLEASE FIX:\n{error_context}"
         system_prompt = "The code has errors. Fix them using SEARCH/REPLACE blocks."
 
-        self.log_conversation(ws.path, prompt, role="User", label=f"Retry {retry_num}")
-        self.log_conversation(ws.path, system_prompt, role="System")
+        self.logger.log(UserEvent(content=prompt, data={"label": f"Retry {retry_num}"}))
+        self.logger.log(SystemEvent(content=system_prompt))
 
         response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
-        self.cost += response.cost
-        self.log_conversation(ws.path, response, label=f"Retry {retry_num}")
+        self.logger.log(AssistantEvent(content=response.text, role=response.model,
+                                       cost=response.cost, usage=response.usage, data={"label": f"Retry {retry_num}"}))
 
         fixed_code, diff = extract_code(response.text, broken_code)
         if fixed_code:
@@ -237,10 +241,10 @@ Output your changes as SEARCH/REPLACE blocks."""
         )
         system_prompt = "You are a concise research assistant. Write brief, actionable observations."
 
-        self.log_conversation(ws.path, prompt, role="User", label="Learnings")
+        self.logger.log(UserEvent(content=prompt, data={"label": "Learnings"}))
         response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
-        self.cost += response.cost
-        self.log_conversation(ws.path, response, label="Learnings")
+        self.logger.log(AssistantEvent(content=response.text, role=response.model,
+                                       cost=response.cost, usage=response.usage, data={"label": "Learnings"}))
 
         toolkit.learnings.add(response.text)
 

@@ -14,7 +14,7 @@ DEFAULT_MODEL = "openrouter/deepseek/deepseek-v4-flash"
 class OpenCodeBackend(LLMBackend):
     """OpenCode CLI (opencode.ai). Supports any provider the user has configured.
 
-    Models specified as provider/model, e.g. "anthropic/claude-sonnet-4-6-20260217".
+    Models specified as provider/model, e.g. "anthropic/claude-sonnet-4-6".
     """
 
     def __init__(self, model: str = DEFAULT_MODEL, timeout: int = 300):

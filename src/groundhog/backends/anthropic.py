@@ -8,17 +8,19 @@ import urllib.error
 from groundhog.base.backend import LLMBackend, LLMResponse, Prompt, TextPart
 from groundhog.backends._http import _urlopen_with_warnings
 
+# Canonical IDs carry no date suffix; dated aliases resolve to the same models.
 PRICING = {
-    "claude-opus-4-6-20260205":   {"input": 5.00,  "output": 25.00},
-    "claude-sonnet-4-6-20260217": {"input": 3.00,  "output": 15.00},
-    "claude-haiku-4-5-20250414":  {"input": 1.00,  "output": 5.00},
+    "claude-opus-4-8":   {"input": 5.00,  "output": 25.00},
+    "claude-opus-4-6":   {"input": 5.00,  "output": 25.00},
+    "claude-sonnet-4-6": {"input": 3.00,  "output": 15.00},
+    "claude-haiku-4-5":  {"input": 1.00,  "output": 5.00},
 }
 
 
 class AnthropicBackend(LLMBackend):
     """Anthropic Claude via Messages API. No SDK dependency."""
 
-    def __init__(self, model: str = "claude-sonnet-4-6-20260217", api_key: str = None):
+    def __init__(self, model: str = "claude-sonnet-4-6", api_key: str = None):
         self.model = model
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
 

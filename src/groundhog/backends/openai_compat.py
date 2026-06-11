@@ -62,10 +62,11 @@ class OpenAICompatibleBackend(LLMBackend):
         return LLMResponse(text=text, model=self.model, usage=usage, cost=cost)
 
     def _compute_cost(self, usage):
-        input_tokens = usage.get("prompt_tokens", 0)
-        output_tokens = usage.get("completion_tokens", 0)
-        # Cost computation left to subclasses or pricing tables
-        return 0.0
+        # OpenRouter reports the actual charge in usage["cost"]; other
+        # OpenAI-compatible providers don't, and we keep no pricing tables
+        # for them here.
+        cost = usage.get("cost")
+        return float(cost) if cost else 0.0
 
     # --- Factory methods for common providers ---
 
@@ -75,7 +76,7 @@ class OpenAICompatibleBackend(LLMBackend):
                    api_key_env="OPENAI_API_KEY", **kwargs)
 
     @classmethod
-    def openrouter(cls, model="anthropic/claude-sonnet-4-6-20260217", **kwargs):
+    def openrouter(cls, model="anthropic/claude-sonnet-4.6", **kwargs):
         return cls(model=model, base_url="https://openrouter.ai/api/v1",
                    api_key_env="OPENROUTER_API_KEY", **kwargs)
 

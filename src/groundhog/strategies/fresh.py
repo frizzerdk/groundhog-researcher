@@ -10,7 +10,9 @@ Two modes:
 from dataclasses import dataclass
 
 from groundhog.base.strategy import Strategy, StrategyConfig, param
-from groundhog.tools.conversation_log import conversation_log
+from groundhog.tools.attempt_logger import (
+    AssistantEvent, MarkdownAttemptLogger, SystemEvent, UserEvent, eval_event,
+)
 from groundhog.utils.codegen import extract_code, build_prompt
 from groundhog.utils.selection import get_trunk_leaders
 
@@ -39,6 +41,7 @@ class FreshApproach(Strategy):
             return {"skipped": "no LLM available"}
         self.log.start(f"--- FreshApproach ({self.cfg.mode})")
         ws = self._start_workspace(toolkit)
+        self.logger.attempt_start(ws.path)
         self._prepare_workspace(toolkit, ws)
         self.log.inline("generating... ")
         self._do_work(toolkit, ws)
@@ -52,7 +55,7 @@ class FreshApproach(Strategy):
         metadata = {
             "strategy": "fresh_approach",
             "mode": self.cfg.mode,
-            "cost": round(self.cost, 6),
+            "cost": round(self.logger.total_cost(), 6),
         }
         self._apply_fresh_direction_gate(toolkit, ws, result, metadata)
         from groundhog.utils.results import write_result
@@ -65,10 +68,9 @@ class FreshApproach(Strategy):
     def _init(self, toolkit, config):
         from groundhog.tools.log import StrategyLog
         self.cfg = self._resolve_config(config)
-        self.log_conversation = toolkit.conversation_log if hasattr(toolkit, 'conversation_log') else conversation_log
+        self.logger = getattr(toolkit, 'attempt_logger', None) or MarkdownAttemptLogger()
         self.through = getattr(toolkit, 'through', None)
         self.log = toolkit.log if hasattr(toolkit, 'log') else StrategyLog()
-        self.cost = 0.0
 
     # --- Workspace ---
 
@@ -96,12 +98,12 @@ class FreshApproach(Strategy):
         )
         system_prompt = "You are an expert programmer. Write complete, runnable code."
 
-        self.log_conversation(ws.path, prompt, role="User")
-        self.log_conversation(ws.path, system_prompt, role="System")
+        self.logger.log(UserEvent(content=prompt))
+        self.logger.log(SystemEvent(content=system_prompt))
 
         response = toolkit.llm.get("high").generate(prompt=prompt, system_prompt=system_prompt)
-        self.cost += response.cost
-        self.log_conversation(ws.path, response)
+        self.logger.log(AssistantEvent(content=response.text, role=response.model,
+                                       cost=response.cost, usage=response.usage))
 
         code, _ = extract_code(response.text)
         if code:
@@ -137,12 +139,12 @@ class FreshApproach(Strategy):
 The existing approaches are shown so you can AVOID them — use a completely different algorithm.
 Write complete, runnable code in a ```python block."""
 
-        self.log_conversation(ws.path, prompt, role="User")
-        self.log_conversation(ws.path, system_prompt, role="System")
+        self.logger.log(UserEvent(content=prompt))
+        self.logger.log(SystemEvent(content=system_prompt))
 
         response = toolkit.llm.get("high").generate(prompt=prompt, system_prompt=system_prompt)
-        self.cost += response.cost
-        self.log_conversation(ws.path, response)
+        self.logger.log(AssistantEvent(content=response.text, role=response.model,
+                                       cost=response.cost, usage=response.usage))
 
         code, _ = extract_code(response.text)
         if code:
@@ -177,7 +179,8 @@ Write complete, runnable code in a ```python block."""
                 "code, no markdown headers."
             ),
         )
-        self.cost += response.cost
+        self.logger.log(AssistantEvent(content=response.text, role=response.model,
+                                       cost=response.cost, usage=response.usage, data={"label": "Direction"}))
         from groundhog.utils.direction import write_direction
         write_direction(ws.path, response.text)
 
@@ -215,6 +218,7 @@ Write complete, runnable code in a ```python block."""
             if not (ws.path / "solution.py").exists():
                 (ws.path / "solution.py").write_text("# no code generated", encoding="utf-8")
             result = toolkit.task.evaluate(ws.path, through=self.through)
+            self.logger.log(eval_event(result, self._score_result(result, toolkit)))
 
             if result.completed:
                 return result
@@ -237,12 +241,12 @@ Write complete, runnable code in a ```python block."""
         prompt += f"\n\nERROR — PLEASE FIX:\n{error_context}"
         system_prompt = "The code has errors. Fix them using SEARCH/REPLACE blocks."
 
-        self.log_conversation(ws.path, prompt, role="User", label=f"Retry {retry_num}")
-        self.log_conversation(ws.path, system_prompt, role="System")
+        self.logger.log(UserEvent(content=prompt, data={"label": f"Retry {retry_num}"}))
+        self.logger.log(SystemEvent(content=system_prompt))
 
         response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
-        self.cost += response.cost
-        self.log_conversation(ws.path, response, label=f"Retry {retry_num}")
+        self.logger.log(AssistantEvent(content=response.text, role=response.model,
+                                       cost=response.cost, usage=response.usage, data={"label": f"Retry {retry_num}"}))
 
         fixed_code, _ = extract_code(response.text, broken_code)
         if fixed_code:

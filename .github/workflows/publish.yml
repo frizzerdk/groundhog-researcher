@@ -17,6 +17,7 @@ jobs:
       - run: uv python install ${{ matrix.python }}
       - run: uv run python tests/test_concepts.py
       - run: uv run python tests/test_agent_concepts.py
+      - run: uv run python tests/test_attempt_logger.py
 
   publish:
     needs: test

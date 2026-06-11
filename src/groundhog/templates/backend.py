@@ -151,6 +151,7 @@ class MyCLIBackend(LLMBackend):
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace",
                                     timeout=self.timeout)
         except FileNotFoundError:
             raise RuntimeError("my-tool not found. Install from https://...")

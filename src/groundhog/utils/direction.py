@@ -224,7 +224,9 @@ def direction_title(text: str, max_len: int = 60) -> str:
         line = line.lstrip("#").strip()
         if not line:
             continue
+        # ASCII ellipsis on purpose: this string goes to stdout and Windows
+        # consoles on legacy codepages render "…" as garbage.
         if len(line) > max_len:
-            return line[: max_len - 1] + "…"
+            return line[: max_len - 3] + "..."
         return line
     return "(no direction)"

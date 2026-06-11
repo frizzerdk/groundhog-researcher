@@ -14,6 +14,7 @@ from groundhog.base.toolkit import Toolkit
 from groundhog.base.learnings import Learnings
 from groundhog.learnings.markdown import MarkdownLearnings
 from groundhog.tools.attempt_log import AttemptLog
+from groundhog.tools.attempt_logger import MarkdownAttemptLogger
 from groundhog.tools.log import StrategyLog
 from groundhog.tools.queue import read_next as read_queue
 from groundhog.utils.selection import select_prior
@@ -97,10 +98,13 @@ class SimpleOptimizer(Optimizer):
         self.toolkit = Toolkit(task=self.task, history=self.history, path=self.path)
         self.toolkit.learnings = self.learnings
         self.toolkit.log = StrategyLog()
-        # Per-attempt log: status box + scrolling event tail. Auto-disables
-        # ANSI/heartbeat on non-TTY so CI logs stay clean. See
-        # groundhog.tools.attempt_log for the full event/render contract.
-        self.toolkit.attempt_log = AttemptLog()
+        # Per-attempt event stream: strategies emit events through
+        # attempt_logger, which fans out to attemptlog.jsonl/.md and the
+        # live console renderer (AttemptLog — auto-disables ANSI/heartbeat
+        # on non-TTY so CI logs stay clean).
+        console = AttemptLog()
+        self.toolkit.attempt_log = console
+        self.toolkit.attempt_logger = MarkdownAttemptLogger(console=console)
         if self.through:
             self.toolkit.through = self.through
 

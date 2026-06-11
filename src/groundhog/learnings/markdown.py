@@ -54,7 +54,10 @@ class MarkdownLearnings(Learnings):
         content = self._path.read_text(encoding="utf-8").strip()
         if not content:
             return []
-        return [e.strip() for e in content.split("---") if e.strip()]
+        # Split on the exact separator add() writes — a bare "---" would
+        # also match markdown table rows (|---|) inside entries and shred
+        # them into fragments.
+        return [e.strip() for e in content.split(SEPARATOR) if e.strip()]
 
     def _sample(self, entries, last, random):
         if last >= len(entries):

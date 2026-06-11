@@ -26,6 +26,7 @@ jobs:
         run: |
           uv run python tests/test_concepts.py
           uv run python tests/test_agent_concepts.py
+          uv run python tests/test_attempt_logger.py
 
       - name: Build package
         run: uv build

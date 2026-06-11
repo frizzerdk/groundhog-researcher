@@ -34,8 +34,9 @@ WORKSPACE PATTERN:
   # or ws.abort() to discard without recording
 
 APPROACH FILE:
-  If starting a new trunk (parent=None), generate and write approach.md.
-  If building on a prior, copy approach.md from the parent attempt.
+  If starting a new trunk (parent=None), write core_direction.md (the
+  family's algorithmic invariant). If building on a prior, inherit it
+  from the parent via groundhog.utils.direction.inherit_direction.
 
 LLM TIERS:
   toolkit.llm.get("default")  — standard generation
@@ -57,7 +58,9 @@ RUN: uv run python task.py 10
 from dataclasses import dataclass
 
 from groundhog import Strategy, StrategyConfig, param
-from groundhog.tools.conversation_log import conversation_log
+from groundhog.tools.attempt_logger import (
+    AssistantEvent, MarkdownAttemptLogger, SystemEvent, UserEvent, eval_event,
+)
 from groundhog.utils.codegen import extract_code, build_prompt
 
 
@@ -97,6 +100,7 @@ class MyStrategy(Strategy):
         prior = self._select_prior(toolkit)
         self.log.start(f"--- MyStrategy | prior=#{prior.number if prior else 'none'}")
         ws = self._start_workspace(toolkit, prior)
+        self.logger.attempt_start(ws.path)
         self._prepare_workspace(toolkit, ws, prior)
         self.log.inline("generating... ")
         self._do_work(toolkit, ws, prior)
@@ -108,7 +112,7 @@ class MyStrategy(Strategy):
         write_result(ws.path, result, metadata={
             "strategy": "my_strategy",
             "prior": prior.number if prior else None,
-            "cost": round(self.cost, 6),
+            "cost": round(self.logger.total_cost(), 6),
         })
         attempt = ws.commit(success=result.completed)
         return {"attempt": attempt.number, "strategy": "my_strategy"}
@@ -118,10 +122,9 @@ class MyStrategy(Strategy):
     def _init(self, toolkit, config):
         from groundhog.tools.log import StrategyLog
         self.cfg = self._resolve_config(config)
-        self.log_conversation = toolkit.conversation_log if hasattr(toolkit, 'conversation_log') else conversation_log
+        self.logger = getattr(toolkit, 'attempt_logger', None) or MarkdownAttemptLogger()
         self.through = getattr(toolkit, 'through', None)
         self.log = toolkit.log if hasattr(toolkit, 'log') else StrategyLog()
-        self.cost = 0.0
 
     # --- Selection ---
 
@@ -141,12 +144,13 @@ class MyStrategy(Strategy):
         (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get(), encoding="utf-8")
         if prior:
             (ws.path / "solution.py").write_text(prior.code, encoding="utf-8")
-            # Copy approach from parent
-            if hasattr(prior, 'path') and (prior.path / "approach.md").exists():
-                approach_text = (prior.path / "approach.md").read_text(encoding="utf-8")
-                (ws.path / "approach.md").write_text(approach_text, encoding="utf-8")
+            # Inherit the family's core direction from the parent (legacy
+            # approach.md is migrated forward automatically).
+            if hasattr(prior, 'path'):
+                from groundhog.utils.direction import inherit_direction
+                inherit_direction(prior.path, ws.path)
         # Learnings are included in the prompt via build_prompt(learnings=...),
-        # and logged in conversation.json — no need to duplicate as a file.
+        # and recorded in the attempt log — no need to duplicate as a file.
 
     # --- Core work (REPLACE THIS WITH YOUR LOGIC) ---
 
@@ -164,12 +168,12 @@ class MyStrategy(Strategy):
         )
 
         system_prompt = "You are an expert programmer."
-        self.log_conversation(ws.path, prompt, role="User")
-        self.log_conversation(ws.path, system_prompt, role="System")
+        self.logger.log(UserEvent(content=prompt))
+        self.logger.log(SystemEvent(content=system_prompt))
 
         response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
-        self.cost += response.cost
-        self.log_conversation(ws.path, response)
+        self.logger.log(AssistantEvent(content=response.text, role=response.model,
+                                       cost=response.cost, usage=response.usage))
 
         new_code, diff = extract_code(response.text, prior.code if prior else "")
         if new_code:
@@ -182,6 +186,7 @@ class MyStrategy(Strategy):
             if not (ws.path / "solution.py").exists():
                 (ws.path / "solution.py").write_text("# no code generated", encoding="utf-8")
             result = toolkit.task.evaluate(ws.path, through=self.through)
+            self.logger.log(eval_event(result))
 
             if result.completed:
                 return result
@@ -200,12 +205,12 @@ class MyStrategy(Strategy):
         prompt += f"\n\nERROR — PLEASE FIX:\n{error_context}"
         system_prompt = "The code has errors. Fix them using SEARCH/REPLACE blocks."
 
-        self.log_conversation(ws.path, prompt, role="User", label=f"Retry {retry_num}")
-        self.log_conversation(ws.path, system_prompt, role="System")
+        self.logger.log(UserEvent(content=prompt, data={"label": f"Retry {retry_num}"}))
+        self.logger.log(SystemEvent(content=system_prompt))
 
         response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
-        self.cost += response.cost
-        self.log_conversation(ws.path, response, label=f"Retry {retry_num}")
+        self.logger.log(AssistantEvent(content=response.text, role=response.model,
+                                       cost=response.cost, usage=response.usage, data={"label": f"Retry {retry_num}"}))
 
         fixed_code, _ = extract_code(response.text, broken_code)
         if fixed_code:

@@ -131,7 +131,8 @@ my_task/
         001_none/           # first attempt (no parent)
             solution.py
             result.json
-            conversation.json
+            attemptlog.jsonl    # every event: prompts, responses, evals, costs
+            attemptlog.md       # the same, human-readable
         002_1/              # second attempt (parent=1)
             ...
 ```
@@ -172,7 +173,7 @@ optimizer = SimpleOptimizer(
 from groundhog import BackendRegistry, AnthropicBackend, GeminiBackend, OpenAICompatibleBackend
 
 optimizer.toolkit.llm = BackendRegistry(
-    high=AnthropicBackend(model="claude-opus-4-6-20260205"),
+    high=AnthropicBackend(model="claude-opus-4-6"),
     default=GeminiBackend(model="gemini-2.5-flash"),
     cheap=OpenAICompatibleBackend.ollama(model="llama3"),
 )
@@ -182,7 +183,7 @@ Override individual tiers after auto-discovery:
 
 ```python
 optimizer.toolkit.llm = auto_registry()
-optimizer.toolkit.llm.set("high", AnthropicBackend(model="claude-opus-4-6-20260205"))
+optimizer.toolkit.llm.set("high", AnthropicBackend(model="claude-opus-4-6"))
 ```
 
 Available backends:
@@ -242,7 +243,7 @@ histories/      # FolderAttemptHistory
 backends/       # Gemini, Anthropic, OpenAI-compatible, Claude Code CLI, + more
 learnings/      # MarkdownLearnings
 acceptance/     # DefaultAcceptance
-tools/          # conversation_log, cost_estimate, StrategyLog, queue
+tools/          # attempt_logger, attempt_log (console), cost_estimate, queue
 utils/          # codegen, subprocess_runner, selection
 templates/      # task scaffolding templates (used by groundhog init)
 ```

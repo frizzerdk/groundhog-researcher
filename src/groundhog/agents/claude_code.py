@@ -164,6 +164,8 @@ class ClaudeCodeAgentBackend(AgentBackend):
             stdout=subprocess.PIPE,
             stderr=None,  # inherit — streams to terminal
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=str(spec.workspace_path),
             env=env,
         )

@@ -18,6 +18,7 @@ This is distinct from :class:`FreshApproach` (a single-shot LLM strategy):
 """
 
 from groundhog.strategies.agent import AgentStrategy
+from groundhog.tools.attempt_logger import AssistantEvent
 from groundhog.utils.direction import (
     find_direction_path,
     promote_workspace_direction,
@@ -80,7 +81,9 @@ class FreshAgentStrategy(AgentStrategy):
                 prompt=_DIRECTION_PROMPT.format(code=code),
                 system_prompt=_DIRECTION_SYSTEM_PROMPT,
             )
-            self.cost += response.cost
+            self.logger.log(AssistantEvent(content=response.text, role=response.model,
+                                           cost=response.cost, usage=response.usage,
+                                           data={"label": "Direction"}))
             write_direction(ws.path, response.text)
         except Exception as e:
             # Direction generation is best-effort; not having one is

@@ -10,7 +10,6 @@ with the compressed version. Does NOT generate code or create an attempt.
 from dataclasses import dataclass
 
 from groundhog.base.strategy import Strategy, StrategyConfig, param
-from groundhog.tools.conversation_log import conversation_log
 
 
 @dataclass
@@ -70,7 +69,6 @@ class Analyse(Strategy):
     def _init(self, toolkit, config):
         from groundhog.tools.log import StrategyLog
         self.cfg = self._resolve_config(config)
-        self.log_conversation = toolkit.conversation_log if hasattr(toolkit, 'conversation_log') else conversation_log
         self.through = getattr(toolkit, 'through', None)
         self.log = toolkit.log if hasattr(toolkit, 'log') else StrategyLog()
         self.cost = 0.0

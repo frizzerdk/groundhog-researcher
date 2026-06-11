@@ -204,7 +204,7 @@ task = Task(data=MyData(), context=MyContext(), evaluator=MyEvaluator(), name="M
 #   auto_registry() discovers what's available (CLI tools, API keys, local servers)
 #   and builds a registry automatically. Or configure manually:
 #     BackendRegistry(
-#         high=AnthropicBackend(model="claude-opus-4-6-20260205"),
+#         high=AnthropicBackend(model="claude-opus-4-6"),
 #         default=GeminiBackend(model="gemini-2.5-flash"),
 #         cheap=OpenAICompatibleBackend.ollama(model="llama3"),
 #     )
@@ -250,7 +250,7 @@ if __name__ == "__main__":
 
     # Or configure manually — full control over which models power each tier:
     # optimizer.toolkit.llm = BackendRegistry(
-    #     max=AnthropicBackend(model="claude-opus-4-6-20260205"),           # best reasoning ($5/$25 per MTok)
+    #     max=AnthropicBackend(model="claude-opus-4-6"),                    # best reasoning ($5/$25 per MTok)
     #     high=GeminiBackend(model="gemini-3-flash-preview"),               # strong + fast ($0.50/$3)
     #     default=ClaudeCodeBackend(model="sonnet"),                        # via CLI, no API key needed
     #     budget=OpenAICompatibleBackend.deepseek(model="deepseek-chat"),   # great value ($0.28/$0.42)
