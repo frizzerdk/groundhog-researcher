@@ -132,6 +132,17 @@ class Workspace(ABC):
         """
         return None
 
+    def heartbeat(self):
+        """Refresh this workspace's liveness marker.
+
+        Default: a no-op (the folder backend has no liveness state). The git
+        backend rewrites its pid+timestamp heartbeat so ``reap`` can tell a
+        working session from a crashed one. Called by
+        ``WorkspaceHandle.set_attempt``; long-running holders may call it
+        directly.
+        """
+        return None
+
 
 class AttemptHistory(ABC):
     """Storage and retrieval for all attempts."""
@@ -170,6 +181,28 @@ class AttemptHistory(ABC):
         """Abort crashed (stale) in-progress workspaces; leave live ones.
         Returns the number reaped. Default: nothing to reap."""
         return 0
+
+    def materialize(self, attempt_or_id) -> Path:
+        """Ensure the attempt's files exist as a folder on disk; return it.
+
+        What's on disk is dynamic — folders may be pruned, or a synced store
+        may arrive as git objects with no worktrees. Consumers that need a
+        real directory (the CLI, workspace-relative tools) call this instead
+        of assuming one exists. Idempotent: a folder already on disk is
+        returned as-is.
+
+        Default covers path-carrying backends (folder); the git backend
+        overrides to check out a worktree from the object store on demand.
+        """
+        a = self.get(attempt_or_id) if isinstance(attempt_or_id, str) else attempt_or_id
+        if a is None:
+            raise KeyError(f"unknown attempt {attempt_or_id!r}")
+        p = getattr(a, "path", None)
+        if p is not None and Path(p).exists():
+            return Path(p)
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot materialize attempt {a.id!r} to disk"
+        )
 
     def seed_from_parent(self, ws: Workspace, parent: Optional[Attempt],
                          spec: Optional[SeedSpec] = None) -> None:

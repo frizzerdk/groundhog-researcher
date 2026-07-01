@@ -92,6 +92,14 @@ def assemble_toolkit(
     tk.selection = selection or SelectionPolicy()
     tk.get_prior = default_prior_selector
 
+    # The attempt pointer: a stable handle at "the attempt in flight".
+    # Strategies bracket their attempt lifetime with it; the CLI points it at
+    # any attempt; build-time tools close over it and read at invoke time.
+    # (tk.workspace is the namespace alias — same object.)
+    from groundhog.base.workspace_handle import WorkspaceHandle
+    tk.ws = WorkspaceHandle(tk.history)
+    tk.workspace = tk.ws
+
     # Agent tools LAST, so the task hook sees the finished bench: framework
     # defaults merged with the task.py hook's tools (task wins on a name
     # collision, and the shadow is logged). Set exactly once — no override

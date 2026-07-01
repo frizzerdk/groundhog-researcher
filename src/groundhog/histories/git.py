@@ -98,8 +98,12 @@ def _binary_placeholder(nbytes: int) -> str:
 
 
 class GitAttempt(Attempt):
-    """A committed attempt, addressed by its commit sha. Read-only — all reads
-    go through the object store, no worktree required."""
+    """A committed attempt, addressed by its commit sha.
+
+    Content reads (``code`` / ``result`` / ``metadata`` / ``read_file``) go
+    through the object store — no worktree required. ``path`` is the on-disk
+    view: it materializes the attempt's worktree on demand (may run git), for
+    consumers that need a real folder (CLI tools, workspace-relative reads)."""
 
     def __init__(self, history: "GitAttemptHistory", id: str,
                  parent: Optional[str], created_at: float, status: str):
@@ -129,6 +133,16 @@ class GitAttempt(Attempt):
     @property
     def name(self) -> str:
         return self.metadata.get("name", "")
+
+    @property
+    def path(self) -> Path:
+        """This attempt's worktree folder, materialized on demand.
+
+        Disk state is dynamic (pruned folders, synced clones without
+        worktrees) — the folder is ensured on first access. Prefer ``code`` /
+        ``read_file`` for content; use ``path`` when a real directory is
+        needed."""
+        return self._history.materialize(self.id)
 
     def list_files(self) -> List[str]:
         return self._history._list_files(self.id)
@@ -161,6 +175,11 @@ class GitWorkspace(Workspace):
 
     def abort(self):
         self._history._abort_workspace(self)
+
+    def heartbeat(self):
+        """Refresh the pid+timestamp liveness marker so ``reap`` can tell a
+        working session from a crashed one."""
+        self._history._write_heartbeat(self.display_id)
 
 
 class GitAttemptHistory(AttemptHistory):
@@ -469,8 +488,14 @@ class GitAttemptHistory(AttemptHistory):
         now = time.time()
         reaped = 0
         for ip in self.list_in_progress():
-            if ip.live and (now - ip.started_at) <= ttl_s:
-                continue   # alive and recent — leave it
+            # Contract: leave LIVE sessions alone regardless of age (a working
+            # agent easily exceeds any TTL — the old `live and recent` check
+            # force-killed it, audit 2026-07-01 bug #2). The TTL is a grace
+            # period for dead pids only, guarding against pid-reuse races.
+            if ip.live:
+                continue
+            if (now - ip.started_at) <= ttl_s:
+                continue   # dead but recent — grace period
             branch = f"wip/{ip.workspace_id}"
             if ip.path is not None:
                 try:
@@ -482,6 +507,48 @@ class GitAttemptHistory(AttemptHistory):
             self._clear_heartbeat(ip.workspace_id)
             reaped += 1
         return reaped
+
+    def materialize(self, attempt_or_id) -> Path:
+        """Ensure the attempt's worktree folder exists on disk; return it.
+
+        Disk is dynamic by design: worktrees may be pruned, and a store
+        synced from a remote arrives as git objects with NO worktrees at all.
+        This is the one place a folder is (re)created — generalizing the
+        rematerialize move ``resume()`` already performs for in-progress
+        workspaces. Idempotent: an existing worktree is returned as-is.
+        """
+        sha = attempt_or_id.id if hasattr(attempt_or_id, "id") else str(attempt_or_id)
+        res = self._git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}",
+                        check=False)
+        if res.returncode != 0:
+            raise KeyError(f"unknown attempt {sha!r}")
+        sha = self._git_text("rev-parse", f"{sha}^{{commit}}")
+
+        branch = f"attempt/{sha[:12]}"
+        existing = self._worktree_for_branch(branch)
+        if existing is not None and Path(existing).exists():
+            return Path(existing)
+
+        # Recreate from the object store. Use the attempt branch when it
+        # exists locally (keeps the branch<->worktree binding); a synced
+        # store may only have the commit, so fall back to a detached checkout.
+        self._git("worktree", "prune", check=False)
+        attempt = self._load_attempt(sha)
+        slug = slugify(attempt.name) if attempt.name else ""
+        leaf = slug or f"attempt-{sha[:12]}"
+        dest = self._attempts / leaf
+        if dest.exists():
+            dest = self._attempts / f"{leaf}-{sha[:8]}"
+        if dest.exists():
+            dest = self._attempts / f"{leaf}-{sha[:12]}"
+
+        have_branch = self._git("rev-parse", "--verify", "--quiet",
+                                f"refs/heads/{branch}", check=False).returncode == 0
+        if have_branch:
+            self._git("worktree", "add", str(dest), branch)
+        else:
+            self._git("worktree", "add", "--detach", str(dest), sha)
+        return dest
 
     # --- object-store reads (no checkout) ------------------------------
 

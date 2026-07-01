@@ -434,14 +434,25 @@ class AgentStrategy(Strategy):
             budget_total=self.cfg.budget_usd or 0.0,
         )
 
-        try:
-            self._prepare_workspace(toolkit, ws, prior)
+        # Bracket the attempt lifetime on the toolkit's pointer: the setter
+        # lives where the workspace is born, and the bracket's finally clears
+        # on every exit path. Build-time tools that closed over toolkit.ws
+        # read THIS attempt's dir while we're inside. commit() happens inside
+        # the bracket and is the last ws.path-touching statement (the folder
+        # is renamed at commit).
+        from contextlib import nullcontext
+        handle = getattr(toolkit, "ws", None)
+        bracket = handle.attempt(ws) if handle is not None else nullcontext()
 
-            backend = toolkit.agent.get(self.cfg.tier)
-            if backend.cost_model == "per_request":
-                return self._run_per_request(toolkit, ws, prior)
-            else:
-                return self._run_per_token(toolkit, ws, prior)
+        try:
+            with bracket:
+                self._prepare_workspace(toolkit, ws, prior)
+
+                backend = toolkit.agent.get(self.cfg.tier)
+                if backend.cost_model == "per_request":
+                    return self._run_per_request(toolkit, ws, prior)
+                else:
+                    return self._run_per_token(toolkit, ws, prior)
 
         except Exception as e:
             ws.abort()
