@@ -72,3 +72,4 @@ ignore = [
 # Templates are illustrative scaffolds: dotenv-before-imports is the documented
 # pattern, and "unused" locals show the user where their code goes.
 "src/groundhog/templates/*" = ["E402", "F841"]
+"examples/*" = ["E402"]
