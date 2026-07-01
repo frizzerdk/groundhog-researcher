@@ -22,8 +22,8 @@ jobs:
       - name: Set up Python
         run: uv python install ${{ matrix.python }}
 
-      - name: Run tests
-        run: uv run --extra dev pytest tests/
+      - name: Run tests (with coverage)
+        run: uv run --extra dev pytest tests/ --cov=groundhog --cov-report=term
 
       - name: Build package
         run: uv build
