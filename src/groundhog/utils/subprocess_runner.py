@@ -1,12 +1,16 @@
 """Subprocess runner — execute user code in an isolated process.
 
 Runs code strings in a subprocess with timeout and optional memory limits.
-Uses pickle for I/O via stdin/stdout. The subprocess can't corrupt the optimizer's process.
+Input goes to the child as pickle over stdin; the result comes back through a
+dedicated temp file, NOT stdout — user code prints freely (LLM-generated
+solutions almost always do) without corrupting the return channel.
 """
 
+import os
 import pickle
 import subprocess
 import sys
+import tempfile
 from typing import Any, Dict, Optional, Tuple
 
 
@@ -48,16 +52,23 @@ def run_code(
         TimeoutError: If timeout exceeded
         RuntimeError: If code fails (syntax, runtime, etc.)
     """
+    result_fd, result_path = tempfile.mkstemp(suffix=".pkl", prefix="groundhog-run-")
+    os.close(result_fd)
+
     payload = {
         "code": code,
         "entry_point": entry_point,
         "args": args,
         "kwargs": kwargs or {},
         "imports": imports or {},
+        "result_path": result_path,
     }
 
+    # The child writes its result to result_path — stdout stays free for user
+    # prints. (Regression: this used to be pickle-over-stdout, so any print()
+    # in evaluated code corrupted the result. Audit 2026-07-01, bug #3.)
     script = '''
-import sys, pickle, base64, importlib, time
+import sys, pickle, importlib
 
 payload = pickle.loads(sys.stdin.buffer.read())
 
@@ -69,26 +80,44 @@ exec(payload["code"], ns)
 func = ns[payload["entry_point"]]
 
 result = func(*payload["args"], **payload["kwargs"])
-sys.stdout.buffer.write(pickle.dumps(result))
+with open(payload["result_path"], "wb") as f:
+    pickle.dump(result, f)
 '''
 
     preexec = _make_memory_limiter(memory_limit_mb) if memory_limit_mb else None
 
     try:
-        proc = subprocess.run(
-            [sys.executable, "-c", script],
-            input=pickle.dumps(payload),
-            capture_output=True,
-            timeout=timeout,
-            preexec_fn=preexec,
-        )
-    except subprocess.TimeoutExpired:
-        raise TimeoutError(f"Timed out after {timeout}s")
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                input=pickle.dumps(payload),
+                capture_output=True,
+                timeout=timeout,
+                preexec_fn=preexec,
+            )
+        except subprocess.TimeoutExpired:
+            raise TimeoutError(f"Timed out after {timeout}s")
 
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.decode().strip() or "Subprocess failed")
+        if proc.returncode != 0:
+            stderr = proc.stderr.decode(errors="replace").strip()
+            stdout_tail = proc.stdout.decode(errors="replace").strip()[-500:]
+            detail = stderr or "Subprocess failed"
+            if stdout_tail:
+                detail += f"\n--- subprocess stdout (tail) ---\n{stdout_tail}"
+            raise RuntimeError(detail)
 
-    if not proc.stdout:
-        raise RuntimeError(f"No output from subprocess. stderr: {proc.stderr.decode().strip()}")
+        try:
+            with open(result_path, "rb") as f:
+                data = f.read()
+        except OSError:
+            data = b""
+        if not data:
+            stderr = proc.stderr.decode(errors="replace").strip()
+            raise RuntimeError(f"No result from subprocess. stderr: {stderr}")
 
-    return pickle.loads(proc.stdout)
+        return pickle.loads(data)
+    finally:
+        try:
+            os.unlink(result_path)
+        except OSError:
+            pass

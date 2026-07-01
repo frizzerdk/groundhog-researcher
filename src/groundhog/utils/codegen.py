@@ -101,13 +101,22 @@ def _apply_diff(code: str, diffs: List[Tuple[str, str]]) -> str:
         if search in code:
             code = code.replace(search, replace, 1)
             continue
-        # Try with trailing whitespace stripped
-        search_stripped = "\n".join(line.rstrip() for line in search.split("\n"))
-        code_stripped = "\n".join(line.rstrip() for line in code.split("\n"))
-        if search_stripped in code_stripped:
-            code = code.replace(search_stripped, replace)
-            continue
-        raise ValueError(f"Search block not found in code:\n{search[:100]}...")
+        # Fallback: match with per-line trailing whitespace stripped, then
+        # splice the replacement into the ORIGINAL code at the matched window.
+        # (A naive str.replace on the original silently no-ops here, because
+        # the stripped needle doesn't occur in the unstripped code — the old
+        # behavior dropped the edit while still reporting it applied.)
+        search_lines = [line.rstrip() for line in search.split("\n")]
+        code_lines = code.split("\n")
+        stripped = [line.rstrip() for line in code_lines]
+        n = len(search_lines)
+        for i in range(len(stripped) - n + 1):
+            if stripped[i:i + n] == search_lines:
+                code_lines[i:i + n] = replace.split("\n")
+                code = "\n".join(code_lines)
+                break
+        else:
+            raise ValueError(f"Search block not found in code:\n{search[:100]}...")
     return code
 
 

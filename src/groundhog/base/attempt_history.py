@@ -125,8 +125,10 @@ class Workspace(ABC):
     def checkpoint(self):
         """Snapshot in-flight state so a crashed run can be resumed from here.
 
-        Default: a no-op. The folder backend is already on disk; the git
-        backend overrides this to advance the workspace's ``wip`` commit.
+        Default: a no-op, and both shipped backends rely on it — folder and
+        git workspaces live on disk, so in-flight edits already survive a
+        crash (``resume()`` re-binds them). A backend that buffers state in
+        memory would override this to flush.
         """
         return None
 

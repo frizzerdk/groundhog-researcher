@@ -455,7 +455,7 @@ class AgentStrategy(Strategy):
         self._update_attempt_log(toolkit, phase="submit")
         self._submit_best(toolkit, ws)
         result = self._evaluate(toolkit, ws)
-        result = self._fix_loop(toolkit, ws, session_id, result)
+        result = self._fix_loop(toolkit, ws, session_id, result, prior=prior)
         self._reflect(toolkit, ws, session_id)
 
         self._finalize(ws, result, prior)
@@ -474,7 +474,7 @@ class AgentStrategy(Strategy):
 
         # Fix if needed
         if not result.completed:
-            result = self._fix_loop(toolkit, ws, session_id, result)
+            result = self._fix_loop(toolkit, ws, session_id, result, prior=prior)
 
         # Promote local learnings to task-level
         self._collect_learnings(toolkit, ws)
