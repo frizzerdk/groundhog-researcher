@@ -5,6 +5,8 @@ succeed even when the remote is unreachable. ``fetch_ttl_s=0`` here makes reads
 fetch every time so the assertions are deterministic.
 """
 
+import os
+import shutil
 import subprocess
 
 import pytest
@@ -87,10 +89,6 @@ def test_local_store_never_touches_remote(tmp_path):
 # Auth: token-in-URL from `gh auth token` at runtime (the hermetic _git
 # chokepoint strips credential helpers by design). Enable with
 # GROUNDHOG_GITHUB_SYNC=1.
-
-import os
-import shutil
-
 
 def _github_remote_url():
     gh = shutil.which("gh")
