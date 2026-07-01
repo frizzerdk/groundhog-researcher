@@ -6,7 +6,6 @@ Follows the general strategy pattern that real strategies should use:
 
 import random
 
-from groundhog import StageResult
 
 
 class MockStrategy:

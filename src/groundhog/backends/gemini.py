@@ -8,7 +8,7 @@ import urllib.error
 
 from groundhog.base.backend import (
     LLMBackend, LLMResponse, Prompt,
-    PromptPart, TextPart, ImagePart, AudioPart,
+    TextPart, ImagePart, AudioPart,
 )
 from groundhog.backends._http import _urlopen_with_warnings
 

@@ -3,7 +3,7 @@
 import random
 from itertools import cycle
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from groundhog.base.types import Task
 from groundhog.base.strategy import Strategy
@@ -417,7 +417,7 @@ class SimpleOptimizer(Optimizer):
         rotation = cycle(self._schedule)
         queue_path = self.path
 
-        for i in range(n):
+        for _ in range(n):
             # Check queue first — override rotation if there's a queued item
             queue_item = read_queue(queue_path)
             queue_label = ""
@@ -447,7 +447,7 @@ class SimpleOptimizer(Optimizer):
                     strategy(self.toolkit)
             except KeyboardInterrupt:
                 self.toolkit.log.end()
-                print(f"\n  Interrupted by user")
+                print("\n  Interrupted by user")
                 break
             except Exception as e:
                 self.toolkit.log.end()

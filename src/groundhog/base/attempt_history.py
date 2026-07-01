@@ -200,7 +200,6 @@ class AttemptHistory(ABC):
         if not attempts:
             return []
 
-        by_id = {a.id: a for a in attempts}
         children = {}
         roots = []
         for a in attempts:

@@ -4,7 +4,6 @@ Runs code strings in a subprocess with timeout and optional memory limits.
 Uses pickle for I/O via stdin/stdout. The subprocess can't corrupt the optimizer's process.
 """
 
-import base64
 import pickle
 import subprocess
 import sys

@@ -8,19 +8,31 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python: ["3.11", "3.13"]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
       - run: uv python install ${{ matrix.python }}
-      - run: uv run python tests/test_concepts.py
-      - run: uv run python tests/test_agent_concepts.py
-      - run: uv run python tests/test_attempt_logger.py
+      - name: Run full test suite
+        run: uv run --extra dev pytest tests/
+
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches pyproject and __init__ versions
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PYPROJECT=$(grep -Po '(?<=^version = ")[^"]*' pyproject.toml)
+          INIT=$(grep -Po '(?<=^__version__ = ")[^"]*' src/groundhog/__init__.py)
+          echo "tag=$TAG pyproject=$PYPROJECT __init__=$INIT"
+          test "$TAG" = "$PYPROJECT" || { echo "::error::tag v$TAG != pyproject version $PYPROJECT"; exit 1; }
+          test "$TAG" = "$INIT" || { echo "::error::tag v$TAG != __init__ version $INIT"; exit 1; }
 
   publish:
-    needs: test
+    needs: [test, version-check]
     runs-on: ubuntu-latest
     permissions:
       id-token: write

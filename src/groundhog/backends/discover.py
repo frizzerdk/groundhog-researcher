@@ -329,7 +329,6 @@ def discover_agent_backends():
     Returns a dict of {name: AgentBackend} for everything found.
     Only CLI tools qualify — API backends are stateless LLMs, not agents.
     """
-    from groundhog.base.agent import AgentBackend
     backends = {}
 
     if shutil.which("claude"):

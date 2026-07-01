@@ -25,7 +25,7 @@ groundhog = "groundhog.cli:main"
 ghg = "groundhog.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "ruff>=0.4"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/groundhog"]
@@ -41,3 +41,31 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# Start conservative: correctness + hygiene classes only. Style expansion later.
+select = [
+    "E4",   # imports
+    "E7",   # statement correctness (comparison, lambda assignment, ...)
+    "E9",   # syntax/indentation errors
+    "F",    # pyflakes: undefined names, unused imports/variables, ...
+    "B",    # bugbear: likely bugs (mutable defaults, unused loop vars, ...)
+]
+ignore = [
+    "E731", # lambda assignments are used deliberately (toolkit wiring)
+    # Deferred to a post-refactor style pass (2026-07): mechanical but churny.
+    "B904", # raise ... from err inside except
+    "E741", # ambiguous single-letter names (l, O) in algorithm code
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Package façades: re-exports ARE the public API (`from groundhog import *`).
+"src/groundhog/__init__.py" = ["F401", "E402"]
+"src/groundhog/base/__init__.py" = ["F401"]
+# Templates are illustrative scaffolds: dotenv-before-imports is the documented
+# pattern, and "unused" locals show the user where their code goes.
+"src/groundhog/templates/*" = ["E402", "F841"]

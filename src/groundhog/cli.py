@@ -10,7 +10,6 @@ Usage:
 """
 
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -72,11 +71,11 @@ def init(template_name, target_dir=None, script_only=False):
         )
         if not _on_pypi:
             pyproject_content += (
-                f'\n[[tool.uv.index]]\nname = "testpypi"\n'
-                f'url = "https://test.pypi.org/simple/"\n'
-                f'explicit = true\n'
-                f'\n[tool.uv.sources]\n'
-                f'groundhog-researcher = {{ index = "testpypi" }}\n'
+                '\n[[tool.uv.index]]\nname = "testpypi"\n'
+                'url = "https://test.pypi.org/simple/"\n'
+                'explicit = true\n'
+                '\n[tool.uv.sources]\n'
+                'groundhog-researcher = { index = "testpypi" }\n'
             )
         (target / "pyproject.toml").write_text(pyproject_content, encoding="utf-8")
 
@@ -96,7 +95,7 @@ def init(template_name, target_dir=None, script_only=False):
     if template.get("env"):
         print("  # edit .env with your API key")
     print("  # edit task.py with your task logic")
-    print(f"  uv run task.py 10")
+    print("  uv run task.py 10")
     return 0
 
 
@@ -180,7 +179,7 @@ def new_component(args):
     shutil.copy2(TEMPLATES_DIR / info["template"], target)
 
     print(f"Created {component} template: {target}")
-    print(f"  Edit the file and customize the logic.")
+    print("  Edit the file and customize the logic.")
     return 0
 
 
@@ -209,7 +208,7 @@ def show_backends():
     if _auth_warnings:
         for name, msg in _auth_warnings:
             if name == "copilot":
-                print(f"[copilot] Found but not authenticated.")
+                print("[copilot] Found but not authenticated.")
                 answer = input("  Log in now? (y/n): ").strip().lower()
                 if answer in ("y", "yes", ""):
                     from groundhog.backends.copilot import login_copilot
@@ -381,7 +380,6 @@ def _short(value, n=8):
 def _print_stage_scores(result, scorer):
     """Print per-stage score + the final overall line."""
     for name, stage in result.stages.items():
-        score = stage.score if hasattr(stage, "score") else 0.0
         print(f"  {name}: score={scorer(stage):.4f}")
     overall = _score_result(result, scorer)
     if result.completed:

@@ -202,7 +202,6 @@ class CopilotBackend(LLMBackend):
             return output.strip(), {}, 0.0
 
         # Parse premium requests
-        import re
         usage = {"raw_stats": stats.strip()}
         match = re.search(r"([\d.]+)\s+Premium requests", stats)
         cost = 0.0

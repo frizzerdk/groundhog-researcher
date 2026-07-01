@@ -32,7 +32,7 @@ class Analyse(Strategy):
         if not hasattr(toolkit, 'learnings') or not hasattr(toolkit, 'llm'):
             return {"skipped": "no learnings or LLM available"}
 
-        self.log.start(f"--- Analyse | compressing learnings")
+        self.log.start("--- Analyse | compressing learnings")
 
         current_learnings = toolkit.learnings.get()
         entries_before = toolkit.learnings.count()

@@ -14,7 +14,6 @@ from groundhog import Task, Data, Context, Evaluator, EvalStage, StageResult
 
 class MockData(Data):
     def __init__(self, seed=42):
-        import random
         rng = random.Random(seed)
         self._target = rng.uniform(0, 100)
 

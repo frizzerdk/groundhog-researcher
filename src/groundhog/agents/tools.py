@@ -55,7 +55,7 @@ def _format_eval_result(result):
     if result.artifacts:
         lines.append("")
         lines.append("Artifacts:")
-        for name, path in result.artifacts.items():
+        for path in result.artifacts.values():
             lines.append(f"  {path}")
 
     return "\n".join(lines)

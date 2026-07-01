@@ -39,7 +39,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import IO, Optional
 
 
@@ -261,7 +261,6 @@ class TwoPaneRenderer(Renderer):
     def attempt_done(self, score, delta, total_cost, cumulative_cost, summary_line):
         # Freeze the live region — leave the box+tail in scrollback as history.
         self._lines_drawn = 0
-        cfg = self.log.cfg
         out = self.log.out
         c = self._color
         sign = "+" if delta >= 0 else ""

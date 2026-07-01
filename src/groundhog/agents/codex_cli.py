@@ -58,8 +58,15 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
+from groundhog.base.agent import AgentBackend, AgentResult, AgentSpec
+from groundhog.agents.tool_server import (
+    ToolServer,
+    build_tool_docs,
+    cleanup_wrappers,
+    generate_wrappers,
+)
 
 
 def _resolve_codex_bin() -> str:
@@ -71,14 +78,6 @@ def _resolve_codex_bin() -> str:
     environments. Resolve to a concrete path up front.
     """
     return shutil.which("codex") or "codex"
-
-from groundhog.base.agent import AgentBackend, AgentResult, AgentSpec
-from groundhog.agents.tool_server import (
-    ToolServer,
-    build_tool_docs,
-    cleanup_wrappers,
-    generate_wrappers,
-)
 
 
 class CodexCliAgentBackend(AgentBackend):

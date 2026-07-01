@@ -39,9 +39,7 @@ load_dotenv()
 
 from groundhog import (
     Task, Data, Context, Evaluator, EvalStage, StageResult,
-    SimpleOptimizer, Improve, FreshApproach, CrossPollinate, Analyse,
-    auto_registry, BackendRegistry, GeminiBackend, OpenAICompatibleBackend,
-    AnthropicBackend, ClaudeCodeBackend,
+    SimpleOptimizer, Improve, FreshApproach, CrossPollinate, auto_registry,
 )
 
 

@@ -9,7 +9,7 @@ Backend implementations convert parts to their provider's API format.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Sequence, Union
+from typing import Any, Dict, Sequence, Union
 
 
 # --- Prompt parts ---

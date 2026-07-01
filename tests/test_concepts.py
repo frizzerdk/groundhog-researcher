@@ -27,7 +27,6 @@ Concept → Test mapping:
 import json
 import os
 import random
-import shutil
 import time
 import tempfile
 from pathlib import Path
@@ -249,6 +248,7 @@ def test_attempt_history_is_immutable():
         # Read again — should be identical
         attempt2 = history.get(attempt.id)
         assert attempt2.code == code_before
+        assert attempt2.result.stages["eval"].metrics == result_before.stages["eval"].metrics
 
 def test_attempt_history_tree_structure():
     """Each attempt has at most one parent, forming a tree."""
@@ -465,7 +465,7 @@ def test_toolkit_missing_attribute_raises():
     tk = Toolkit(task="something")
     try:
         _ = tk.nonexistent
-        assert False, "Should have raised AttributeError"
+        raise AssertionError("Should have raised AttributeError")
     except AttributeError:
         pass
 
@@ -534,9 +534,12 @@ def test_optimizer_is_deterministic_with_seed():
             rng_values = []
 
             class DeterministicStrategy:
+                def __init__(self, sink):
+                    self.sink = sink
+
                 def __call__(self, toolkit, config=None):
                     val = toolkit.rng.uniform(0, 100)
-                    rng_values.append(val)
+                    self.sink.append(val)
                     ws = toolkit.history.workspace()
                     code = make_code(val)
                     (ws.path / "solution.py").write_text(code)
@@ -546,7 +549,7 @@ def test_optimizer_is_deterministic_with_seed():
                     ws.commit(success=result.completed)
                     return {"value": val}
 
-            optimizer = SimpleOptimizer(task, strategy=DeterministicStrategy(), seed=42, history=history, seed_strategy=None)
+            optimizer = SimpleOptimizer(task, strategy=DeterministicStrategy(rng_values), seed=42, history=history, seed_strategy=None)
             optimizer.run(n=5)
             results.append(rng_values[:])
 
@@ -1665,7 +1668,7 @@ def test_select_prior_favors_underexplored_family():
         a2 = commit_with("rollout", 0.6, parent=a1)
         a3 = commit_with("rollout", 0.7, parent=a2)
         a4 = commit_with("rollout", 0.8, parent=a3)
-        a5 = commit_with("rollout", 0.9, parent=a4)
+        commit_with("rollout", 0.9, parent=a4)
 
         # Tiny family: 1 attempt, score 0.5 (much weaker)
         commit_with("mcts", 0.5)
@@ -1727,7 +1730,8 @@ def test_agent_strategy_flags_duplicate_solution_non_promotable():
     with tempfile.TemporaryDirectory() as tmp:
         ws_path = Path(tmp) / "ws"
         prior_path = Path(tmp) / "prior"
-        ws_path.mkdir(); prior_path.mkdir()
+        ws_path.mkdir()
+        prior_path.mkdir()
         # Same bytes
         (ws_path / "solution.py").write_text("def solve(): return 1", encoding="utf-8")
         (prior_path / "solution.py").write_text("def solve(): return 1", encoding="utf-8")
@@ -1751,7 +1755,8 @@ def test_improve_strategy_flags_duplicate_solution():
     with tempfile.TemporaryDirectory() as tmp:
         ws_path = Path(tmp) / "ws"
         prior_path = Path(tmp) / "prior"
-        ws_path.mkdir(); prior_path.mkdir()
+        ws_path.mkdir()
+        prior_path.mkdir()
         (ws_path / "solution.py").write_text("same", encoding="utf-8")
         (prior_path / "solution.py").write_text("same", encoding="utf-8")
         ws = type("WS", (), {"path": ws_path})()
@@ -1973,7 +1978,6 @@ def test_backend_registry_fallback():
 
 def test_mock_task_end_to_end():
     """Run MockTask with MockStrategy for 5 iterations — full loop including path-based evaluation."""
-    import sys
     import tempfile
     from pathlib import Path
 

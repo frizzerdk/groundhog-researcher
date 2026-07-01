@@ -13,7 +13,6 @@ Five evaluation stages:
 During optimization, run through="evaluate". Deep and full are for final validation.
 """
 
-import traceback
 
 import numpy as np
 

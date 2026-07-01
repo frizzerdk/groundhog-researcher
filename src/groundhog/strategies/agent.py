@@ -928,8 +928,6 @@ class AgentStrategy(Strategy):
         """
         from groundhog.utils.direction import (
             direction_exists,
-            enforce_inherited_direction,
-            inherited_direction_changed,
             mark_result_failed,
             promote_workspace_direction,
             read_direction,

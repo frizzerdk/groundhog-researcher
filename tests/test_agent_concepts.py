@@ -17,18 +17,16 @@ Concept → Test mapping:
 
 import json
 import os
-import stat
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from groundhog.base.agent import (
-    AgentTool, ToolResult, agent_tool,
+    agent_tool,
     AgentSpec, AgentResult,
     AgentBackend, AgentRegistry,
 )
@@ -192,7 +190,7 @@ def test_registry_no_default_raises():
     reg = AgentRegistry(budget=MockAgentBackend("budget"))
     try:
         reg.get("nonexistent")
-        assert False, "Should have raised KeyError"
+        raise AssertionError("Should have raised KeyError")
     except KeyError:
         pass
 

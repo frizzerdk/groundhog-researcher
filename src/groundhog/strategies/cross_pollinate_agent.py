@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from groundhog.base.strategy import StrategyConfig, param
+from groundhog.base.strategy import param
 from groundhog.strategies.agent import AgentConfig, AgentStrategy
 from groundhog.utils.selection import get_trunk_leaders
 
