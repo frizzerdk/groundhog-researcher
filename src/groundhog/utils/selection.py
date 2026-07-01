@@ -118,10 +118,11 @@ def select_prior(
 
 def _attempt_family_key(attempt: Attempt) -> Optional[str]:
     """Normalized core_direction.md text, or None for the sentinel family."""
-    if not hasattr(attempt, "path"):
-        return None
-    from groundhog.utils.direction import read_direction, normalize_direction
-    text = read_direction(attempt.path)
+    from groundhog.utils.direction import (
+        read_direction_from_attempt,
+        normalize_direction,
+    )
+    text = read_direction_from_attempt(attempt)
     return normalize_direction(text) if text else None
 
 
@@ -151,13 +152,13 @@ def _is_non_promotable(attempt: Attempt) -> bool:
 
 
 def get_trunk_leaders(history: AttemptHistory, scorer: Callable[[StageResult], float],
-                      exclude: Optional[int] = None) -> List[Attempt]:
+                      exclude: Optional[str] = None) -> List[Attempt]:
     """Get the best attempt from each trunk, optionally excluding one trunk."""
     trunks = history.derive_trunks(scorer)
     leaders = []
     for trunk in trunks:
         leader = trunk[-1]
-        if exclude is not None and leader.number == exclude:
+        if exclude is not None and leader.id == exclude:
             continue
         leaders.append(leader)
     return leaders

@@ -132,9 +132,9 @@ class CrossPollinateAgent(AgentStrategy):
     def _select_inspiration(self, toolkit, prior):
         """Pick the best-scoring trunk leader whose family differs from the
         parent's. Returns ``None`` if no other family exists."""
-        from groundhog.utils.direction import read_direction, normalize_direction
+        from groundhog.utils.direction import read_direction_from_attempt, normalize_direction
 
-        prior_text = read_direction(prior.path) if hasattr(prior, "path") else None
+        prior_text = read_direction_from_attempt(prior)
         prior_family = normalize_direction(prior_text) if prior_text else None
 
         stages = toolkit.task.evaluator.eval_stages(
@@ -142,12 +142,12 @@ class CrossPollinateAgent(AgentStrategy):
         )
         scorer = stages[-1].score
         candidates = []
-        for leader in get_trunk_leaders(toolkit.history, scorer, exclude=prior.number):
+        for leader in get_trunk_leaders(toolkit.history, scorer, exclude=prior.id):
             if not leader.result.completed or leader.metadata.get("non_promotable"):
                 continue
             if self._score_attempt(leader, scorer) <= 0:
                 continue
-            text = read_direction(leader.path) if hasattr(leader, "path") else None
+            text = read_direction_from_attempt(leader)
             family = normalize_direction(text) if text else None
             # Different family iff keys differ (sentinel None counts as
             # "no family", which is treated as different from any real
@@ -169,9 +169,9 @@ class CrossPollinateAgent(AgentStrategy):
 
     def _prior_tool_options(self, toolkit, ws, prior):
         """Expose inspiration candidates while hiding the parent family."""
-        from groundhog.utils.direction import read_direction
+        from groundhog.utils.direction import read_direction_from_attempt
 
-        parent_direction = read_direction(prior.path) if hasattr(prior, "path") else None
+        parent_direction = read_direction_from_attempt(prior)
         return {"scope": "all", "exclude_direction": parent_direction}
 
     # --- Prompt augmentation ---
@@ -183,8 +183,8 @@ class CrossPollinateAgent(AgentStrategy):
         if insp is None:
             return base
 
-        from groundhog.utils.direction import read_direction, direction_title
-        insp_text = read_direction(insp.path) if hasattr(insp, "path") else None
+        from groundhog.utils.direction import read_direction_from_attempt, direction_title
+        insp_text = read_direction_from_attempt(insp)
         insp_family = direction_title(insp_text or "")
         # Reuse the strategy's scorer-derived score helper.
         try:
@@ -196,7 +196,7 @@ class CrossPollinateAgent(AgentStrategy):
             insp_score = float("nan")
 
         return base + _INSPIRATION_PROMPT.format(
-            insp_num=insp.number,
+            insp_num=insp.id,
             insp_family=insp_family,
             insp_score=insp_score,
         )
@@ -207,5 +207,5 @@ class CrossPollinateAgent(AgentStrategy):
         meta = super()._build_metadata(prior)
         meta["strategy"] = "cross_pollinate_agent"
         if getattr(self, "_inspiration", None) is not None:
-            meta["inspiration"] = self._inspiration.number
+            meta["inspiration"] = self._inspiration.id
         return meta

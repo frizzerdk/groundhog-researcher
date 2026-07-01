@@ -22,6 +22,7 @@ from groundhog.tools.cost_estimate import estimate_cost, estimate_total_cost
 # Default implementations
 from groundhog.optimizers.simple import SimpleOptimizer
 from groundhog.histories.folder import FolderAttemptHistory
+from groundhog.histories.git import GitAttemptHistory, SyncPolicy
 from groundhog.learnings.markdown import MarkdownLearnings
 from groundhog.learnings.compacted import Compacted, make_llm_compactor
 from groundhog.learnings.queue_wait import QueueWaitLearnings

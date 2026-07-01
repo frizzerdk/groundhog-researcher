@@ -247,7 +247,7 @@ def test_attempt_history_is_immutable():
         result_before = attempt.result
 
         # Read again — should be identical
-        attempt2 = history.get(attempt.number)
+        attempt2 = history.get(attempt.id)
         assert attempt2.code == code_before
 
 def test_attempt_history_tree_structure():
@@ -261,19 +261,19 @@ def test_attempt_history_tree_structure():
         write_result(ws1.path, result)
         a1 = ws1.commit(success=True)
 
-        ws2 = history.workspace(parent=a1.number)
+        ws2 = history.workspace(parent=a1.id)
         (ws2.path / "solution.py").write_text("v2")
         write_result(ws2.path, result)
         a2 = ws2.commit(success=True)
 
-        ws3 = history.workspace(parent=a1.number)
+        ws3 = history.workspace(parent=a1.id)
         (ws3.path / "solution.py").write_text("v3")
         write_result(ws3.path, result)
         a3 = ws3.commit(success=True)
 
         assert a1.parent is None
-        assert a2.parent == a1.number
-        assert a3.parent == a1.number
+        assert a2.parent == a1.id
+        assert a3.parent == a1.id
 
 def test_attempt_history_lineage():
     """Lineage walks from attempt back to root."""
@@ -286,18 +286,18 @@ def test_attempt_history_lineage():
         write_result(ws1.path, result)
         a1 = ws1.commit(success=True)
 
-        ws2 = history.workspace(parent=a1.number)
+        ws2 = history.workspace(parent=a1.id)
         (ws2.path / "solution.py").write_text("v2")
         write_result(ws2.path, result)
         a2 = ws2.commit(success=True)
 
-        ws3 = history.workspace(parent=a2.number)
+        ws3 = history.workspace(parent=a2.id)
         (ws3.path / "solution.py").write_text("v3")
         write_result(ws3.path, result)
         a3 = ws3.commit(success=True)
 
         chain = history.lineage(a3)
-        assert [a.number for a in chain] == [1, 2, 3]
+        assert [a.id for a in chain] == ["1", "2", "3"]
 
 def test_attempt_history_best_uses_scorer():
     """best() takes a scorer function — different scorers give different bests."""
@@ -395,7 +395,7 @@ def test_workspace_allocation_is_atomic_under_concurrency():
     import threading
 
     with tempfile.TemporaryDirectory() as tmp:
-        results: list[list[int]] = []
+        results: list[list[str]] = []
         errors: list[BaseException] = []
         barrier = threading.Barrier(4)
 
@@ -403,7 +403,7 @@ def test_workspace_allocation_is_atomic_under_concurrency():
             try:
                 h = FolderAttemptHistory(Path(tmp))  # one per "optimizer"
                 barrier.wait(timeout=10)             # release them together
-                nums = [h.workspace().number for _ in range(count)]
+                nums = [h.workspace().display_id for _ in range(count)]
                 results.append(nums)
             except BaseException as e:
                 errors.append(e)
@@ -418,8 +418,9 @@ def test_workspace_allocation_is_atomic_under_concurrency():
         all_nums = [n for batch in results for n in batch]
         assert len(all_nums) == 20, f"expected 20 allocations, got {len(all_nums)}"
         assert len(set(all_nums)) == 20, f"duplicate numbers: {sorted(all_nums)}"
-        assert sorted(all_nums) == list(range(1, 21)), \
-            f"expected dense 1..20, got {sorted(all_nums)}"
+        nums_int = sorted(int(n) for n in all_nums)
+        assert nums_int == list(range(1, 21)), \
+            f"expected dense 1..20, got {nums_int}"
 
 
 def test_workspace_stale_claim_is_reclaimed():
@@ -438,7 +439,7 @@ def test_workspace_stale_claim_is_reclaimed():
 
         # First allocation should reclaim 001 (cleaning up the stale sentinel).
         ws = history.workspace()
-        assert ws.number == 1
+        assert ws.display_id == "1"
         assert not stale.exists()
 
 
@@ -509,8 +510,8 @@ def test_strategy_owns_evaluation_and_recording():
                 write_result(ws.path, result)
 
                 attempt = ws.commit(success=result.completed)
-                recorded.append(attempt.number)
-                return {"attempt": attempt.number}
+                recorded.append(attempt.id)
+                return {"attempt": attempt.id}
 
         optimizer = SimpleOptimizer(task, strategy=TrackingStrategy(), seed=42, history=history, seed_strategy=None)
         optimizer.run(n=5)
@@ -822,13 +823,13 @@ def test_build_prior_tools_three_tool_progressive_disclosure():
         write_result(ws1.path, result)
         a1 = ws1.commit(success=True)
 
-        ws2 = history.workspace(parent=a1.number)
+        ws2 = history.workspace(parent=a1.id)
         (ws2.path / "solution.py").write_text("v2")
         (ws2.path / "work" / "learnings.md").write_text("note from 2")
         write_result(ws2.path, result)
         a2 = ws2.commit(success=True)
 
-        ws3 = history.workspace(parent=a2.number)
+        ws3 = history.workspace(parent=a2.id)
         (ws3.path / "solution.py").write_text("v3")
         write_result(ws3.path, result)
         a3 = ws3.commit(success=True)
@@ -880,7 +881,7 @@ def test_build_prior_tools_direction_scopes():
         write_result(ws1.path, result)
         a1 = ws1.commit(success=True)
 
-        ws2 = history.workspace(parent=a1.number)
+        ws2 = history.workspace(parent=a1.id)
         (ws2.path / "solution.py").write_text("rollout child")
         write_direction(ws2.path, "rollout")
         write_result(ws2.path, result)
@@ -894,9 +895,9 @@ def test_build_prior_tools_direction_scopes():
 
         family_tools = build_prior_tools(a2, history=history, scope="family")
         family = {t.name: t for t in family_tools}["get-priors"].execute(n=10).output
-        assert f"attempt_{a1.number}" in family
-        assert f"attempt_{a2.number}" in family
-        assert f"attempt_{a3.number}" not in family
+        assert f"attempt_{a1.id}" in family
+        assert f"attempt_{a2.id}" in family
+        assert f"attempt_{a3.id}" not in family
 
         all_tools = build_prior_tools(
             a2,
@@ -906,10 +907,10 @@ def test_build_prior_tools_direction_scopes():
         )
         by_name = {t.name: t for t in all_tools}
         listing = by_name["get-priors"].execute(n=10).output
-        assert f"attempt_{a3.number}" in listing
-        assert f"attempt_{a2.number}" not in listing
+        assert f"attempt_{a3.id}" in listing
+        assert f"attempt_{a2.id}" not in listing
         assert by_name["get-prior-file"].execute(
-            attempt=str(a3.number), file="solution.py"
+            attempt=str(a3.id), file="solution.py"
         ).output == "mcts"
 
 
@@ -1111,7 +1112,7 @@ def test_folder_history_workspace_commit():
         write_result(ws.path, result)
 
         attempt = ws.commit(success=result.completed)
-        assert attempt.number == 1
+        assert attempt.id == "1"
         assert attempt.parent is None
         assert attempt.code == "def solve(): return 42"
         assert attempt.result.completed
@@ -1141,7 +1142,7 @@ def test_folder_history_list_and_best():
 
         assert len(h.list()) == 2
         best = h.best(lambda sr: sr.metrics.get("score", 0))
-        assert best.number == 2
+        assert best.id == "2"
 
 def test_folder_history_lineage():
     import tempfile
@@ -1168,7 +1169,7 @@ def test_folder_history_lineage():
 
         attempt2 = h.list()[-1]
         lineage = h.lineage(attempt2)
-        assert [a.number for a in lineage] == [1, 2]
+        assert [a.id for a in lineage] == ["1", "2"]
 
 
 # === Queue (tools/queue.py) ===
@@ -1657,7 +1658,7 @@ def test_select_prior_favors_underexplored_family():
             write_direction(ws.path, direction)
             r = EvaluationResult(stages={"eval": StageResult(metrics={"score": score})})
             write_result(ws.path, r)
-            return ws.commit(success=True).number
+            return ws.commit(success=True).id
 
         # Big family: 5 attempts, score 0.9 (incl. score 1.0 leader)
         a1 = commit_with("rollout", 0.5)
@@ -1703,7 +1704,7 @@ def test_select_prior_skips_non_promotable():
         a1 = ws.commit(success=True)
 
         # Second attempt (improvement): flagged non_promotable.
-        ws2 = history.workspace(parent=a1.number)
+        ws2 = history.workspace(parent=a1.id)
         (ws2.path / "solution.py").write_text("v2")
         write_direction(ws2.path, "rollout")
         write_result(ws2.path,
@@ -1716,7 +1717,7 @@ def test_select_prior_skips_non_promotable():
         rng = random.Random(0)
         for _ in range(50):
             p = select_prior(history, scorer, rng)
-            assert p.number == 1, f"non-promotable was picked (#{p.number})"
+            assert p.id == "1", f"non-promotable was picked (#{p.id})"
 
 
 def test_agent_strategy_flags_duplicate_solution_non_promotable():
@@ -1732,7 +1733,7 @@ def test_agent_strategy_flags_duplicate_solution_non_promotable():
         (prior_path / "solution.py").write_text("def solve(): return 1", encoding="utf-8")
 
         ws = type("WS", (), {"path": ws_path})()
-        prior = type("P", (), {"path": prior_path})()
+        prior = type("P", (), {"path": prior_path, "code": "def solve(): return 1"})()
         assert AgentStrategy._is_solution_duplicate(ws, prior) is True
 
         # Different bytes
@@ -1754,7 +1755,7 @@ def test_improve_strategy_flags_duplicate_solution():
         (ws_path / "solution.py").write_text("same", encoding="utf-8")
         (prior_path / "solution.py").write_text("same", encoding="utf-8")
         ws = type("WS", (), {"path": ws_path})()
-        prior = type("P", (), {"path": prior_path})()
+        prior = type("P", (), {"path": prior_path, "code": "same"})()
         assert Improve._is_duplicate_solution(ws, prior) is True
 
 
@@ -1804,8 +1805,8 @@ def test_cross_pollinate_agent_selects_different_family():
         s.through = None
         insp = s._select_inspiration(toolkit, parent)
         assert insp is not None
-        assert insp.number == target.number, \
-            f"expected mcts (#{target.number}), got #{insp.number}"
+        assert insp.id == target.id, \
+            f"expected mcts (#{target.id}), got #{insp.id}"
 
 
 def test_cross_pollinate_agent_skips_when_only_one_family():
@@ -1880,7 +1881,7 @@ def test_diversity_integration_phases_1_2_4_5():
             if non_promotable:
                 meta["non_promotable"] = True
             write_result(ws.path, r, metadata=meta)
-            return ws.commit(success=True).number
+            return ws.commit(success=True).id
 
         # Build the synthetic history.
         a1 = commit("rollout", 0.5)

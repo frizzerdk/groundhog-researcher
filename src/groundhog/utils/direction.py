@@ -65,6 +65,24 @@ def read_direction(attempt_dir: Path | str) -> Optional[str]:
     return path.read_text(encoding="utf-8")
 
 
+def read_direction_from_attempt(attempt) -> Optional[str]:
+    """Read the direction text from a *committed* attempt via its read_file API.
+
+    Backend-agnostic: works for the folder backend (disk) and the git backend
+    (object store, no checkout) alike, so no consumer needs ``attempt.path``
+    on a committed attempt. Tries the same search order as
+    :func:`find_direction_path`.
+    """
+    reader = getattr(attempt, "read_file", None)
+    if reader is None:
+        return None
+    for rel in _SEARCH_PATHS:
+        text = reader(rel)
+        if text is not None:
+            return text
+    return None
+
+
 def write_direction(attempt_dir: Path | str, text: str) -> Path:
     """Write ``text`` to ``attempt_dir/core_direction.md``. Returns the path."""
     base = Path(attempt_dir)
@@ -133,6 +151,65 @@ def promote_workspace_direction(ws_dir: Path | str) -> Optional[Path]:
     return None
 
 
+# --- Backend-agnostic parent reads (folder AND git) --------------------
+#
+# The *_from_attempt helpers read the parent via the committed-read API
+# (Attempt.read_file / Attempt.code) instead of ``prior.path``. GitAttempt has
+# no ``.path`` (reads come from the object store), so the older path-based
+# inherit/enforce/dedup silently no-op on git; these work for both backends.
+
+def inherit_direction_from_attempt(prior, ws_dir: Path | str) -> Optional[Path]:
+    """Copy a parent ATTEMPT's core direction into ``ws_dir``, backend-agnostic.
+
+    Reads the parent's direction via :func:`read_direction_from_attempt` and
+    writes it at the canonical name. Returns the destination path, or ``None``
+    if the parent records no direction. Drop-in for ``inherit_direction(
+    prior.path, ws_dir)`` that also works on the git backend.
+    """
+    if prior is None:
+        return None
+    text = read_direction_from_attempt(prior)
+    if text is None:
+        return None
+    return write_direction(ws_dir, text)
+
+
+def inherited_direction_changed_from(ws_dir: Path | str, prior) -> bool:
+    """True when the workspace direction differs from the parent ATTEMPT's
+    (backend-agnostic counterpart of :func:`inherited_direction_changed`)."""
+    if prior is None:
+        return False
+    parent = read_direction_from_attempt(prior)
+    if parent is None:
+        return False
+    current = read_direction(ws_dir)
+    return normalize_direction(current or "") != normalize_direction(parent)
+
+
+def solution_matches_attempt(ws_dir: Path | str, other) -> bool:
+    """True iff ``ws_dir/solution.py`` equals the ``other`` ATTEMPT's code.
+
+    Backend-agnostic dedup: compares the workspace's solution against
+    ``other.code`` (object store on git, disk on folder) rather than reading
+    ``other.path/solution.py``.
+    """
+    if other is None:
+        return False
+    ours = Path(ws_dir) / "solution.py"
+    if not ours.exists():
+        return False
+    try:
+        other_code = other.code
+    except Exception:
+        return False
+    if not other_code:
+        return False
+    try:
+        return ours.read_text(encoding="utf-8") == other_code
+    except OSError:
+        return False
+
+
 def _history_list(history, *, only_done: bool = True):
     """Call ``history.list`` while tolerating older implementations."""
     try:
@@ -145,7 +222,7 @@ def direction_exists(
     history,
     direction: str,
     *,
-    exclude: Iterable[int] = (),
+    exclude: Iterable[str] = (),
     only_done: bool = False,
 ) -> bool:
     """Return True if history already contains this normalized direction."""
@@ -154,20 +231,12 @@ def direction_exists(
         return False
     excluded = set(exclude)
     for attempt in _history_list(history, only_done=only_done):
-        if getattr(attempt, "number", None) in excluded:
+        if getattr(attempt, "id", None) in excluded:
             continue
-        text = read_direction(attempt.path) if hasattr(attempt, "path") else None
+        text = read_direction_from_attempt(attempt)
         if normalize_direction(text or "") == key:
             return True
     return False
-
-
-def attempt_number_from_path(path: Path | str) -> Optional[int]:
-    """Extract the leading attempt number from a workspace path name."""
-    try:
-        return int(Path(path).name.split("_", 1)[0])
-    except (TypeError, ValueError):
-        return None
 
 
 def inherited_direction_changed(ws_dir: Path | str, prior_dir: Path | str) -> bool:
@@ -230,3 +299,29 @@ def direction_title(text: str, max_len: int = 60) -> str:
             return line[: max_len - 3] + "..."
         return line
     return "(no direction)"
+
+
+def slugify(text: str, max_words: int = 6) -> str:
+    """Lowercase, hyphenated, alphanumeric slug for a human-readable name."""
+    text = (text or "").strip().lower()
+    text = re.sub(r"[`\"']", "", text)
+    text = re.sub(r"\s+", "-", text)
+    text = re.sub(r"[^a-z0-9-]", "", text)
+    text = re.sub(r"-+", "-", text).strip("-")
+    if max_words:
+        text = "-".join(text.split("-")[:max_words])
+    return text
+
+
+def workspace_name(ws_dir: Path | str, explicit: Optional[str] = None) -> str:
+    """Resolve an attempt's display name (human-readable, never a lookup key).
+
+    ``explicit`` (e.g. a PlanApproaches slug) wins; otherwise slug the
+    workspace's core-direction title. Returns "" when neither is available.
+    """
+    if explicit:
+        return slugify(explicit)
+    text = read_direction(ws_dir)
+    if not text:
+        return ""
+    return slugify(direction_title(text))

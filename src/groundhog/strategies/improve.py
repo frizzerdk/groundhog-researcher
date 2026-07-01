@@ -40,7 +40,7 @@ class Improve(Strategy):
             return {"skipped": "no prior to improve"}
         prior_score = self._score_result(prior.result, toolkit)
         learnings_count = toolkit.learnings.count() if hasattr(toolkit, 'learnings') else 0
-        self.log.start(f"--- Improve | prior=#{prior.number} ({prior_score:.3f}) | retries={self.cfg.max_retries} | learnings={learnings_count}")
+        self.log.start(f"--- Improve | prior=#{prior.id} ({prior_score:.3f}) | retries={self.cfg.max_retries} | learnings={learnings_count}")
         ws = self._start_workspace(toolkit, prior)
         self.logger.attempt_start(ws.path)
         self._prepare_workspace(toolkit, ws, prior)
@@ -54,23 +54,24 @@ class Improve(Strategy):
         self._record_learnings(toolkit, ws, prior, result)
         self.log.tock()
         # Soft-gate: re-copy parent's core direction so a stray rewrite during
-        # the LLM session can't fork the family.
-        if hasattr(prior, "path"):
-            from groundhog.utils.direction import (
-                enforce_inherited_direction,
-                inherited_direction_changed,
-            )
-            direction_changed = inherited_direction_changed(ws.path, prior.path)
-            enforce_inherited_direction(ws.path, prior.path)
-        metadata = {"strategy": "improve", "prior": prior.number,
+        # the LLM session can't fork the family. Backend-agnostic (works on git).
+        from groundhog.utils.direction import (
+            inherit_direction_from_attempt,
+            inherited_direction_changed_from,
+        )
+        direction_changed = inherited_direction_changed_from(ws.path, prior)
+        inherit_direction_from_attempt(prior, ws.path)
+        metadata = {"strategy": "improve", "prior": prior.id,
                     "cost": round(self.logger.total_cost(), 6)}
-        if hasattr(prior, "path") and direction_changed:
+        if direction_changed:
             metadata["direction_restored"] = True
         if self._is_duplicate_solution(ws, prior):
             metadata["non_promotable"] = True
             metadata["non_promotable_reason"] = "solution.py is byte-identical to parent"
         from groundhog.utils.results import write_result
         write_result(ws.path, result, metadata=metadata)
+        from groundhog.utils.direction import workspace_name
+        ws.name = workspace_name(ws.path)
         attempt = ws.commit(success=result.completed)
         return self._build_log(attempt, prior, result, toolkit)
 
@@ -95,16 +96,15 @@ class Improve(Strategy):
     # --- Workspace setup ---
 
     def _start_workspace(self, toolkit, prior):
-        return toolkit.history.workspace(parent=prior.number)
+        return toolkit.history.workspace(parent=prior.id)
 
     def _prepare_workspace(self, toolkit, ws, prior):
         (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get(), encoding="utf-8")
         (ws.path / "solution.py").write_text(prior.code, encoding="utf-8")
-        # Inherit the family's core direction from the parent (legacy approach.md
-        # is migrated forward to core_direction.md).
-        if hasattr(prior, "path"):
-            from groundhog.utils.direction import inherit_direction
-            inherit_direction(prior.path, ws.path)
+        # Inherit the family's core direction from the parent (backend-agnostic;
+        # legacy approach.md is migrated forward to core_direction.md).
+        from groundhog.utils.direction import inherit_direction_from_attempt
+        inherit_direction_from_attempt(prior, ws.path)
         # Learnings are included in the prompt via build_prompt(learnings=...),
         # and logged in conversation.json — no need to duplicate as a file.
 
@@ -250,17 +250,9 @@ Output your changes as SEARCH/REPLACE blocks."""
 
     @staticmethod
     def _is_duplicate_solution(ws, prior) -> bool:
-        """True iff committed solution.py equals the parent's bytewise."""
-        if prior is None or not hasattr(prior, "path"):
-            return False
-        ours = ws.path / "solution.py"
-        theirs = prior.path / "solution.py"
-        if not ours.exists() or not theirs.exists():
-            return False
-        try:
-            return ours.read_bytes() == theirs.read_bytes()
-        except OSError:
-            return False
+        """True iff committed solution.py equals the parent's (backend-agnostic)."""
+        from groundhog.utils.direction import solution_matches_attempt
+        return solution_matches_attempt(ws.path, prior)
 
     def _score_result(self, result, toolkit):
         stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=self.through)
@@ -276,8 +268,8 @@ Output your changes as SEARCH/REPLACE blocks."""
         final_result = result.stages.get(final_name)
         score = stages[-1].score(final_result) if final_result else -1.0
         return {
-            "attempt": attempt.number,
-            "prior": prior.number,
+            "attempt": attempt.id,
+            "prior": prior.id,
             "score": round(score, 4),
             "strategy": "improve",
         }

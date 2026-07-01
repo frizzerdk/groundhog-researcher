@@ -16,16 +16,57 @@ Properties:
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
 
 from groundhog.base.types import EvaluationResult, StageResult
 
 
+@dataclass
+class InProgress:
+    """A workspace that was opened but not yet committed — live or crashed.
+
+    Surfaced by ``AttemptHistory.list_in_progress`` so a user, an agent, or the
+    optimizer can ``resume`` it (keep working, then commit) or ``reap`` it
+    (abort a crashed one). ``live`` is a best-effort liveness signal (a fresh
+    heartbeat); a stale ``live=False`` marks a crashed workspace.
+    """
+    workspace_id: str
+    parent: Optional[str]
+    started_at: float
+    path: Optional[Path] = None
+    live: bool = True
+
+
+@dataclass
+class SeedSpec:
+    """The parent→child copy convention, made explicit.
+
+    A child workspace copies ONLY this set from its parent — the parent's
+    solution (a starting point) and core direction — never the parent's
+    ``result.json``/``metadata.json``. Mirrors what the strategies do, so manual
+    and agent-driven attempt creation behave identically.
+    """
+    copy_solution: bool = True
+    solution_dest: str = "solution.py"
+    inherit_direction: bool = True
+
+
 class Attempt(ABC):
-    """A committed attempt in the history. Read-only."""
-    number: int
-    parent: Optional[int]
+    """A committed attempt in the history. Read-only.
+
+    Identity is ``id`` — an opaque string assigned at commit (the commit
+    hash for the git backend, the attempt number for the folder backend).
+    ``parent`` is the id of the parent attempt, or None for a root.
+    ``created_at`` is a unix-epoch float and the canonical sort key.
+    ``name`` is a human-readable, display-only label — never an identity or
+    a lookup key.
+    """
+    id: str
+    parent: Optional[str]
+    created_at: float
+    name: str
 
     @property
     @abstractmethod
@@ -38,6 +79,13 @@ class Attempt(ABC):
     @property
     @abstractmethod
     def metadata(self) -> dict: ...
+
+    @property
+    @abstractmethod
+    def status(self) -> str:
+        """``"done"`` | ``"fail"`` | ``"in-progress"``. Sourced from the git
+        ``Status:`` trailer or the folder ``_done``/``_fail`` suffix."""
+        ...
 
     @abstractmethod
     def list_files(self) -> List[str]:
@@ -52,9 +100,16 @@ class Attempt(ABC):
 
 
 class Workspace(ABC):
-    """A working directory for one attempt. Start → work → commit or abort."""
-    number: int
-    parent: Optional[int]
+    """A working directory for one attempt. Start → work → commit or abort.
+
+    A workspace has no committed ``id`` until ``commit()`` returns an
+    Attempt. ``display_id`` is a human-facing in-flight label (the folder
+    number, or the git temp-dir id); ``name`` is a mutable display label the
+    strategy may set before commit. ``parent`` is the parent attempt id.
+    """
+    display_id: str
+    name: str
+    parent: Optional[str]
     path: Path
 
     @abstractmethod
@@ -67,12 +122,20 @@ class Workspace(ABC):
         """Discard this workspace. No trace left."""
         ...
 
+    def checkpoint(self):
+        """Snapshot in-flight state so a crashed run can be resumed from here.
+
+        Default: a no-op. The folder backend is already on disk; the git
+        backend overrides this to advance the workspace's ``wip`` commit.
+        """
+        return None
+
 
 class AttemptHistory(ABC):
     """Storage and retrieval for all attempts."""
 
     @abstractmethod
-    def workspace(self, parent: Optional[int] = None) -> Workspace:
+    def workspace(self, parent: Optional[str] = None) -> Workspace:
         """Create a new workspace to work in. Call commit() or abort() when done."""
         ...
 
@@ -80,13 +143,52 @@ class AttemptHistory(ABC):
     def list(self, only_done: bool = True) -> List[Attempt]: ...
 
     @abstractmethod
-    def get(self, number: int) -> Optional[Attempt]: ...
+    def get(self, id: str) -> Optional[Attempt]: ...
 
     @abstractmethod
     def best(self, scorer: Callable[[StageResult], float]) -> Optional[Attempt]: ...
 
     @abstractmethod
     def lineage(self, attempt: Attempt) -> List[Attempt]: ...
+
+    # --- In-progress lifecycle (manual / agent / crash-recovery) --------
+    # Default implementations so existing backends keep working; the git and
+    # folder backends override list_in_progress/resume/reap where they can
+    # enumerate open workspaces.
+
+    def list_in_progress(self) -> List[InProgress]:
+        """Open (uncommitted) workspaces — live or crashed. Default: none."""
+        return []
+
+    def resume(self, workspace_id: str) -> Workspace:
+        """Re-acquire an in-progress workspace to keep working, then commit/abort."""
+        raise NotImplementedError("resume() is not supported by this backend")
+
+    def reap_in_progress(self, ttl_s: float = 300.0) -> int:
+        """Abort crashed (stale) in-progress workspaces; leave live ones.
+        Returns the number reaped. Default: nothing to reap."""
+        return 0
+
+    def seed_from_parent(self, ws: Workspace, parent: Optional[Attempt],
+                         spec: Optional[SeedSpec] = None) -> None:
+        """Copy ONLY the convention set parent→child (backend-agnostic).
+
+        The parent's solution (a starting point) and core direction — never the
+        parent's ``result.json``/``metadata.json``. Reads come from the
+        committed Attempt API (object store on git, disk on folder), so it
+        behaves identically on both. Use for manual/agent attempt creation.
+        """
+        if parent is None:
+            return
+        spec = spec or SeedSpec()
+        from groundhog.utils.direction import inherit_direction_from_attempt
+        code = getattr(parent, "code", None)
+        if spec.copy_solution and code:
+            dest = ws.path / spec.solution_dest
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(code, encoding="utf-8")
+        if spec.inherit_direction:
+            inherit_direction_from_attempt(parent, ws.path)
 
     def derive_trunks(self, scorer: Callable[[StageResult], float]) -> List[List[Attempt]]:
         """Find improvement chains — trunks are derived, not stored.
@@ -98,7 +200,7 @@ class AttemptHistory(ABC):
         if not attempts:
             return []
 
-        by_number = {a.number: a for a in attempts}
+        by_id = {a.id: a for a in attempts}
         children = {}
         roots = []
         for a in attempts:
@@ -119,10 +221,10 @@ class AttemptHistory(ABC):
             trunk = [root]
             current = root
             current_score = score_attempt(current)
-            while current.number in children:
+            while current.id in children:
                 best_child = None
                 best_score = current_score
-                for child in children[current.number]:
+                for child in children[current.id]:
                     s = score_attempt(child)
                     if s > best_score:
                         best_child = child
@@ -141,19 +243,23 @@ class AttemptHistory(ABC):
         A family = attempts sharing the same normalized ``core_direction.md``
         content. Falls back to legacy ``approach.md``. Attempts with no
         direction file land in a "no-direction" sentinel family (stable key
-        ``None``). Families are returned sorted by attempt-number of the
+        ``None``). Families are returned sorted by creation time of the
         oldest member, so the seed family appears first.
 
         See ``Optimizer/Implementation Details/Family Identity.md``.
         """
-        from groundhog.utils.direction import read_direction, normalize_direction
+        from groundhog.utils.direction import (
+            read_direction_from_attempt,
+            normalize_direction,
+        )
 
         groups: dict = {}
         for a in self.list():
-            text = read_direction(a.path) if hasattr(a, "path") else None
+            text = read_direction_from_attempt(a)
             key = normalize_direction(text) if text else None
             groups.setdefault(key, []).append(a)
-        # Sort each group by attempt number; sort families by oldest member.
+        # Sort each group by creation time; sort families by oldest member.
+        # Tie-break on id so ordering stays deterministic when timestamps tie.
         for members in groups.values():
-            members.sort(key=lambda x: x.number)
-        return sorted(groups.values(), key=lambda g: g[0].number)
+            members.sort(key=lambda x: (x.created_at, x.id))
+        return sorted(groups.values(), key=lambda g: (g[0].created_at, g[0].id))

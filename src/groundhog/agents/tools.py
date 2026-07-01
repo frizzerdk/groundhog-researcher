@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from groundhog.base.agent import agent_tool
-from groundhog.utils.direction import normalize_direction, read_direction
+from groundhog.utils.direction import normalize_direction, read_direction_from_attempt
 
 
 def _format_eval_result(result):
@@ -338,7 +338,7 @@ def build_prior_tools(
         return []
 
     def _attempt_direction_key(attempt):
-        text = read_direction(attempt.path) if hasattr(attempt, "path") else None
+        text = read_direction_from_attempt(attempt)
         key = normalize_direction(text or "")
         return key or None
 
@@ -354,27 +354,30 @@ def build_prior_tools(
         return True
 
     def _allowed_attempt_map():
-        return {a.number: a for a, _ in _reachable_attempts()}
+        return {a.id: a for a, _ in _reachable_attempts()}
 
     def _resolve(attempt_id: str):
         """Resolve an agent-supplied id to an Attempt. Accepts ``"parent"``,
-        an integer string, or ``"attempt_<N>"``-style strings."""
+        an attempt id, an ``"attempt_<id>"`` string, or a unique id prefix
+        (e.g. a short commit hash)."""
         allowed = _allowed_attempt_map()
         if history is None:
-            if attempt_id in ("parent", str(prior_attempt.number),
-                              f"attempt_{prior_attempt.number}"):
-                return prior_attempt if prior_attempt.number in allowed else None
+            if attempt_id in ("parent", prior_attempt.id,
+                              f"attempt_{prior_attempt.id}"):
+                return prior_attempt if prior_attempt.id in allowed else None
             return None
         if attempt_id == "parent":
-            return prior_attempt if prior_attempt.number in allowed else None
+            return prior_attempt if prior_attempt.id in allowed else None
         s = attempt_id
         if s.startswith("attempt_"):
             s = s[len("attempt_"):]
-        try:
-            num = int(s)
-        except ValueError:
+        if not s:
             return None
-        return allowed.get(num)
+        if s in allowed:
+            return allowed[s]
+        # Unique-prefix match (git short hashes). Ambiguous prefix → no match.
+        matches = [a for k, a in allowed.items() if k.startswith(s)]
+        return matches[0] if len(matches) == 1 else None
 
     def _reachable_attempts():
         """Yield (attempt, distance) pairs the agent is allowed to see."""
@@ -405,18 +408,18 @@ def build_prior_tools(
 
         # Tree extension: siblings of each ancestor (same parent, not the
         # ancestor itself). Distance follows the ancestor.
-        seen_ids = {a.number for a, _ in [(c, 0) for c in chain]}
+        seen_ids = {a.id for a, _ in [(c, 0) for c in chain]}
         for offset, a in enumerate(reversed(chain), start=1):
             if max_distance is not None and offset > max_distance:
                 break
             if a.parent is None:
                 continue
             for sib in history.list(only_done=False):
-                if sib.parent == a.parent and sib.number != a.number \
-                        and sib.number not in seen_ids:
+                if sib.parent == a.parent and sib.id != a.id \
+                        and sib.id not in seen_ids:
                     if _allowed_by_direction(sib):
                         yield sib, offset
-                    seen_ids.add(sib.number)
+                    seen_ids.add(sib.id)
 
     def _score_of(attempt):
         if scorer is None:
@@ -434,10 +437,9 @@ def build_prior_tools(
         for a, distance in _reachable_attempts():
             score = _score_of(a)
             score_str = f"{score:.4f}" if isinstance(score, float) else "?"
-            committed = "done" if a.path.name.endswith("_done") else \
-                        ("fail" if a.path.name.endswith("_fail") else "in-progress")
+            committed = a.status
             rows.append(
-                f"attempt_{a.number}\tparent={a.parent}\tdistance={distance}"
+                f"attempt_{a.id}\tparent={a.parent}\tdistance={distance}"
                 f"\tscore={score_str}\t{committed}"
             )
             if len(rows) >= n:
@@ -458,7 +460,7 @@ def build_prior_tools(
             return f"(unknown attempt: {attempt!r})"
         text = a.read_file(file)
         if text is None:
-            return f"(file not found in attempt_{a.number}: {file!r})"
+            return f"(file not found in attempt_{a.id}: {file!r})"
         return text
 
     return [

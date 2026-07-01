@@ -40,7 +40,7 @@ class CrossPollinate(Strategy):
             return {"skipped": "no alternative trunk for cross-pollination"}
         prior_score = self._score_result(prior.result, toolkit)
         insp_score = self._score_result(inspiration.result, toolkit)
-        self.log.start(f"--- CrossPollinate | parent=#{prior.number} ({prior_score:.3f}) | inspiration=#{inspiration.number} ({insp_score:.3f})")
+        self.log.start(f"--- CrossPollinate | parent=#{prior.id} ({prior_score:.3f}) | inspiration=#{inspiration.id} ({insp_score:.3f})")
         ws = self._start_workspace(toolkit, prior)
         self.logger.attempt_start(ws.path)
         self._prepare_workspace(toolkit, ws, prior)
@@ -51,21 +51,20 @@ class CrossPollinate(Strategy):
         result = self._evaluate_with_retries(toolkit, ws)
         self.log.tock()
         # Soft-gate: re-copy parent's core direction so the borrowed ideas
-        # don't drift the family identity.
-        if hasattr(prior, "path"):
-            from groundhog.utils.direction import (
-                enforce_inherited_direction,
-                inherited_direction_changed,
-            )
-            direction_changed = inherited_direction_changed(ws.path, prior.path)
-            enforce_inherited_direction(ws.path, prior.path)
+        # don't drift the family identity. Backend-agnostic (works on git).
+        from groundhog.utils.direction import (
+            inherit_direction_from_attempt,
+            inherited_direction_changed_from,
+        )
+        direction_changed = inherited_direction_changed_from(ws.path, prior)
+        inherit_direction_from_attempt(prior, ws.path)
         metadata = {
             "strategy": "cross_pollinate",
-            "prior": prior.number,
-            "inspiration": inspiration.number,
+            "prior": prior.id,
+            "inspiration": inspiration.id,
             "cost": round(self.logger.total_cost(), 6),
         }
-        if hasattr(prior, "path") and direction_changed:
+        if direction_changed:
             metadata["direction_restored"] = True
         # Flag if we landed on byte-identical code to either source.
         if self._is_duplicate_solution(ws, prior) or self._is_duplicate_solution(ws, inspiration):
@@ -73,6 +72,8 @@ class CrossPollinate(Strategy):
             metadata["non_promotable_reason"] = "solution.py is byte-identical to parent or inspiration"
         from groundhog.utils.results import write_result
         write_result(ws.path, result, metadata=metadata)
+        from groundhog.utils.direction import workspace_name
+        ws.name = workspace_name(ws.path)
         attempt = ws.commit(success=result.completed)
         return self._build_log(attempt, prior, result, toolkit)
 
@@ -87,17 +88,9 @@ class CrossPollinate(Strategy):
 
     @staticmethod
     def _is_duplicate_solution(ws, other) -> bool:
-        """True iff ws/solution.py == other/solution.py byte-for-byte."""
-        if other is None or not hasattr(other, "path"):
-            return False
-        ours = ws.path / "solution.py"
-        theirs = other.path / "solution.py"
-        if not ours.exists() or not theirs.exists():
-            return False
-        try:
-            return ours.read_bytes() == theirs.read_bytes()
-        except OSError:
-            return False
+        """True iff ws/solution.py equals the other attempt's code (backend-agnostic)."""
+        from groundhog.utils.direction import solution_matches_attempt
+        return solution_matches_attempt(ws.path, other)
 
     # --- Selection ---
 
@@ -115,7 +108,7 @@ class CrossPollinate(Strategy):
 
         # Inspiration: best from a different trunk
         stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=self.through)
-        leaders = get_trunk_leaders(toolkit.history, stages[-1].score, exclude=prior.number)
+        leaders = get_trunk_leaders(toolkit.history, stages[-1].score, exclude=prior.id)
         # Filter out failed attempts
         leaders = [a for a in leaders if a.result.completed and self._score_result(a.result, toolkit) > 0]
         if not leaders:
@@ -128,7 +121,7 @@ class CrossPollinate(Strategy):
     # --- Workspace ---
 
     def _start_workspace(self, toolkit, prior):
-        return toolkit.history.workspace(parent=prior.number)
+        return toolkit.history.workspace(parent=prior.id)
 
     def _prepare_workspace(self, toolkit, ws, prior):
         (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get(), encoding="utf-8")
@@ -136,9 +129,8 @@ class CrossPollinate(Strategy):
         # Cross-pollinate stays in the parent's family: inherit the core
         # direction; borrow ideas from the inspiration's solution / artifacts
         # but keep the algorithmic backbone.
-        if hasattr(prior, "path"):
-            from groundhog.utils.direction import inherit_direction
-            inherit_direction(prior.path, ws.path)
+        from groundhog.utils.direction import inherit_direction_from_attempt
+        inherit_direction_from_attempt(prior, ws.path)
 
     # --- Core work ---
 
@@ -236,8 +228,8 @@ Output SEARCH/REPLACE blocks modifying the base approach."""
     def _build_log(self, attempt, prior, result, toolkit):
         score = self._score_result(result, toolkit)
         return {
-            "attempt": attempt.number,
-            "prior": prior.number,
+            "attempt": attempt.id,
+            "prior": prior.id,
             "score": round(score, 4),
             "strategy": "cross_pollinate",
         }

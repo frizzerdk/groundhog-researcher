@@ -60,6 +60,8 @@ class FreshApproach(Strategy):
         self._apply_fresh_direction_gate(toolkit, ws, result, metadata)
         from groundhog.utils.results import write_result
         write_result(ws.path, result, metadata=metadata)
+        from groundhog.utils.direction import workspace_name
+        ws.name = workspace_name(ws.path)
         attempt = ws.commit(success=result.completed)
         return self._build_log(attempt, result, toolkit)
 
@@ -187,7 +189,6 @@ Write complete, runnable code in a ```python block."""
     def _apply_fresh_direction_gate(self, toolkit, ws, result, metadata):
         """Fresh directions must exist and must not duplicate history."""
         from groundhog.utils.direction import (
-            attempt_number_from_path,
             direction_exists,
             mark_result_failed,
             read_direction,
@@ -204,7 +205,7 @@ Write complete, runnable code in a ```python block."""
         if direction_exists(
             history,
             direction,
-            exclude=[attempt_number_from_path(ws.path)],
+            exclude=[ws.display_id],
             only_done=False,
         ):
             reason = "fresh attempt duplicated an existing core direction"
@@ -265,7 +266,7 @@ Write complete, runnable code in a ```python block."""
     def _build_log(self, attempt, result, toolkit):
         score = self._score_result(result, toolkit)
         return {
-            "attempt": attempt.number,
+            "attempt": attempt.id,
             "score": round(score, 4),
             "strategy": "fresh_approach",
             "mode": self.cfg.mode,

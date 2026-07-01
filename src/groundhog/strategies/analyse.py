@@ -85,12 +85,12 @@ class Analyse(Strategy):
         for a in recent:
             result = a.result
             if not result.completed:
-                lines.append(f"  #{a.number} (parent={a.parent}): FAILED at {result.failed_stage}")
+                lines.append(f"  #{a.id} (parent={a.parent}): FAILED at {result.failed_stage}")
                 continue
             last = list(result.stages.values())[-1]
             score = scorer(last)
             strategy = a.metadata.get("strategy", "?")
-            lines.append(f"  #{a.number} (parent={a.parent}, {strategy}): score={score:.4f}")
+            lines.append(f"  #{a.id} (parent={a.parent}, {strategy}): score={score:.4f}")
 
         return "\n".join(lines)
 

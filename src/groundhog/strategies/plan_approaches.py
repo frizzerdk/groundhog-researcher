@@ -138,6 +138,7 @@ class PlanApproaches(Strategy):
                     "core_direction": direction,
                     "guidance": guidance,
                     "tier": self.cfg.tier,
+                    "name": (proposal.get("name") or "").strip(),
                 },
                 source="plan_approaches",
             )

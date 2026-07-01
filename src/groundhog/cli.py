@@ -330,6 +330,457 @@ def set_prefer_tier(args):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# attempt / eval commands — manual attempt lifecycle + scoring (LLM-free).
+#
+# These call the rundir loader to get the run's task + attempt history, then
+# drive the AttemptHistory / Task.evaluate APIs directly. No optimizer is run.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_run(args=None):
+    """Load the run in the cwd. Returns a LoadedRun or None (after printing an
+    error). ``args`` is accepted for forward-compat (-C/--run-dir) but v1 only
+    uses the cwd."""
+    from groundhog import rundir
+
+    run_dir = None
+    try:
+        return rundir.load_run(run_dir=run_dir)
+    except FileNotFoundError as e:
+        print(str(e))
+        return None
+    except Exception as e:  # noqa: BLE001 — surface a clean error to the CLI user
+        print(f"Could not load this run: {e}")
+        return None
+
+
+def _scorer_for(task, through=None):
+    """Replicate SimpleOptimizer._get_scorer: the final stage's scorer."""
+    stages = task.evaluator.eval_stages(task.data, through=through)
+    return stages[-1].score
+
+
+def _score_result(result, scorer):
+    """Score an EvaluationResult read-side: scorer of the last stage, or -1.0
+    when the result did not complete (a failed gate)."""
+    if not result.completed or not result.stages:
+        return -1.0
+    last = list(result.stages.values())[-1]
+    return scorer(last)
+
+
+def _short(value, n=8):
+    """Short id form (git shas are long; folder ids are already short)."""
+    if value is None:
+        return "-"
+    s = str(value)
+    return s[:n] if len(s) > n else s
+
+
+def _print_stage_scores(result, scorer):
+    """Print per-stage score + the final overall line."""
+    for name, stage in result.stages.items():
+        score = stage.score if hasattr(stage, "score") else 0.0
+        print(f"  {name}: score={scorer(stage):.4f}")
+    overall = _score_result(result, scorer)
+    if result.completed:
+        print(f"  overall: {overall:.4f}  (completed)")
+    else:
+        print(f"  overall: {overall:.4f}  (FAILED at stage {result.failed_stage})")
+
+
+def _attempt_score(attempt, scorer):
+    try:
+        return _score_result(attempt.result, scorer)
+    except Exception:
+        return -1.0
+
+
+def attempt_group(args):
+    """`groundhog attempt <subcommand>` — manual attempt lifecycle."""
+    usage = (
+        "Usage: groundhog attempt <subcommand>\n"
+        "\n"
+        "  new [--parent ID] [--no-seed] [--name NAME]   Open a workspace\n"
+        "  list [--all]                                  List attempts (--all incl. failed)\n"
+        "  show <id> [--file F]                          Show an attempt (or one file)\n"
+        "  in-progress                                   List open workspaces\n"
+        "  resume <wsid>                                 Re-acquire an open workspace\n"
+        "  commit <wsid> [--fail] [--eval] [--through S] Finalize a workspace\n"
+        "  abort <wsid>                                  Discard an open workspace\n"
+        "  reap [--ttl S]                                Abort crashed workspaces\n"
+        "  best                                          Show the best attempt\n"
+    )
+    if not args or args[0] in ("-h", "--help"):
+        print(usage)
+        return 0
+
+    sub = args[0]
+    rest = args[1:]
+
+    handlers = {
+        "new": _attempt_new,
+        "list": _attempt_list,
+        "show": _attempt_show,
+        "in-progress": _attempt_in_progress,
+        "resume": _attempt_resume,
+        "commit": _attempt_commit,
+        "abort": _attempt_abort,
+        "reap": _attempt_reap,
+        "best": _attempt_best,
+    }
+    handler = handlers.get(sub)
+    if handler is None:
+        print(f"Unknown attempt subcommand: {sub}")
+        print(usage)
+        return 1
+    return handler(rest)
+
+
+def _flag(args, name):
+    """Pop a boolean flag; return (present, remaining_args)."""
+    present = name in args
+    return present, [a for a in args if a != name]
+
+
+def _opt(args, name):
+    """Pop an option with a value (``--name VALUE``); return (value, remaining)."""
+    if name in args:
+        i = args.index(name)
+        if i + 1 < len(args):
+            value = args[i + 1]
+            return value, args[:i] + args[i + 2:]
+    return None, args
+
+
+def _attempt_new(args):
+    no_seed, args = _flag(args, "--no-seed")
+    parent, args = _opt(args, "--parent")
+    name, args = _opt(args, "--name")
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history, task = run.history, run.task
+
+    try:
+        # Default parent = current best, if any attempts exist.
+        if parent is None:
+            scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
+            best = history.best(scorer)
+            parent = best.id if best else None
+
+        ws = history.workspace(parent=parent)
+
+        if parent is not None and not no_seed:
+            parent_attempt = history.get(parent)
+            if parent_attempt is None:
+                ws.abort()
+                print(f"No such parent attempt: {parent}")
+                return 1
+            history.seed_from_parent(ws, parent_attempt)
+
+        if name:
+            ws.name = name
+
+        print(f"Opened workspace {ws.display_id}")
+        print(f"  path:   {ws.path}")
+        if parent is not None:
+            print(f"  parent: {parent}")
+        print(f"  edit solution.py, then: groundhog attempt commit {ws.display_id} --eval")
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(f"Could not open a workspace: {e}")
+        return 1
+
+
+def _attempt_list(args):
+    show_all, args = _flag(args, "--all")
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history, task = run.history, run.task
+    scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
+
+    attempts = history.list(only_done=not show_all)
+    if not attempts:
+        print("No attempts yet.")
+        return 0
+
+    print(f"{'id':<10} {'parent':<10} {'status':<12} {'score':<9} name")
+    for a in attempts:
+        if a.status == "done":
+            score = _attempt_score(a, scorer)
+            score_str = f"{score:.4f}"
+        else:
+            score_str = "-"
+        print(f"{_short(a.id):<10} {_short(a.parent):<10} {a.status:<12} "
+              f"{score_str:<9} {a.name}")
+    return 0
+
+
+def _attempt_show(args):
+    file_arg, args = _opt(args, "--file")
+    if not args:
+        print("Usage: groundhog attempt show <id> [--file F]")
+        return 1
+    attempt_id = args[0]
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history, task = run.history, run.task
+
+    attempt = history.get(attempt_id)
+    if attempt is None:
+        print(f"No such attempt: {attempt_id}")
+        return 1
+
+    if file_arg is not None:
+        content = attempt.read_file(file_arg)
+        if content is None:
+            print(f"No such file in attempt {attempt_id}: {file_arg}")
+            return 1
+        print(content)
+        return 0
+
+    scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
+    print(f"id:      {attempt.id}")
+    print(f"parent:  {attempt.parent}")
+    print(f"status:  {attempt.status}")
+    print(f"name:    {attempt.name}")
+    print(f"created: {attempt.created_at}")
+    print(f"metadata: {attempt.metadata}")
+    print()
+    print("stages:")
+    try:
+        result = attempt.result
+        for name, stage in result.stages.items():
+            print(f"  {name}: score={scorer(stage):.4f} metrics={stage.metrics}")
+        print(f"  overall: {_score_result(result, scorer):.4f} "
+              f"({'completed' if result.completed else 'failed at ' + str(result.failed_stage)})")
+    except Exception as e:  # noqa: BLE001
+        print(f"  (no readable result: {e})")
+    print()
+    print("files:")
+    for f in attempt.list_files():
+        print(f"  {f}")
+    return 0
+
+
+def _attempt_in_progress(args):
+    import time
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    items = run.history.list_in_progress()
+    if not items:
+        print("No in-progress workspaces.")
+        return 0
+
+    now = time.time()
+    print(f"{'wsid':<10} {'parent':<10} {'age(s)':<8} {'state':<9} path")
+    for ip in items:
+        age = int(now - ip.started_at)
+        state = "live" if ip.live else "CRASHED"
+        print(f"{_short(ip.workspace_id):<10} {_short(ip.parent):<10} "
+              f"{age:<8} {state:<9} {ip.path}")
+    return 0
+
+
+def _attempt_resume(args):
+    if not args:
+        print("Usage: groundhog attempt resume <wsid>")
+        return 1
+    wsid = args[0]
+    run = _resolve_run()
+    if run is None:
+        return 1
+    try:
+        ws = run.history.resume(wsid)
+    except (KeyError, NotImplementedError) as e:
+        print(f"Could not resume {wsid}: {e}")
+        return 1
+    print(f"Resumed workspace {ws.display_id}")
+    print(f"  path: {ws.path}")
+    print(f"  edit, then: groundhog attempt commit {ws.display_id}")
+    return 0
+
+
+def _attempt_commit(args):
+    do_fail, args = _flag(args, "--fail")
+    do_eval, args = _flag(args, "--eval")
+    through, args = _opt(args, "--through")
+    if not args:
+        print("Usage: groundhog attempt commit <wsid> [--fail] [--eval] [--through STAGE]")
+        return 1
+    wsid = args[0]
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history, task, toolkit = run.history, run.task, run.toolkit
+
+    try:
+        ws = history.resume(wsid)
+    except (KeyError, NotImplementedError) as e:
+        print(f"Could not resume {wsid}: {e}")
+        return 1
+
+    through = through or getattr(toolkit, "through", None)
+    scorer = _scorer_for(task, through=through)
+
+    try:
+        if do_eval:
+            from groundhog.utils.results import write_result
+
+            result = task.evaluate(ws.path, through=through)
+            write_result(ws.path, result, metadata={"strategy": "manual", "cost": 0.0})
+            print("Evaluation:")
+            _print_stage_scores(result, scorer)
+            success = result.completed and not do_fail
+        else:
+            success = not do_fail
+
+        if not ws.name:
+            from groundhog.utils.direction import workspace_name
+            derived = workspace_name(ws.path)
+            if derived:
+                ws.name = derived
+
+        attempt = ws.commit(success=success)
+        verdict = "done" if success else "fail"
+        print(f"Committed attempt {attempt.id} ({verdict})")
+        return 0
+    except Exception as e:  # noqa: BLE001
+        print(f"Commit failed: {e}")
+        return 1
+
+
+def _attempt_abort(args):
+    if not args:
+        print("Usage: groundhog attempt abort <wsid>")
+        return 1
+    wsid = args[0]
+    run = _resolve_run()
+    if run is None:
+        return 1
+    try:
+        ws = run.history.resume(wsid)
+    except (KeyError, NotImplementedError) as e:
+        print(f"Could not abort {wsid}: {e}")
+        return 1
+    ws.abort()
+    print(f"aborted {wsid}")
+    return 0
+
+
+def _attempt_reap(args):
+    ttl, args = _opt(args, "--ttl")
+    run = _resolve_run()
+    if run is None:
+        return 1
+    ttl_s = float(ttl) if ttl else 300.0
+    n = run.history.reap_in_progress(ttl_s=ttl_s)
+    print(f"reaped {n}")
+    return 0
+
+
+def _attempt_best(args):
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history, task = run.history, run.task
+    scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
+    best = history.best(scorer)
+    if best is None:
+        print("No attempts yet.")
+        return 0
+    print(f"id:    {best.id}")
+    print(f"score: {_attempt_score(best, scorer):.4f}")
+    print(f"name:  {best.name}")
+    return 0
+
+
+def cmd_eval(args):
+    """`groundhog eval <path-or-attempt-id> [--through STAGE] [--json]`."""
+    as_json, args = _flag(args, "--json")
+    through, args = _opt(args, "--through")
+    if not args or args[0] in ("-h", "--help"):
+        print("Usage: groundhog eval <path-or-attempt-id> [--through STAGE] [--json]")
+        return 0 if (args and args[0] in ("-h", "--help")) else 1
+    target_arg = args[0]
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history, task, toolkit = run.history, run.task, run.toolkit
+    through = through or getattr(toolkit, "through", None)
+    scorer = _scorer_for(task, through=through)
+
+    # Resolve the target: an attempt id, a directory, or a .py file.
+    target = None
+    attempt = history.get(target_arg)
+    if attempt is not None:
+        target = attempt.code  # a code string
+    else:
+        p = Path(target_arg)
+        if p.is_dir():
+            target = p
+        elif p.is_file() and p.suffix == ".py":
+            target = p.read_text(encoding="utf-8")
+        else:
+            print(f"Cannot resolve eval target: {target_arg!r} "
+                  f"(not an attempt id, directory, or .py file)")
+            return 1
+
+    try:
+        result = task.evaluate(target, through=through)
+    except Exception as e:  # noqa: BLE001
+        print(f"Evaluation crashed: {e}")
+        return 1
+
+    if as_json:
+        import json
+
+        out = {
+            "completed": result.completed,
+            "failed_stage": result.failed_stage,
+            "overall_score": _score_result(result, scorer),
+            "stages": {
+                name: {
+                    "score": scorer(stage),
+                    "metrics": stage.metrics,
+                    "errors": stage.errors,
+                    "warnings": stage.warnings,
+                    "artifacts": list(stage.artifacts.keys()),
+                }
+                for name, stage in result.stages.items()
+            },
+        }
+        print(json.dumps(out, indent=2, default=str))
+    else:
+        for name, stage in result.stages.items():
+            print(f"[{name}] score={scorer(stage):.4f}")
+            if stage.metrics:
+                print(f"  metrics:   {stage.metrics}")
+            if stage.errors:
+                print(f"  errors:    {stage.errors}")
+            if stage.warnings:
+                print(f"  warnings:  {stage.warnings}")
+            if stage.artifacts:
+                print(f"  artifacts: {list(stage.artifacts.keys())}")
+        overall = _score_result(result, scorer)
+        if result.completed:
+            print(f"overall: {overall:.4f}  (completed)")
+        else:
+            print(f"overall: {overall:.4f}  (FAILED at stage {result.failed_stage})")
+
+    return 0 if result.completed else 2
+
+
 def main():
     args = sys.argv[1:]
 
@@ -349,6 +800,9 @@ def main():
         print("  groundhog prefer <backend>        Prefer a backend for all tiers")
         print("  groundhog prefer-tier <tier> <backend> [model]")
         print("  groundhog prefer reset            Reset all preferences")
+        print()
+        print("  groundhog attempt <subcommand>    Manual attempt lifecycle (new/list/show/commit/...)")
+        print("  groundhog eval <path-or-id>       Score a solution dir, .py file, or attempt")
         print()
         print("Options:")
         print("  --script    Script-only mode (no uv project, uses inline deps)")
@@ -375,6 +829,10 @@ def main():
         sys.exit(set_prefer(args[1:]))
     elif cmd == "prefer-tier":
         sys.exit(set_prefer_tier(args[1:]))
+    elif cmd == "attempt":
+        sys.exit(attempt_group(args[1:]))
+    elif cmd == "eval":
+        sys.exit(cmd_eval(args[1:]))
     else:
         print(f"Unknown command: {cmd}")
         print("Try: groundhog --help")

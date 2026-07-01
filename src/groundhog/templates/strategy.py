@@ -27,7 +27,7 @@ EVALUATION:
   Accepts a workspace Path (reads solution.py etc.) or a code string.
 
 WORKSPACE PATTERN:
-  ws = toolkit.history.workspace(parent=prior.number)  # or parent=None for fresh
+  ws = toolkit.history.workspace(parent=prior.id)  # or parent=None for fresh
   (ws.path / "solution.py").write_text(code, encoding="utf-8")
   write_result(ws.path, result, metadata={...})         # serialize results
   attempt = ws.commit(success=result.completed)          # finalize
@@ -98,7 +98,7 @@ class MyStrategy(Strategy):
     def __call__(self, toolkit, config=None):
         self._init(toolkit, config)
         prior = self._select_prior(toolkit)
-        self.log.start(f"--- MyStrategy | prior=#{prior.number if prior else 'none'}")
+        self.log.start(f"--- MyStrategy | prior=#{prior.id if prior else 'none'}")
         ws = self._start_workspace(toolkit, prior)
         self.logger.attempt_start(ws.path)
         self._prepare_workspace(toolkit, ws, prior)
@@ -111,11 +111,11 @@ class MyStrategy(Strategy):
         from groundhog.utils.results import write_result
         write_result(ws.path, result, metadata={
             "strategy": "my_strategy",
-            "prior": prior.number if prior else None,
+            "prior": prior.id if prior else None,
             "cost": round(self.logger.total_cost(), 6),
         })
         attempt = ws.commit(success=result.completed)
-        return {"attempt": attempt.number, "strategy": "my_strategy"}
+        return {"attempt": attempt.id, "strategy": "my_strategy"}
 
     # --- Init ---
 
@@ -138,7 +138,7 @@ class MyStrategy(Strategy):
     # --- Workspace ---
 
     def _start_workspace(self, toolkit, prior):
-        return toolkit.history.workspace(parent=prior.number if prior else None)
+        return toolkit.history.workspace(parent=prior.id if prior else None)
 
     def _prepare_workspace(self, toolkit, ws, prior):
         (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get(), encoding="utf-8")

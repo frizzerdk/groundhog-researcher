@@ -38,6 +38,12 @@ class AgentConfig(StrategyConfig):
     model: Optional[str] = param(None, "Override agent model")
     effort: Optional[str] = param(None, "Override agent effort/reasoning level")
     guidance: str = param("", "Additional guidance appended to agent prompt")
+    name: str = param(
+        "",
+        "Optional display name (human-readable slug). PlanApproaches sets this "
+        "from the proposed direction's name; otherwise it is derived from the "
+        "core direction at commit.",
+    )
     tier: str = param("default", "Agent backend tier (default/high/budget)")
     core_direction: str = param(
         "",
@@ -422,8 +428,8 @@ class AgentStrategy(Strategy):
         # attempt_done/attempt_failed in _log_attempt.
         self.logger.attempt_start(
             ws.path,
-            num=ws.number,
-            prior=prior.number if prior else None,
+            num=ws.display_id,
+            prior=prior.id if prior else None,
             queue_label=getattr(toolkit, "_current_queue_label", "") or "",
             budget_total=self.cfg.budget_usd or 0.0,
         )
@@ -519,7 +525,7 @@ class AgentStrategy(Strategy):
         # doesn't exist — caller treats that as "no prior available".
         forced = getattr(self.cfg, "force_prior_attempt", None)
         if forced is not None:
-            return toolkit.history.get(int(forced))
+            return toolkit.history.get(str(forced))
         if self.cfg.target == "best":
             stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=self.through)
             return toolkit.history.best(stages[-1].score)
@@ -531,7 +537,7 @@ class AgentStrategy(Strategy):
     # --- Workspace ---
 
     def _start_workspace(self, toolkit, prior):
-        parent = prior.number if prior else None
+        parent = prior.id if prior else None
         return toolkit.history.workspace(parent=parent)
 
     def _prepare_workspace(self, toolkit, ws, prior):
@@ -541,9 +547,9 @@ class AgentStrategy(Strategy):
         # Inherit core direction from prior (read-only for the agent during
         # the session; re-enforced at commit so an agent can't fork the family
         # by rewriting it).
-        if prior is not None and hasattr(prior, 'path'):
-            from groundhog.utils.direction import inherit_direction
-            inherit_direction(prior.path, ws.path)
+        if prior is not None:
+            from groundhog.utils.direction import inherit_direction_from_attempt
+            inherit_direction_from_attempt(prior, ws.path)
 
         # Seed work/solution.py from prior
         if prior:
@@ -585,11 +591,20 @@ class AgentStrategy(Strategy):
             from groundhog.agents.tools import build_eval_tools, build_prior_tools
 
             promote_dest = (ws.path / "solution.py") if phase == "explore" else None
-            parent_solution_path = (
-                Path(prior.path) / "solution.py"
-                if prior is not None and hasattr(prior, "path")
-                else None
-            )
+            if prior is None:
+                parent_solution_path = None
+            elif hasattr(prior, "path"):
+                parent_solution_path = Path(prior.path) / "solution.py"
+            else:
+                # git: materialize the parent solution OUTSIDE the workspace so
+                # the eval tool can read it without committing it into the child.
+                import tempfile
+                _tf = tempfile.NamedTemporaryFile(
+                    mode="w", suffix="_parent_solution.py", delete=False,
+                    encoding="utf-8")
+                _tf.write(prior.code or "")
+                _tf.close()
+                parent_solution_path = Path(_tf.name)
             tools += build_eval_tools(
                 toolkit,
                 ws.path,
@@ -638,10 +653,10 @@ class AgentStrategy(Strategy):
     def _build_session_header(self, toolkit, ws, prior):
         """Build session header with prior score and key metrics."""
         if not prior:
-            return f"[{toolkit.task.name} #{ws.number}] fresh start"
+            return f"[{toolkit.task.name} #{ws.display_id}] fresh start"
 
         prior_score = self._score_result(prior.result, toolkit)
-        header = f"[{toolkit.task.name} #{ws.number}] prior=#{prior.number} score={prior_score:.4f}"
+        header = f"[{toolkit.task.name} #{ws.display_id}] prior=#{prior.id} score={prior_score:.4f}"
 
         # Append key metrics from the prior's last stage
         prior_metrics = self._get_prior_metrics(prior, toolkit)
@@ -912,7 +927,6 @@ class AgentStrategy(Strategy):
         in metadata so selectors skip it. Diversity > a few BT points.
         """
         from groundhog.utils.direction import (
-            attempt_number_from_path,
             direction_exists,
             enforce_inherited_direction,
             inherited_direction_changed,
@@ -933,16 +947,20 @@ class AgentStrategy(Strategy):
             elif direction_exists(
                 history,
                 direction,
-                exclude=[attempt_number_from_path(ws.path)],
+                exclude=[ws.display_id],
                 only_done=False,
             ):
                 reason = "fresh attempt duplicated an existing core direction"
                 metadata["gate_failure"] = reason
                 mark_result_failed(result, "core_direction", reason)
-        elif hasattr(prior, "path"):
-            if inherited_direction_changed(ws.path, prior.path):
+        elif prior is not None:
+            from groundhog.utils.direction import (
+                inherit_direction_from_attempt,
+                inherited_direction_changed_from,
+            )
+            if inherited_direction_changed_from(ws.path, prior):
                 metadata["direction_restored"] = True
-            enforce_inherited_direction(ws.path, prior.path)
+            inherit_direction_from_attempt(prior, ws.path)
 
         if self._is_solution_duplicate(ws, prior):
             metadata["non_promotable"] = True
@@ -951,26 +969,23 @@ class AgentStrategy(Strategy):
         from groundhog.utils.results import write_result
         write_result(ws.path, result, metadata=metadata)
 
+        # Display name: the planned slug if provided (e.g. PlanApproaches),
+        # else a slug of the finalized core direction.
+        from groundhog.utils.direction import workspace_name
+        ws.name = workspace_name(ws.path, explicit=self.cfg.name)
+
     @staticmethod
     def _is_solution_duplicate(ws, prior) -> bool:
-        """True iff the committed solution.py equals the parent's byte-for-byte."""
-        if prior is None or not hasattr(prior, "path"):
-            return False
-        ours = ws.path / "solution.py"
-        theirs = prior.path / "solution.py"
-        if not ours.exists() or not theirs.exists():
-            return False
-        try:
-            return ours.read_bytes() == theirs.read_bytes()
-        except OSError:
-            return False
+        """True iff the committed solution.py equals the parent's (backend-agnostic)."""
+        from groundhog.utils.direction import solution_matches_attempt
+        return solution_matches_attempt(ws.path, prior)
 
     # --- Logging ---
 
     def _build_metadata(self, prior):
         return {
             "strategy": "agent",
-            "prior": prior.number if prior else None,
+            "prior": prior.id if prior else None,
             "cost": round(self.logger.total_cost(), 6),
         }
 
@@ -980,8 +995,8 @@ class AgentStrategy(Strategy):
         final_result = result.stages.get(final_name)
         score = stages[-1].score(final_result) if final_result else -1.0
         return {
-            "attempt": attempt.number,
-            "prior": prior.number if prior else None,
+            "attempt": attempt.id,
+            "prior": prior.id if prior else None,
             "score": round(score, 4),
             "strategy": "agent",
         }

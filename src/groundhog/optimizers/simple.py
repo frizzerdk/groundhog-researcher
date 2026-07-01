@@ -244,14 +244,14 @@ class SimpleOptimizer(Optimizer):
             errors = result.stages[result.failed_stage].errors
             if log is not None:
                 log.attempt_failed(
-                    attempt_num=attempt.number,
+                    attempt_num=attempt.id,
                     stage=result.failed_stage,
                     errors=str(errors),
                     total_cost=cost,
                     cumulative_cost=cumulative_cost,
                 )
             else:
-                print(f"  [{attempt.number:3d}] FAIL  {result.failed_stage}: {errors}  "
+                print(f"  [{attempt.id:>3}] FAIL  {result.failed_stage}: {errors}  "
                       f"${cost:.4f} (${cumulative_cost:.4f})")
                 print()
             return
@@ -262,7 +262,7 @@ class SimpleOptimizer(Optimizer):
 
         if log is not None:
             log.attempt_done(
-                attempt_num=attempt.number,
+                attempt_num=attempt.id,
                 score=score, delta=delta,
                 total_cost=cost, cumulative_cost=cumulative_cost,
                 summary_line=self._summary_line(last),
@@ -270,7 +270,7 @@ class SimpleOptimizer(Optimizer):
         else:
             marker = " *" if delta > 0 else ""
             sign = "+" if delta >= 0 else ""
-            print(f"  [{attempt.number:3d}] {score:.4f} ({sign}{delta:.4f}){marker}  "
+            print(f"  [{attempt.id:>3}] {score:.4f} ({sign}{delta:.4f}){marker}  "
                   f"${cost:.4f} (${cumulative_cost:.4f})")
             print(self._format_metrics(last))
             print()
@@ -303,7 +303,7 @@ class SimpleOptimizer(Optimizer):
         print(f"{self.task.name} | {len(attempts)} attempts")
         if best:
             best_score = self._score_attempt(best, scorer)
-            print(f"Best: {best_score:.4f} (#{best.number})")
+            print(f"Best: {best_score:.4f} (#{best.id})")
         else:
             print("No successful attempts")
 
@@ -338,7 +338,7 @@ class SimpleOptimizer(Optimizer):
 
         print("Trunks:")
         for trunk, best_score in scored_trunks:
-            chain = " ->".join(f"#{a.number}" for a in trunk)
+            chain = " ->".join(f"#{a.id}" for a in trunk)
             # Show the family's core direction (1st line) from the trunk root.
             root = trunk[0]
             from groundhog.utils.direction import read_direction, direction_title
@@ -365,7 +365,7 @@ class SimpleOptimizer(Optimizer):
                     title = direction_title(sample or "")
                 best_score = max(self._score_attempt(a, scorer) for a in members)
                 best_attempt = max(members, key=lambda a: self._score_attempt(a, scorer))
-                family_rows.append((title, len(members), best_score, best_attempt.number))
+                family_rows.append((title, len(members), best_score, best_attempt.id))
             # Sort by best score descending; sentinel last.
             family_rows.sort(
                 key=lambda r: (r[0] == "(no direction)", -r[2])

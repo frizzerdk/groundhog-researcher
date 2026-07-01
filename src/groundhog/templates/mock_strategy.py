@@ -41,7 +41,7 @@ class MockStrategy:
     # --- Workspace setup ---
 
     def _start_workspace(self, toolkit, prior):
-        return toolkit.history.workspace(parent=prior.number if prior else None)
+        return toolkit.history.workspace(parent=prior.id if prior else None)
 
     def _prepare_workspace(self, toolkit, ws, prior):
         """Write context files to workspace before doing work."""
@@ -76,7 +76,7 @@ class MockStrategy:
         final_result = result.stages.get(stages[-1].name)
         score = stages[-1].score(final_result) if final_result else -1.0
         return {
-            "attempt": attempt.number,
-            "prior": prior.number if prior else None,
+            "attempt": attempt.id,
+            "prior": prior.id if prior else None,
             "score": round(score, 4),
         }

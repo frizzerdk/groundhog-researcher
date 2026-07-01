@@ -22,6 +22,7 @@ from typing import Callable, Optional, List
 
 from groundhog.base.types import EvaluationResult, StageResult
 from groundhog.base.attempt_history import Attempt, Workspace, AttemptHistory
+from groundhog.utils.results import read_result, write_metadata, read_attempt_metadata
 
 
 # Stale claim sentinels (left behind by a crashed allocator) are reclaimed
@@ -35,10 +36,13 @@ _ALLOC_MAX_RETRIES = 100
 class FolderAttempt(Attempt):
     """Attempt stored as a folder on disk. Read-only."""
 
-    def __init__(self, number: int, parent: Optional[int], path: Path):
-        self.number = number
+    def __init__(self, id: str, parent: Optional[str], path: Path):
+        self.id = id
         self.parent = parent
         self.path = path
+        # Creation time = the attempt directory's mtime (set when the workspace
+        # last wrote into it). Frozen here so it stays a stable sort key.
+        self.created_at = path.stat().st_mtime if path.exists() else 0.0
 
     # Binary file extensions that should not be read as text
     _BINARY_EXTS = {".png", ".gif", ".jpg", ".jpeg", ".bmp", ".ico", ".pdf",
@@ -52,23 +56,24 @@ class FolderAttempt(Attempt):
     @property
     def result(self) -> EvaluationResult:
         data = json.loads((self.path / "result.json").read_text(encoding="utf-8"))
-        stages = {}
-        for name, stage_data in data.get("stages", {}).items():
-            stages[name] = StageResult(
-                metrics=stage_data.get("metrics", {}),
-                errors=stage_data.get("errors", {}),
-                warnings=stage_data.get("warnings", {}),
-            )
-        return EvaluationResult(
-            stages=stages,
-            completed=data.get("completed", True),
-            failed_stage=data.get("failed_stage"),
-        )
+        return read_result(data)
 
     @property
     def metadata(self) -> dict:
-        data = json.loads((self.path / "result.json").read_text(encoding="utf-8"))
-        return data.get("metadata", {})
+        return read_attempt_metadata(self)
+
+    @property
+    def name(self) -> str:
+        return self.metadata.get("name", "")
+
+    @property
+    def status(self) -> str:
+        name = self.path.name
+        if name.endswith("_done"):
+            return "done"
+        if name.endswith("_fail"):
+            return "fail"
+        return "in-progress"
 
     def list_files(self) -> List[str]:
         """List all files in this attempt (relative paths)."""
@@ -92,16 +97,17 @@ class FolderAttempt(Attempt):
             return f"[binary file: {size_kb:.0f}KB — use your file viewer to inspect]"
 
     def __repr__(self):
-        return f"Attempt({self.number}, parent={self.parent})"
+        return f"Attempt({self.id}, parent={self.parent})"
 
 
 class FolderWorkspace(Workspace):
     """A working directory for one attempt. Write files, then commit or abort."""
 
-    def __init__(self, number: int, parent: Optional[int], path: Path):
-        self.number = number
+    def __init__(self, display_id: str, parent: Optional[str], path: Path, name: str = ""):
+        self.display_id = display_id
         self.parent = parent
         self.path = path
+        self.name = name
         # exist_ok=True so FolderAttemptHistory.workspace can pre-create the
         # directory as part of its atomic-claim handshake.
         self.path.mkdir(parents=True, exist_ok=True)
@@ -113,11 +119,13 @@ class FolderWorkspace(Workspace):
         Strategy must write all files (solution.py, result.json, etc.)
         before calling commit(). This just flips the visibility flag.
         """
+        if self.name:
+            write_metadata(self.path, {"name": self.name})
         suffix = "_done" if success else "_fail"
         new_path = self.path.parent / (self.path.name + suffix)
         self.path.rename(new_path)
         self.path = new_path
-        return FolderAttempt(number=self.number, parent=self.parent, path=new_path)
+        return FolderAttempt(id=self.display_id, parent=self.parent, path=new_path)
 
     def abort(self):
         """Delete the workspace folder entirely."""
@@ -152,11 +160,11 @@ class FolderAttemptHistory(AttemptHistory):
                 pass
         return used
 
-    def _folder_name(self, number: int, parent: Optional[int]) -> str:
-        parent_str = str(parent) if parent is not None else "none"
+    def _folder_name(self, number: int, parent: Optional[str]) -> str:
+        parent_str = parent if parent is not None else "none"
         return f"{number:03d}_{parent_str}"
 
-    def workspace(self, parent: Optional[int] = None) -> FolderWorkspace:
+    def workspace(self, parent: Optional[str] = None) -> FolderWorkspace:
         """Create a new workspace folder. Strategy writes files here, then commits or aborts.
 
         Allocation is atomic across concurrent processes: each call rescans the
@@ -165,6 +173,9 @@ class FolderAttemptHistory(AttemptHistory):
         atomic on POSIX and NTFS; whichever process wins owns the number.
         Losers retry with a fresh scan.
         """
+        # The contract is string ids; tolerate an int parent from older callers
+        # by coercing to the canonical string form.
+        parent = str(parent) if parent is not None else None
         for _ in range(_ALLOC_MAX_RETRIES):
             number = max(self._used_numbers(), default=0) + 1
             sentinel = self.base_path / f".claim_{number:03d}"
@@ -193,7 +204,7 @@ class FolderAttemptHistory(AttemptHistory):
             except OSError:
                 pass  # Best-effort; TTL handles leftovers.
 
-            return FolderWorkspace(number=number, parent=parent, path=path)
+            return FolderWorkspace(display_id=str(number), parent=parent, path=path)
 
         raise RuntimeError(
             f"Could not allocate a workspace number after {_ALLOC_MAX_RETRIES} retries"
@@ -216,14 +227,14 @@ class FolderAttemptHistory(AttemptHistory):
                     continue
                 base = name  # in-progress
             parts = base.split("_", 1)
-            number = int(parts[0])
-            parent = None if parts[1] == "none" else int(parts[1])
-            attempts.append(FolderAttempt(number=number, parent=parent, path=d))
+            id = str(int(parts[0]))
+            parent = None if parts[1] == "none" else parts[1]
+            attempts.append(FolderAttempt(id=id, parent=parent, path=d))
         return attempts
 
-    def get(self, number: int) -> Optional[FolderAttempt]:
+    def get(self, id: str) -> Optional[FolderAttempt]:
         for attempt in self.list():
-            if attempt.number == number:
+            if attempt.id == id:
                 return attempt
         return None
 
@@ -251,3 +262,57 @@ class FolderAttemptHistory(AttemptHistory):
             chain.append(current)
         chain.reverse()
         return chain
+
+    # --- In-progress lifecycle (list / resume / reap) ------------------
+    # In-progress = an un-suffixed ``NNN_<parent>`` dir (no _done/_fail). It
+    # persists on disc through a crash, so it is listable and resumable.
+
+    def _is_in_progress_dir(self, d) -> bool:
+        name = d.name
+        return (d.is_dir() and not name.startswith(".claim_")
+                and not name.endswith("_done") and not name.endswith("_fail"))
+
+    def list_in_progress(self):
+        from groundhog.base.attempt_history import InProgress
+        items = []
+        for d in sorted(self.base_path.iterdir()):
+            if not self._is_in_progress_dir(d):
+                continue
+            parts = d.name.split("_", 1)
+            try:
+                wsid = str(int(parts[0]))
+            except ValueError:
+                continue
+            parent = None if (len(parts) < 2 or parts[1] == "none") else parts[1]
+            items.append(InProgress(
+                workspace_id=wsid, parent=parent,
+                started_at=d.stat().st_mtime, path=d, live=True))
+        items.sort(key=lambda ip: ip.started_at)
+        return items
+
+    def resume(self, workspace_id: str) -> FolderWorkspace:
+        for d in self.base_path.iterdir():
+            if not self._is_in_progress_dir(d):
+                continue
+            parts = d.name.split("_", 1)
+            try:
+                if str(int(parts[0])) != str(workspace_id):
+                    continue
+            except ValueError:
+                continue
+            parent = None if (len(parts) < 2 or parts[1] == "none") else parts[1]
+            return FolderWorkspace(display_id=str(workspace_id), parent=parent, path=d)
+        raise KeyError(f"no in-progress workspace {workspace_id!r}")
+
+    def reap_in_progress(self, ttl_s: float = 300.0) -> int:
+        now = time.time()
+        reaped = 0
+        for ip in self.list_in_progress():
+            if (now - ip.started_at) <= ttl_s:
+                continue
+            try:
+                shutil.rmtree(ip.path)
+                reaped += 1
+            except OSError:
+                pass
+        return reaped
