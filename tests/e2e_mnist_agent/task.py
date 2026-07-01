@@ -16,6 +16,7 @@ load_dotenv()
 from groundhog.templates.mnist_task import MNISTTask
 
 from groundhog import (
+    assemble_toolkit,
     SimpleOptimizer,
     AgentStrategy,
     AnthropicBackend,
@@ -59,19 +60,16 @@ if backend_name == "llm":
         llm = ClaudeCodeBackend(model="haiku")
 
     optimizer = SimpleOptimizer(
-        task,
+        assemble_toolkit(task, through="evaluate"),
         strategies=[(Improve(), 2), (CrossPollinate(), 1), (FreshApproach(), 1)],
-        through="evaluate",
     )
     optimizer.toolkit.llm = BackendRegistry(default=llm, high=llm, cheap=llm)
 else:
     agent_strategy = AgentStrategy()
     optimizer = SimpleOptimizer(
-        task,
+        assemble_toolkit(task, through="evaluate", agent_through="validate"),
         strategy=agent_strategy,
         seed_strategy=agent_strategy,
-        through="evaluate",
-        agent_through="validate",
     )
     optimizer.toolkit.llm = BackendRegistry(
         default=AnthropicBackend(model="claude-sonnet-4-6-20260217"),

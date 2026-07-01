@@ -4,14 +4,9 @@ from itertools import cycle
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-from groundhog.assemble import assemble_toolkit
-from groundhog.base.types import Task
 from groundhog.base.strategy import Strategy
 from groundhog.base.optimizer import Optimizer
-from groundhog.base.attempt_history import AttemptHistory
-from groundhog.histories.folder import FolderAttemptHistory
-from groundhog.base.learnings import Learnings
-from groundhog.learnings.markdown import MarkdownLearnings
+from groundhog.base.toolkit import Toolkit
 from groundhog.tools.queue import read_next as read_queue
 from groundhog.utils.selection import SelectionPolicy, scorer_for
 
@@ -19,34 +14,34 @@ from groundhog.utils.selection import SelectionPolicy, scorer_for
 class SimpleOptimizer(Optimizer):
     """Runs strategies in weighted rotation with potential-based prior selection.
 
+    A CONSUMER of a finished toolkit: ``SimpleOptimizer(toolkit, strategies=…)``.
+    The toolkit is assembled separately (``assemble_toolkit`` — or a run dir's
+    ``build_toolkit()``) and fully configured before the optimizer sees it.
+    The optimizer owns the strategy schedule, the queue, and the ``run()``
+    loop; it reads everything else from the toolkit.
+
     Accepts either a single strategy or a list of (strategy, repeats) tuples
     that define a rotation schedule. The schedule cycles — e.g. 14 Improve +
     5 CrossPollinate + 1 Fresh = 20 per cycle.
 
-    Prior selection uses potential scoring across trunk leaders: high-scoring
-    trunks are favored but short/unexplored trunks get an exploration bonus.
-    Set via toolkit.get_prior.
+    Prior selection is the toolkit's standing capability (``toolkit.get_prior``
+    reading ``toolkit.selection``). The optimizer tunes it by REPLACING the
+    SelectionPolicy data — never by rewriting the function.
 
     At end of run, prints trunk summary showing improvement chains.
     """
 
-    def __init__(self, task: Task,
+    def __init__(self, toolkit: Toolkit,
                  strategy: Union[Strategy, None] = None,
                  strategies: Optional[List[Tuple[Strategy, int]]] = None,
                  extras: Optional[List[Strategy]] = None,
-                 seed: int = 42,
-                 path: Optional[Path] = None,
-                 history: Optional[AttemptHistory] = None,
-                 learnings: Optional[Learnings] = None,
-                 through: Optional[str] = None,
-                 agent_through: Optional[str] = None,
                  seed_strategy="default",
                  direction_weight: Optional[float] = None,
                  direction_decay: Optional[float] = None,
                  exclude_non_promotable: Optional[bool] = None,
                  direction_bonus: Optional[float] = None,
                  skip_non_promotable: Optional[bool] = None):
-        """Configure the optimizer.
+        """Configure the optimizer around a finished toolkit.
 
         ``extras`` registers strategies that are reachable from the queue but
         do not appear in the rotation schedule — useful for one-shot strategies
@@ -55,32 +50,37 @@ class SimpleOptimizer(Optimizer):
         is already taken.
 
         Selection tuning (``direction_weight`` / ``direction_decay`` /
-        ``exclude_non_promotable``) is data: it becomes the toolkit's
-        ``SelectionPolicy``. Left unset, the policy defaults rule.
+        ``exclude_non_promotable``) is data: passing any of them replaces the
+        toolkit's ``SelectionPolicy`` (the override print is deliberate
+        visibility). Left unset, the toolkit's policy rules untouched.
         """
         from groundhog.strategies.fresh import FreshApproach
-        self.task = task
-        self.seed = seed
-        self.through = through
-        self.agent_through = agent_through
+        self.toolkit = toolkit
+        self.task = toolkit.task
+        self.history = toolkit.history
+        self.learnings = getattr(toolkit, "learnings", None)
+        self.path = Path(getattr(toolkit, "path", ".") or ".")
+        self.through = getattr(toolkit, "through", None)
+
+        # Selection tuning as data: only touch the toolkit's policy when the
+        # caller actually tunes something.
         if direction_bonus is not None:
             direction_weight = direction_bonus
         if skip_non_promotable is not None:
             exclude_non_promotable = skip_non_promotable
-        # Resolve tuning into a SelectionPolicy: only explicitly-passed values
-        # deviate from the policy defaults.
-        _defaults = SelectionPolicy()
-        selection = SelectionPolicy(
-            direction_weight=direction_weight if direction_weight is not None else _defaults.direction_weight,
-            direction_decay=direction_decay if direction_decay is not None else _defaults.direction_decay,
-            exclude_non_promotable=exclude_non_promotable if exclude_non_promotable is not None else _defaults.exclude_non_promotable,
-        )
-        self.direction_weight = selection.direction_weight
-        self.direction_decay = selection.direction_decay
-        self.exclude_non_promotable = selection.exclude_non_promotable
-        self.path = Path(path) if path else Path(".")
-        self.history = history or FolderAttemptHistory(self.path)
-        self.learnings = learnings or MarkdownLearnings(self.path)
+        base = getattr(toolkit, "selection", None) or SelectionPolicy()
+        if any(v is not None for v in (direction_weight, direction_decay, exclude_non_promotable)):
+            toolkit.selection = SelectionPolicy(
+                trunk_weight=base.trunk_weight,
+                direction_weight=direction_weight if direction_weight is not None else base.direction_weight,
+                direction_decay=direction_decay if direction_decay is not None else base.direction_decay,
+                exclude_non_promotable=exclude_non_promotable if exclude_non_promotable is not None else base.exclude_non_promotable,
+            )
+            base = toolkit.selection
+        self.direction_weight = base.direction_weight
+        self.direction_decay = base.direction_decay
+        self.exclude_non_promotable = base.exclude_non_promotable
+
         self.seed_strategy = FreshApproach() if seed_strategy == "default" else seed_strategy
 
         # Build rotation schedule from strategies or single strategy
@@ -101,21 +101,6 @@ class SimpleOptimizer(Optimizer):
             self._register_strategy(s)
         for s in (extras or []):
             self._register_strategy(s, allow_overwrite=False)
-
-        # The toolkit is assembled by the factory — one build path for every
-        # consumer. The optimizer's selection tuning travels as DATA
-        # (SelectionPolicy) that the toolkit's standing get_prior reads; the
-        # optimizer never rewrites toolkit functions.
-        self.toolkit = assemble_toolkit(
-            self.task,
-            history=self.history,
-            learnings=self.learnings,
-            path=self.path,
-            through=self.through,
-            agent_through=self.agent_through,
-            seed=self.seed,
-            selection=selection,
-        )
 
     def _register_strategy(self, strategy: Strategy, allow_overwrite: bool = True) -> None:
         """Add a strategy to the queue-resolution registry under both its
@@ -319,9 +304,11 @@ class SimpleOptimizer(Optimizer):
         for trunk, best_score in scored_trunks:
             chain = " ->".join(f"#{a.id}" for a in trunk)
             # Show the family's core direction (1st line) from the trunk root.
+            # Backend-agnostic read: GitAttempt has no .path (audit bug #4 —
+            # the old hasattr guard silently dropped directions on git).
             root = trunk[0]
-            from groundhog.utils.direction import read_direction, direction_title
-            text = read_direction(root.path) if hasattr(root, 'path') else None
+            from groundhog.utils.direction import read_direction_from_attempt, direction_title
+            text = read_direction_from_attempt(root)
             direction = direction_title(text or "")
             direction_str = f" | {direction}" if direction != "(no direction)" else ""
             print(f"  {chain} (best: {best_score:.4f}, {len(trunk)} attempts){direction_str}")
@@ -332,7 +319,7 @@ class SimpleOptimizer(Optimizer):
         # cross-pollinate child outscored a different-family parent).
         families = self.history.derive_families()
         if families and any(self._family_key(f) is not None for f in families):
-            from groundhog.utils.direction import read_direction, direction_title
+            from groundhog.utils.direction import read_direction_from_attempt, direction_title
             print("Direction families:")
             family_rows = []
             for members in families:
@@ -340,7 +327,7 @@ class SimpleOptimizer(Optimizer):
                 if key is None:
                     title = "(no direction)"
                 else:
-                    sample = read_direction(members[0].path)
+                    sample = read_direction_from_attempt(members[0])
                     title = direction_title(sample or "")
                 best_score = max(self._score_attempt(a, scorer) for a in members)
                 best_attempt = max(members, key=lambda a: self._score_attempt(a, scorer))
@@ -356,10 +343,10 @@ class SimpleOptimizer(Optimizer):
     @staticmethod
     def _family_key(members):
         """Return the family's normalized direction key (None for sentinel)."""
-        from groundhog.utils.direction import read_direction, normalize_direction
+        from groundhog.utils.direction import read_direction_from_attempt, normalize_direction
         if not members:
             return None
-        text = read_direction(members[0].path) if hasattr(members[0], "path") else None
+        text = read_direction_from_attempt(members[0])
         return normalize_direction(text) if text else None
 
     def run(self, n: int = 10):

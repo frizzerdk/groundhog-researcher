@@ -20,6 +20,8 @@ from groundhog.utils.subprocess_runner import run_code
 from groundhog.tools.cost_estimate import estimate_cost, estimate_total_cost
 
 # Default implementations
+from groundhog.assemble import assemble_toolkit
+from groundhog.utils.selection import SelectionPolicy, scorer_for
 from groundhog.optimizers.simple import SimpleOptimizer
 from groundhog.histories.folder import FolderAttemptHistory
 from groundhog.histories.git import GitAttemptHistory, SyncPolicy

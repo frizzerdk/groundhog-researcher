@@ -93,17 +93,15 @@ def history_for(run_dir: Path) -> AttemptHistory:
 
 
 def build_toolkit(task: Task, run_dir: Path, through: Optional[str] = None) -> Toolkit:
-    """Build a no-LLM toolkit for a task by constructing a SimpleOptimizer.
+    """Build a no-LLM toolkit for a task via the factory.
 
-    We only want ``optimizer.toolkit`` (task, history, learnings, logging,
-    get_prior, through) — never ``.run()``. The backend is chosen by
-    ``history_for``. No LLM is installed: eval / history / learnings reads need
-    none.
+    The backend is chosen by ``history_for``. No LLM is installed: eval /
+    history / learnings reads need none. (Transitional: step 5 replaces this
+    module with the ``module.build_toolkit()`` run-dir contract.)
     """
+    from groundhog.assemble import assemble_toolkit
     run_dir = Path(run_dir)
-    history = history_for(run_dir)
-    optimizer = SimpleOptimizer(task, history=history, path=run_dir, through=through)
-    return optimizer.toolkit
+    return assemble_toolkit(task, history=history_for(run_dir), path=run_dir, through=through)
 
 
 def load_run(run_dir: Optional[Path] = None, through: Optional[str] = None) -> LoadedRun:

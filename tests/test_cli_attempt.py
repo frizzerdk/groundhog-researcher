@@ -89,7 +89,7 @@ task = Task(data=TinyData(), context=TinyContext(), evaluator=TinyEvaluator(),
 _UNGUARDED_TAIL = '''
 import sys
 from pathlib import Path
-from groundhog import SimpleOptimizer
+from groundhog import SimpleOptimizer, assemble_toolkit
 
 from groundhog.strategies.fresh import FreshApproach
 
@@ -105,7 +105,8 @@ class _SeedOnce(FreshApproach):
         ws.commit(success=True)
         return {}
 
-optimizer = SimpleOptimizer(task, seed_strategy=_SeedOnce(), path=Path(__file__).parent)
+optimizer = SimpleOptimizer(assemble_toolkit(task, path=Path(__file__).parent),
+                            seed_strategy=_SeedOnce())
 
 if len(sys.argv) > 1 and sys.argv[1] == "status":
     optimizer.status()

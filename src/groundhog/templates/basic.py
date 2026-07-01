@@ -8,7 +8,7 @@ load_dotenv()
 
 from groundhog import (
     Task, Data, Context, Evaluator, EvalStage, StageResult,
-    SimpleOptimizer, Improve, auto_registry,
+    Toolkit, assemble_toolkit, SimpleOptimizer, Improve, auto_registry,
 )
 
 
@@ -78,24 +78,33 @@ class MyEvaluator(Evaluator):
 task = Task(data=MyData(), context=MyContext(), evaluator=MyEvaluator(), name="MyTask")
 
 
-# --- Optimizer: runs the loop ---
+# --- Bench: the toolkit every consumer loads ---
 
-if __name__ == "__main__":
-    import sys
-
-    optimizer = SimpleOptimizer(task, strategy=Improve())
+def build_toolkit() -> Toolkit:
+    """Assemble + configure this run's bench. The CLI, agents, and notebooks
+    load this too — construct and configure only, never run anything here."""
+    tk = assemble_toolkit(task)
 
     # Auto-discovers available backends (CLI tools, API keys, local servers)
     # Run "groundhog backends" to see what's available on your machine
-    optimizer.toolkit.llm = auto_registry()
+    tk.llm = auto_registry()
 
     # Or configure manually — uncomment and customize:
     # from groundhog import BackendRegistry, GeminiBackend, AnthropicBackend, OpenAICompatibleBackend, ClaudeCodeBackend
-    # optimizer.toolkit.llm = BackendRegistry(
+    # tk.llm = BackendRegistry(
     #     high=AnthropicBackend(model="claude-opus-4-6"),                # best reasoning
     #     default=ClaudeCodeBackend(model="sonnet"),                     # via Claude Code CLI
     #     cheap=OpenAICompatibleBackend.ollama(model="llama3"),          # free local model
     # )
+    return tk
+
+
+# --- Run: the ONLY place anything executes ---
+
+if __name__ == "__main__":
+    import sys
+
+    optimizer = SimpleOptimizer(build_toolkit(), strategy=Improve())
 
     if len(sys.argv) > 1 and sys.argv[1] == "status":
         optimizer.status()

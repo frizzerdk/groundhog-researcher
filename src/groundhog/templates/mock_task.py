@@ -116,11 +116,19 @@ class MockTask(Task):
         )
 
 
+task = MockTask(seed=42)
+
+
+def build_toolkit():
+    """Assemble this run's bench — loadable by the CLI without running."""
+    from groundhog import assemble_toolkit
+    return assemble_toolkit(task, seed=69)
+
+
 if __name__ == "__main__":
     from mock_strategy import MockStrategy
     from groundhog import SimpleOptimizer
 
-    task = MockTask(seed=42)
     strategy = MockStrategy()
 
     print(f"Task: {task.name}")
@@ -128,7 +136,7 @@ if __name__ == "__main__":
     print()
 
     import sys
-    optimizer = SimpleOptimizer(task, strategy=strategy, seed=69, seed_strategy=None)
+    optimizer = SimpleOptimizer(build_toolkit(), strategy=strategy, seed_strategy=None)
 
     if len(sys.argv) > 1 and sys.argv[1] == "status":
         optimizer.status()
