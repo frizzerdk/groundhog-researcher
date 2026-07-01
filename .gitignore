@@ -13,3 +13,5 @@ tmp/*
 .claude/
 tests/e2e_mnist_agent/*
 probe_results/
+.review-sessions/
+.tmp-*/
