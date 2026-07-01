@@ -574,8 +574,11 @@ class AgentStrategy(Strategy):
         if allowed is not None and not allowed:
             return []
 
-        # General utilities from toolkit (plotting, KB, etc.)
-        tools = list(getattr(toolkit, 'agent_tools', []))
+        # Base layer: framework defaults + task-hook tools, merged by
+        # assemble_toolkit. Strategy tools below get merged OVER this base
+        # (strategy > task > default) by the same name-keyed rule.
+        base = list(getattr(toolkit, 'agent_tools', []))
+        tools = []
 
         # Learnings tool
         from groundhog.agents.tools import build_learnings_tool
@@ -628,7 +631,12 @@ class AgentStrategy(Strategy):
                     )
                 )
 
-        return tools
+        # One collision rule for the whole pipeline: strategy tools shadow
+        # same-named base tools (previously a plain concat — duplicates went
+        # to the agent undetected).
+        from groundhog.agents.tools import _merge_agent_tools
+        return _merge_agent_tools(base, tools, layer="strategy",
+                                  log=getattr(toolkit, "log", None))
 
     def _prior_tool_options(self, toolkit, ws, prior):
         """Hook for subclasses that want wider/narrower prior visibility."""

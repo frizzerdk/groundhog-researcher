@@ -18,7 +18,7 @@ that calls this factory and configures the bench (e.g. ``tk.llm = ...``);
 
 import random
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from groundhog.base.types import Task
 from groundhog.base.toolkit import Toolkit
@@ -42,6 +42,7 @@ def assemble_toolkit(
     agent_through: Optional[str] = None,
     seed: int = 42,
     selection: Optional[SelectionPolicy] = None,
+    agent_tools: Optional[Callable[[Toolkit], list]] = None,
 ) -> Toolkit:
     """Assemble a complete Toolkit for ``task``.
 
@@ -49,6 +50,12 @@ def assemble_toolkit(
     history/learnings stores (folder/markdown defaults rooted at ``path``),
     logging, seeded rng, agent-backend discovery, default agent tools, and
     the default prior selector reading ``toolkit.selection``.
+
+    ``agent_tools`` is the task.py module hook — ``def agent_tools(toolkit)``
+    returning a list of AgentTools. It is called LAST, against the fully
+    assembled toolkit, so tools may close over ``toolkit.history`` /
+    ``.task`` / ``.path``; its tools shadow same-named framework defaults
+    (logged). Pass the FUNCTION, never its result.
 
     The caller configures the bench afterwards (``tk.llm = auto_registry()``,
     custom tools) and only then hands it to a consumer.
@@ -77,10 +84,6 @@ def assemble_toolkit(
     if agent_registry:
         tk.agent = agent_registry
 
-    # Default agent tools from toolkit capabilities.
-    from groundhog.agents.tools import build_default_agent_tools
-    tk.agent_tools = build_default_agent_tools(tk)
-
     # Seeded rng + selection policy + the default prior selector. The
     # selector is a standing capability: it reads tk.selection (data) on
     # every call, so consumers tune selection by replacing the policy,
@@ -88,5 +91,16 @@ def assemble_toolkit(
     tk.rng = random.Random(seed)
     tk.selection = selection or SelectionPolicy()
     tk.get_prior = default_prior_selector
+
+    # Agent tools LAST, so the task hook sees the finished bench: framework
+    # defaults merged with the task.py hook's tools (task wins on a name
+    # collision, and the shadow is logged). Set exactly once — no override
+    # print fires.
+    from groundhog.agents.tools import (
+        build_default_agent_tools, collect_task_tools, _merge_agent_tools,
+    )
+    defaults = build_default_agent_tools(tk)
+    custom = collect_task_tools(agent_tools, tk)
+    tk.agent_tools = _merge_agent_tools(defaults, custom, layer="task", log=tk.log)
 
     return tk

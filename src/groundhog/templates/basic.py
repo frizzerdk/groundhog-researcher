@@ -78,12 +78,34 @@ class MyEvaluator(Evaluator):
 task = Task(data=MyData(), context=MyContext(), evaluator=MyEvaluator(), name="MyTask")
 
 
+# --- Optional per-task agent tools ---
+# The blessed hook: a module-level function (NOT a method on Task — the Task
+# stays a pure value object). Called LAST by assemble_toolkit against the
+# fully assembled toolkit, so tools may close over toolkit.task / .history /
+# .learnings / .path. Return [] for none; your tools shadow same-named
+# framework defaults (logged). Wired below via `agent_tools=agent_tools`.
+#
+#     def agent_tools(toolkit) -> list:
+#         data = toolkit.task.data                 # closure capture at build
+#         def render_sample(n: int = 16) -> str:
+#             ...                                  # uses `data`
+#             return f"wrote {n} samples"
+#         return [agent_tool(
+#             name="render-sample", description="Render input samples to a PNG.",
+#             func=render_sample,
+#             params={"n": {"type": "int", "default": 16}},
+#         )]
+
+def agent_tools(toolkit) -> list:
+    return []
+
+
 # --- Bench: the toolkit every consumer loads ---
 
 def build_toolkit() -> Toolkit:
     """Assemble + configure this run's bench. The CLI, agents, and notebooks
     load this too — construct and configure only, never run anything here."""
-    tk = assemble_toolkit(task)
+    tk = assemble_toolkit(task, agent_tools=agent_tools)
 
     # Auto-discovers available backends (CLI tools, API keys, local servers)
     # Run "groundhog backends" to see what's available on your machine

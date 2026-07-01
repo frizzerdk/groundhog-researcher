@@ -232,13 +232,25 @@ task = Task(data=MyData(), context=MyContext(), evaluator=MyEvaluator(), name="M
 #   Set seed_strategy=None to skip (e.g. if history already exists).
 
 # ==========================================================================
+# PER-TASK AGENT TOOLS (optional)
+# ==========================================================================
+# Module-level hook — NOT a Task method. assemble_toolkit calls it LAST,
+# against the finished toolkit, so tools can close over toolkit.task /
+# .history / .learnings / .path. Return [] for none. Your tools shadow
+# same-named framework defaults (the shadow is logged).
+
+def agent_tools(toolkit) -> list:
+    return []
+
+
+# ==========================================================================
 # BENCH — the toolkit every consumer loads (CLI, agents, notebooks, __main__)
 # ==========================================================================
 # build_toolkit() assembles + configures; it never runs anything. That is
 # what makes `groundhog attempt list` / eval safe to call on this file.
 
 def build_toolkit() -> Toolkit:
-    tk = assemble_toolkit(task)
+    tk = assemble_toolkit(task, agent_tools=agent_tools)
 
     # Auto-discovers available backends (CLI tools, API keys, local servers)
     # Run "groundhog backends" to see what's available on your machine

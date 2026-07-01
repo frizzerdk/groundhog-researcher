@@ -116,14 +116,60 @@ def eval_to_dir(stage, path, output_dir, prefix=""):
 
 
 def build_default_agent_tools(toolkit) -> list:
-    """Build general-purpose utility tools for toolkit.agent_tools.
+    """Build general-purpose framework utility tools for toolkit.agent_tools.
 
     Eval tools and learnings are built by the strategy (which owns the workspace
-    and can add policies like promote-best). This builds task-defined utility
-    tools only — currently empty, placeholder for future tools (plotting,
-    knowledge base, etc.).
+    and can add policies like promote-best); task-specific tools come from the
+    task.py ``agent_tools(toolkit)`` hook via ``assemble_toolkit``. This layer is
+    currently empty — placeholder for future framework utilities.
     """
     return []
+
+
+def _merge_agent_tools(lower: list, higher: list, *, layer: str, log=None) -> list:
+    """Merge two tool layers by name — higher wins, every shadow is logged.
+
+    One rule for the whole pipeline (precedence strategy > task > default):
+    ``assemble_toolkit`` merges task-hook tools over the framework defaults,
+    and the agent strategy merges its per-attempt tools over
+    ``toolkit.agent_tools``. Name-keyed, last-write-wins, idempotent.
+    """
+    by_name = {t.name: t for t in lower}
+    for t in higher:
+        if t.name in by_name:
+            msg = (f"agent tool '{t.name}' from the {layer} layer shadows a "
+                   f"lower-precedence tool of the same name")
+            if log is not None and hasattr(log, "info"):
+                log.info(msg)
+            else:
+                print(msg)
+        by_name[t.name] = t
+    return list(by_name.values())
+
+
+def collect_task_tools(hook, toolkit) -> list:
+    """Run a task.py ``agent_tools(toolkit)`` hook with loud validation.
+
+    Failures surface at build time — a TypeError/ValueError here beats a
+    swallowed ToolResult(success=False) at agent-invoke time.
+    """
+    if hook is None:
+        return []
+    from groundhog.base.agent import AgentTool
+    tools = list(hook(toolkit) or [])
+    seen = set()
+    for t in tools:
+        if not isinstance(t, AgentTool):
+            raise TypeError(
+                f"agent_tools(toolkit) must return AgentTool instances "
+                f"(use groundhog.agent_tool(...)), got {t!r}"
+            )
+        if t.name in seen:
+            raise ValueError(
+                f"duplicate task tool name {t.name!r} returned by agent_tools()"
+            )
+        seen.add(t.name)
+    return tools
 
 
 def build_learnings_tool(toolkit):

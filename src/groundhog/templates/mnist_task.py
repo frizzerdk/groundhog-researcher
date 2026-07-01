@@ -220,13 +220,19 @@ class MNISTTask(Task):
 task = MNISTTask()   # cheap: MNISTData is lazy, nothing downloads at import
 
 
+def agent_tools(toolkit) -> list:
+    """Optional per-task agent tools (module hook, not a Task method).
+    Called last by assemble_toolkit; close over toolkit.task/.history/.path."""
+    return []
+
+
 def build_toolkit():
     """Assemble + configure this run's bench — loadable without running."""
     from dotenv import load_dotenv
     load_dotenv()
     from groundhog import assemble_toolkit, auto_registry
 
-    tk = assemble_toolkit(task, through="evaluate")
+    tk = assemble_toolkit(task, through="evaluate", agent_tools=agent_tools)
 
     # Auto-discovers available backends (CLI tools, API keys, local servers)
     # Run "groundhog backends" to see what's available on your machine
