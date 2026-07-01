@@ -779,6 +779,79 @@ def cmd_eval(args):
     return 0 if result.completed else 2
 
 
+def tool_group(args):
+    """`groundhog tool list` / `groundhog tool run <name> [--attempt ID] [-p k=v ...]`.
+
+    The CLI as a thin toolkit wrapper: every tool on ``toolkit.agent_tools``
+    — framework default or the task.py hook's own — is runnable from the
+    terminal. ``--attempt`` points ``toolkit.ws`` at a chosen attempt for the
+    duration (same bracket the strategy uses), so workspace-relative tools
+    read that attempt's files.
+    """
+    if not args or args[0] in ("-h", "--help"):
+        print("Usage:")
+        print("  groundhog tool list                                    List this run's tools")
+        print("  groundhog tool run <name> [--attempt ID] [-p k=v ...]  Invoke one")
+        return 0
+    sub, rest = args[0], args[1:]
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    toolkit = run.toolkit
+    tools = {t.name: t for t in getattr(toolkit, "agent_tools", [])}
+
+    if sub == "list":
+        if not tools:
+            print("No tools on this toolkit (framework defaults are empty and "
+                  "the task.py agent_tools hook returned none).")
+            return 0
+        width = max(len(n) for n in tools)
+        for name, t in sorted(tools.items()):
+            desc = (getattr(t, "description", "") or "").strip().splitlines()
+            print(f"  {name:<{width}}  {desc[0] if desc else ''}")
+        return 0
+
+    if sub == "run":
+        attempt_id, rest = _opt(rest, "--attempt")
+        params = {}
+        positional = []
+        i = 0
+        while i < len(rest):
+            if rest[i] == "-p" and i + 1 < len(rest) and "=" in rest[i + 1]:
+                k, v = rest[i + 1].split("=", 1)
+                params[k] = v
+                i += 2
+            else:
+                positional.append(rest[i])
+                i += 1
+        if not positional:
+            print("Usage: groundhog tool run <name> [--attempt ID] [-p k=v ...]")
+            return 1
+        name = positional[0]
+        tool = tools.get(name)
+        if tool is None:
+            print(f"No tool named {name!r}. Try: groundhog tool list")
+            return 1
+
+        from contextlib import nullcontext
+        bracket = toolkit.ws.attempt(attempt_id) if attempt_id else nullcontext()
+        try:
+            with bracket:
+                result = tool.execute(**params)
+        except Exception as e:  # noqa: BLE001 — CLI surface, print and exit
+            print(f"Could not run {name!r}: {e}")
+            return 1
+        if result.success:
+            print(result.output)
+            return 0
+        print(f"Tool failed: {result.error}")
+        return 2
+
+    print(f"Unknown tool subcommand: {sub!r}. Try: groundhog tool --help")
+    return 1
+
+
 def main():
     args = sys.argv[1:]
 
@@ -801,6 +874,7 @@ def main():
         print()
         print("  groundhog attempt <subcommand>    Manual attempt lifecycle (new/list/show/commit/...)")
         print("  groundhog eval <path-or-id>       Score a solution dir, .py file, or attempt")
+        print("  groundhog tool list|run           Run any toolkit tool from the terminal")
         print()
         print("Options:")
         print("  --script    Script-only mode (no uv project, uses inline deps)")
@@ -831,6 +905,8 @@ def main():
         sys.exit(attempt_group(args[1:]))
     elif cmd == "eval":
         sys.exit(cmd_eval(args[1:]))
+    elif cmd == "tool":
+        sys.exit(tool_group(args[1:]))
     else:
         print(f"Unknown command: {cmd}")
         print("Try: groundhog --help")

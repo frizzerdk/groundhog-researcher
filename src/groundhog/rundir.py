@@ -1,22 +1,28 @@
-"""Run-dir loader — import a task.py and hand back its task + toolkit + history.
+"""Run-dir loader — import a task.py and call its ``build_toolkit()``.
 
-A "run dir" is a folder with a ``task.py`` that defines a task (and usually
-builds a ``SimpleOptimizer``). The CLI's ``attempt``/``eval`` commands need the
-*task* and an *attempt history*, but NOT an actual optimization run.
+The run-dir contract: a run dir is a folder whose ``task.py`` exposes
 
-The hard part is that task.py is user code with two shapes:
+    def build_toolkit() -> Toolkit:
+        tk = assemble_toolkit(task, ...)   # construct + configure the bench
+        tk.llm = auto_registry()
+        return tk
 
-  * GUARDED — scaffold templates (``templates/basic.py`` etc.) put
-    ``optimizer.run()`` under ``if __name__ == "__main__":``. Importing under a
-    non-``__main__`` name is already safe.
-  * UNGUARDED — real run scripts (e.g. ``C:/repo/groundhog-runs/task.py``) build
-    the optimizer and call ``optimizer.run(n)`` at module top level, reading
-    ``sys.argv``. Importing that as-is would kick off a real optimization.
+``build_toolkit()`` constructs and configures — it never runs anything. The
+loader imports the module under a non-``__main__`` name and calls that one
+function; the returned toolkit IS the run's real bench (its ``history`` is
+the store the run actually uses — no reconstruction, no guessing).
 
-``load_run`` sandboxes the import so BOTH shapes load without running anything:
-it chdir's into the run dir, neutralizes ``sys.argv``, and monkeypatches
-``SimpleOptimizer.run``/``status`` to no-ops for the duration of the import. All
-of that is restored in ``finally`` — even on ``SystemExit`` or exception.
+The old loader monkeypatched ``SimpleOptimizer.run/status`` to no-ops and
+scanned module globals for an optimizer, so that "unguarded" scripts could be
+imported without firing a run. That machinery is gone: the contract makes the
+module import-safe by construction (heavy work is ``__main__``-guarded; Data
+is lazy by convention).
+
+The one deliberate side effect kept: the import and the ``build_toolkit()``
+call run with ``run_dir`` as the working directory and on ``sys.path``, so
+relative store paths (``GitAttemptHistory(".")``) and sibling imports
+(``from mock_strategy import ...``) resolve against the run dir, not
+whatever directory the CLI happened to be launched from.
 """
 
 from __future__ import annotations
@@ -32,7 +38,6 @@ from typing import Optional
 from groundhog.base.types import Task
 from groundhog.base.toolkit import Toolkit
 from groundhog.base.attempt_history import AttemptHistory
-from groundhog.optimizers.simple import SimpleOptimizer
 
 # Unique-ish counter so repeated loads don't collide in sys.modules (we use a
 # throwaway name and never leave the module registered permanently anyway).
@@ -41,11 +46,10 @@ _LOAD_COUNTER = itertools.count()
 
 @dataclass
 class LoadedRun:
-    """Everything the CLI needs from a run dir, with the optimizer never run."""
+    """Everything a consumer needs from a run dir — the bench, never a run."""
     task: Task
     toolkit: Toolkit
     history: AttemptHistory
-    optimizer: Optional[SimpleOptimizer]
     module: object
     run_dir: Path
 
@@ -78,148 +82,58 @@ def find_task_py(run_dir: Optional[Path] = None) -> Path:
     )
 
 
-def history_for(run_dir: Path) -> AttemptHistory:
-    """Pick the attempt-history backend for ``run_dir``.
+def load_run(run_dir: Optional[Path] = None) -> LoadedRun:
+    """Import a run dir's task.py, call its ``build_toolkit()``, return the bench.
 
-    Git if a bare store already exists at ``run_dir/attempts/.git``, else the
-    plain folder backend. Both are rooted at the run dir.
-    """
-    run_dir = Path(run_dir)
-    if (run_dir / "attempts" / ".git").exists():
-        from groundhog.histories.git import GitAttemptHistory
-        return GitAttemptHistory(run_dir)
-    from groundhog.histories.folder import FolderAttemptHistory
-    return FolderAttemptHistory(run_dir)
-
-
-def build_toolkit(task: Task, run_dir: Path, through: Optional[str] = None) -> Toolkit:
-    """Build a no-LLM toolkit for a task via the factory.
-
-    The backend is chosen by ``history_for``. No LLM is installed: eval /
-    history / learnings reads need none. (Transitional: step 5 replaces this
-    module with the ``module.build_toolkit()`` run-dir contract.)
-    """
-    from groundhog.assemble import assemble_toolkit
-    run_dir = Path(run_dir)
-    return assemble_toolkit(task, history=history_for(run_dir), path=run_dir, through=through)
-
-
-def load_run(run_dir: Optional[Path] = None, through: Optional[str] = None) -> LoadedRun:
-    """Import a run dir's task.py and return its task + toolkit + history.
-
-    Robust to guarded and unguarded task.py (see module docstring). The
-    optimizer is never run. ``through`` only matters when task.py has no
-    optimizer and we build a toolkit ourselves.
+    Raises a clear error if the module doesn't define the contract.
     """
     task_py = find_task_py(run_dir)
     resolved_run_dir = task_py.parent
 
-    module = _import_sandboxed(task_py, resolved_run_dir)
-
-    optimizer = _find_optimizer(module)
-    task = _find_task(module, optimizer)
-
-    if optimizer is not None:
-        toolkit = optimizer.toolkit
-        history = toolkit.history
-    else:
-        toolkit = build_toolkit(task, resolved_run_dir, through=through)
-        history = toolkit.history
-
-    return LoadedRun(
-        task=task,
-        toolkit=toolkit,
-        history=history,
-        optimizer=optimizer,
-        module=module,
-        run_dir=resolved_run_dir,
-    )
-
-
-def _import_sandboxed(task_py: Path, run_dir: Path):
-    """Exec task.py under a non-``__main__`` name with side effects neutralized.
-
-    Saves and restores cwd, sys.path, sys.argv, and SimpleOptimizer.run/status
-    in a try/finally so an unguarded task.py can't fire a real run or print
-    status at import time — and so we leave the process exactly as we found it,
-    even if the import raises or calls ``sys.exit``.
-    """
     saved_cwd = os.getcwd()
-    saved_argv = sys.argv
-    saved_run = SimpleOptimizer.run
-    saved_status = SimpleOptimizer.status
-    inserted_path = str(run_dir)
+    inserted = str(resolved_run_dir)
     mod_name = f"groundhog_runtask_{next(_LOAD_COUNTER)}"
-
     try:
-        os.chdir(run_dir)
-        sys.path.insert(0, inserted_path)
-        sys.argv = ["task.py"]
-        SimpleOptimizer.run = lambda self, *a, **k: None
-        SimpleOptimizer.status = lambda self, *a, **k: None
+        os.chdir(resolved_run_dir)
+        sys.path.insert(0, inserted)
 
         spec = importlib.util.spec_from_file_location(mod_name, str(task_py))
         if spec is None or spec.loader is None:
             raise ImportError(f"Could not load a module spec from {task_py}")
         module = importlib.util.module_from_spec(spec)
-        # Register temporarily so dataclasses / pickling inside task.py resolve,
-        # but always remove it afterward — we don't want it lingering globally.
         sys.modules[mod_name] = module
         try:
             spec.loader.exec_module(module)
-        except SystemExit:
-            # An unguarded task.py that calls sys.exit() (e.g. `raise SystemExit`
-            # on an unknown backend arg) still gives us a usable module object —
-            # whatever was defined before the exit is on it.
-            pass
+
+            hook = getattr(module, "build_toolkit", None)
+            if not callable(hook):
+                raise RuntimeError(
+                    f"{task_py} does not define `def build_toolkit() -> Toolkit` — "
+                    f"the run-dir contract. Define it beside your task:\n"
+                    f"    def build_toolkit():\n"
+                    f"        tk = assemble_toolkit(task, ...)\n"
+                    f"        tk.llm = auto_registry()\n"
+                    f"        return tk"
+                )
+            toolkit = hook()
+            if not isinstance(toolkit, Toolkit):
+                raise RuntimeError(
+                    f"{task_py}: build_toolkit() returned {type(toolkit).__name__}, "
+                    f"expected a Toolkit (return the result of assemble_toolkit)."
+                )
         finally:
             sys.modules.pop(mod_name, None)
-        return module
     finally:
         os.chdir(saved_cwd)
         try:
-            sys.path.remove(inserted_path)
+            sys.path.remove(inserted)
         except ValueError:
             pass
-        sys.argv = saved_argv
-        SimpleOptimizer.run = saved_run
-        SimpleOptimizer.status = saved_status
 
-
-def _find_optimizer(module) -> Optional[SimpleOptimizer]:
-    """First SimpleOptimizer instance in the module's globals, or None."""
-    for value in vars(module).values():
-        if isinstance(value, SimpleOptimizer):
-            return value
-    return None
-
-
-def _find_task(module, optimizer: Optional[SimpleOptimizer]) -> Task:
-    """Resolve the task: optimizer.task, then a module-level Task instance,
-    then the first Task subclass instantiated no-arg (guarded)."""
-    if optimizer is not None and getattr(optimizer, "task", None) is not None:
-        return optimizer.task
-
-    # A module-level `task = Task(...)` instance.
-    for value in vars(module).values():
-        if isinstance(value, Task):
-            return value
-
-    # A Task SUBCLASS defined in the module — instantiate no-arg. Guard
-    # exceptions: e.g. MNISTTask downloads data on __init__.
-    for value in vars(module).values():
-        if isinstance(value, type) and issubclass(value, Task) and value is not Task:
-            try:
-                return value()
-            except Exception as e:  # noqa: BLE001 — surface a clear, actionable error
-                raise RuntimeError(
-                    f"Found Task subclass {value.__name__} but could not "
-                    f"instantiate it with no arguments: {e}. Define a "
-                    f"module-level `task = {value.__name__}(...)` in task.py "
-                    f"instead so the loader can use it directly."
-                ) from e
-
-    raise RuntimeError(
-        "No task found in task.py — define a module-level `task = Task(...)`, "
-        "a Task subclass, or an `optimizer = SimpleOptimizer(task, ...)`."
+    return LoadedRun(
+        task=toolkit.task,
+        toolkit=toolkit,
+        history=toolkit.history,
+        module=module,
+        run_dir=resolved_run_dir,
     )
