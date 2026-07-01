@@ -1,23 +1,19 @@
 """Simple optimizer: weighted strategy rotation, potential-based prior selection."""
 
-import random
 from itertools import cycle
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+from groundhog.assemble import assemble_toolkit
 from groundhog.base.types import Task
 from groundhog.base.strategy import Strategy
 from groundhog.base.optimizer import Optimizer
 from groundhog.base.attempt_history import AttemptHistory
 from groundhog.histories.folder import FolderAttemptHistory
-from groundhog.base.toolkit import Toolkit
 from groundhog.base.learnings import Learnings
 from groundhog.learnings.markdown import MarkdownLearnings
-from groundhog.tools.attempt_log import AttemptLog
-from groundhog.tools.attempt_logger import MarkdownAttemptLogger
-from groundhog.tools.log import StrategyLog
 from groundhog.tools.queue import read_next as read_queue
-from groundhog.utils.selection import select_prior
+from groundhog.utils.selection import SelectionPolicy, scorer_for
 
 
 class SimpleOptimizer(Optimizer):
@@ -45,9 +41,9 @@ class SimpleOptimizer(Optimizer):
                  through: Optional[str] = None,
                  agent_through: Optional[str] = None,
                  seed_strategy="default",
-                 direction_weight: float = 0.5,
-                 direction_decay: float = 0.1,
-                 exclude_non_promotable: bool = True,
+                 direction_weight: Optional[float] = None,
+                 direction_decay: Optional[float] = None,
+                 exclude_non_promotable: Optional[bool] = None,
                  direction_bonus: Optional[float] = None,
                  skip_non_promotable: Optional[bool] = None):
         """Configure the optimizer.
@@ -57,6 +53,10 @@ class SimpleOptimizer(Optimizer):
         like ``Analyse`` or queue-only ``FreshApproach`` invocations. Rotation
         wins on name collision; a warning is logged for any extra whose name
         is already taken.
+
+        Selection tuning (``direction_weight`` / ``direction_decay`` /
+        ``exclude_non_promotable``) is data: it becomes the toolkit's
+        ``SelectionPolicy``. Left unset, the policy defaults rule.
         """
         from groundhog.strategies.fresh import FreshApproach
         self.task = task
@@ -67,9 +67,17 @@ class SimpleOptimizer(Optimizer):
             direction_weight = direction_bonus
         if skip_non_promotable is not None:
             exclude_non_promotable = skip_non_promotable
-        self.direction_weight = direction_weight
-        self.direction_decay = direction_decay
-        self.exclude_non_promotable = exclude_non_promotable
+        # Resolve tuning into a SelectionPolicy: only explicitly-passed values
+        # deviate from the policy defaults.
+        _defaults = SelectionPolicy()
+        selection = SelectionPolicy(
+            direction_weight=direction_weight if direction_weight is not None else _defaults.direction_weight,
+            direction_decay=direction_decay if direction_decay is not None else _defaults.direction_decay,
+            exclude_non_promotable=exclude_non_promotable if exclude_non_promotable is not None else _defaults.exclude_non_promotable,
+        )
+        self.direction_weight = selection.direction_weight
+        self.direction_decay = selection.direction_decay
+        self.exclude_non_promotable = selection.exclude_non_promotable
         self.path = Path(path) if path else Path(".")
         self.history = history or FolderAttemptHistory(self.path)
         self.learnings = learnings or MarkdownLearnings(self.path)
@@ -94,47 +102,19 @@ class SimpleOptimizer(Optimizer):
         for s in (extras or []):
             self._register_strategy(s, allow_overwrite=False)
 
-        # Build toolkit
-        self.toolkit = Toolkit(task=self.task, history=self.history, path=self.path)
-        self.toolkit.learnings = self.learnings
-        self.toolkit.log = StrategyLog()
-        # Per-attempt event stream: strategies emit events through
-        # attempt_logger, which fans out to attemptlog.jsonl/.md and the
-        # live console renderer (AttemptLog — auto-disables ANSI/heartbeat
-        # on non-TTY so CI logs stay clean).
-        console = AttemptLog()
-        self.toolkit.attempt_log = console
-        self.toolkit.attempt_logger = MarkdownAttemptLogger(console=console)
-        if self.through:
-            self.toolkit.through = self.through
-
-        # Agent backends (optional — strategies check hasattr)
-        from groundhog.backends.discover import auto_agent_registry
-        agent_registry = auto_agent_registry()
-        if agent_registry:
-            self.toolkit.agent = agent_registry
-
-        # Default agent tools from toolkit capabilities.
-        # agent_through limits which eval stages the agent gets as tools
-        # (e.g. "validate" for fast iteration), independent of `through`
-        # which controls final scoring.
-        if self.agent_through:
-            self.toolkit.agent_through = self.agent_through
-        from groundhog.agents.tools import build_default_agent_tools
-        self.toolkit.agent_tools = build_default_agent_tools(self.toolkit)
-
-        # Seed rng and install default prior selector. Set here (not in run())
-        # so users can override before calling .run(). Anything the user can
-        # customise belongs on the toolkit at construction time.
-        self.toolkit.rng = random.Random(self.seed)
-        scorer = self._get_scorer()
-        self.toolkit.get_prior = lambda tk: select_prior(
-            tk.history,
-            scorer,
-            tk.rng,
-            direction_weight=self.direction_weight,
-            direction_decay=self.direction_decay,
-            exclude_non_promotable=self.exclude_non_promotable,
+        # The toolkit is assembled by the factory — one build path for every
+        # consumer. The optimizer's selection tuning travels as DATA
+        # (SelectionPolicy) that the toolkit's standing get_prior reads; the
+        # optimizer never rewrites toolkit functions.
+        self.toolkit = assemble_toolkit(
+            self.task,
+            history=self.history,
+            learnings=self.learnings,
+            path=self.path,
+            through=self.through,
+            agent_through=self.agent_through,
+            seed=self.seed,
+            selection=selection,
         )
 
     def _register_strategy(self, strategy: Strategy, allow_overwrite: bool = True) -> None:
@@ -162,8 +142,7 @@ class SimpleOptimizer(Optimizer):
             self._strategy_registry[name] = strategy
 
     def _get_scorer(self):
-        stages = self.task.evaluator.eval_stages(self.task.data, through=self.through)
-        return stages[-1].score
+        return scorer_for(self.task, self.through)
 
     def _print_header(self):
         stages = self.task.evaluator.eval_stages(self.task.data, through=self.through)
