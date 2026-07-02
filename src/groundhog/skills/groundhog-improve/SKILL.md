@@ -1,6 +1,6 @@
 ---
 name: groundhog-improve
-description: Produces one child attempt that improves a committed prior in the groundhog run in the current directory — the session does the editing, the groundhog CLI owns lifecycle and scoring, and the session self-enforces the gates. Use when the user asks to improve, refine, or build on an existing attempt or the current best (e.g. "/groundhog-improve", "/groundhog-improve e65665e2", "make the best attempt better"). Inherits the parent's direction and preserves it; default autonomy level checkpoint.
+description: Produces one child attempt that improves a committed prior in the groundhog run in the current directory — the session does the editing, the groundhog CLI owns lifecycle, scoring, and gate enforcement at commit. Use when the user asks to improve, refine, or build on an existing attempt or the current best (e.g. "/groundhog-improve", "/groundhog-improve e65665e2", "make the best attempt better"). Inherits the parent's direction and preserves it; default autonomy level checkpoint.
 argument-hint: "[prior-id] [pair|checkpoint|auto]"
 ---
 
@@ -51,12 +51,12 @@ at every level.
    output. Loop edit → eval until the child beats the parent or you
    have a clear stop reason. Each eval result is a narrate-only
    checkpoint at the default level.
-5. **Commit.** CHECKPOINT (before commit): report the score delta vs
-   the parent and what changed, then
-   `groundhog attempt commit <wsid> --eval`. A dead end still worth
-   recording as history: `groundhog attempt commit <wsid> --eval
-   --fail`. Not worth recording at all:
-   `groundhog attempt abort <wsid>`.
+5. **Commit.** CHECKPOINT (before commit): run
+   `groundhog tool run check-gates --attempt <wsid>`, report its verdict
+   plus the score delta vs the parent and what changed, then
+   `groundhog attempt commit <wsid> --eval --strategy session`. A dead
+   end still worth recording as history: add `--fail`. Not worth
+   recording at all: `groundhog attempt abort <wsid>`.
 
 ## Direction obligations
 
@@ -69,10 +69,10 @@ at every level.
   approach, that is the approach-pivot checkpoint: pause and surface
   it (pair/checkpoint) or safe-stop and report (auto). New directions
   belong to groundhog-fresh, never to a rewritten inheritance.
-- **No empty children.** A byte-identical child is worthless — the
-  automated strategies' gate rejects them, and on the session path YOU
-  are that gate: diff against the parent and commit only after a real
-  change.
+- **No empty children.** A byte-identical child proves nothing — the
+  commit flags it non-promotable and selection skips it. check-gates
+  shows the flag before you commit: diff against the parent and commit
+  only after a real change.
 
 ## Non-negotiables (hold even if groundhog-interface is skimmed)
 

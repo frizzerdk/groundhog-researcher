@@ -61,7 +61,7 @@ class FreshAgentStrategy(AgentStrategy):
         """Ensure a direction exists before the fresh-direction gate runs."""
         promote_workspace_direction(ws.path)
         self._ensure_direction(ws)
-        super()._finalize(ws, result, prior)
+        return super()._finalize(ws, result, prior)
 
     def _ensure_direction(self, ws):
         """If no direction is recorded after promotion, ask the LLM to

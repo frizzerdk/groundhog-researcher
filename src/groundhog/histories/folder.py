@@ -234,8 +234,12 @@ class FolderAttemptHistory(AttemptHistory):
         return attempts
 
     def get(self, id: str) -> Optional[FolderAttempt]:
-        for attempt in self.list():
-            if attempt.id == id:
+        # Resolve any COMMITTED attempt — failed ones included (a child's
+        # recorded parent may be failed; treating it as missing would
+        # misclassify the child as fresh). Open workspaces stay invisible,
+        # matching the git backend, which rev-parses any commit.
+        for attempt in self.list(only_done=False):
+            if attempt.id == id and attempt.path.name.endswith(("_done", "_fail")):
                 return attempt
         return None
 
@@ -275,11 +279,18 @@ class FolderAttemptHistory(AttemptHistory):
             return None
 
         def score_attempt(attempt):
-            result = attempt.result
+            # A done attempt may carry no result.json (committed without
+            # --eval) — unscored, never a crash for everyone else.
+            try:
+                result = attempt.result
+            except (OSError, ValueError):
+                return -1.0
             if not result.completed:
                 return -1.0
-            last_stage = list(result.stages.values())[-1]
-            return scorer(last_stage)
+            stages = list(result.stages.values())
+            if not stages:
+                return -1.0
+            return scorer(stages[-1])
 
         return max(attempts, key=score_attempt)
 

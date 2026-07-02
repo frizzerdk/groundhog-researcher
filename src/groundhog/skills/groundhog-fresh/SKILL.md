@@ -40,32 +40,39 @@ at every level.
    approach, why it could score well, and why no existing family covers
    it. Direction-chosen checkpoint: present the candidates, the user
    picks. At auto level, pick the strongest yourself and log why.
-3. **Open a workspace:** `groundhog attempt new --no-seed`. The parent
-   defaults to the current best; `--no-seed` keeps its files — including
-   its `core_direction.md` — out of your workspace.
+3. **Open a workspace:** `groundhog attempt new --fresh`. A fresh
+   attempt has NO parent — that is what makes the commit run the
+   fresh-direction gates; the direction file you write founds the new
+   family. (`--no-seed` alone is not fresh: the parent still defaults to
+   the current best, and the commit would restore that parent's
+   direction over yours.)
 4. **Write `core_direction.md` first.** First line = the approach name
    itself (no "Core Direction" heading or label); it becomes the display
    name and folder slug. Then build `solution.py`; scratch goes in
    `work/`.
 5. **Evaluate as you iterate:** `groundhog eval <ws-dir>`. Scores come
    only from eval — never hand-write results.
-6. **Before-commit checkpoint:** report the direction, the score, and
-   what you tried; recommend commit — a recorded failed family is
-   information; abort (`groundhog attempt abort <wsid>`) only for
-   unusable scraps. Then `groundhog attempt commit <wsid> --eval`.
+6. **Before-commit checkpoint:** run
+   `groundhog tool run check-gates --attempt <wsid>` and report its
+   verdict along with the direction, the score, and what you tried;
+   recommend commit — a recorded failed family is information; abort
+   (`groundhog attempt abort <wsid>`) only for unusable scraps. Then
+   `groundhog attempt commit <wsid> --eval --strategy session`.
 
 ## Uniqueness obligation
 
 **The direction must be unique vs every existing family** (family
 identity = the normalized file content) and `core_direction.md` must
-exist. The automated strategies enforce this in code; **on the session
-path YOU are the gate** — before committing, re-check the family map
-(`groundhog attempt list` + read the leaders' directions) and confirm:
-direction file present, first-line convention followed, genuinely new
-family, solution not byte-identical to any attempt. If your work
-drifted into an existing family mid-build, that is an approach-pivot
-checkpoint — surface it and re-aim; never reword the direction
-cosmetically to make it look distinct.
+exist. The commit enforces this — a violating attempt commits as FAILED,
+recorded with the violation — and **check-gates is your button**: press
+it mid-work to see what the commit would decide, while there is still
+time to fix it. Semantic near-duplicates are still your judgment call:
+the gate compares normalized text, so re-check the family map
+(`groundhog attempt list` + read the leaders' directions) and confirm
+your idea is a genuinely new family, not the same algorithm reworded.
+If your work drifted into an existing family mid-build, that is an
+approach-pivot checkpoint — surface it and re-aim; never reword the
+direction cosmetically to make it look distinct.
 
 ## Out of scope
 

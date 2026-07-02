@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
+SKILLS_DIR = Path(__file__).parent / "skills"
 
 TEMPLATES = {
     "init": {
@@ -44,7 +45,9 @@ def init(template_name, target_dir=None, script_only=False):
     template = TEMPLATES[template_name]
     target = Path(target_dir) if target_dir else Path("my_task")
 
-    if target.exists() and any(target.iterdir()):
+    # A lone .claude/ (e.g. from an earlier `groundhog skills install`)
+    # doesn't count as content worth protecting from scaffolding.
+    if target.exists() and any(p.name != ".claude" for p in target.iterdir()):
         print(f"Directory '{target}' already exists and is not empty.")
         return 1
 
@@ -86,6 +89,10 @@ def init(template_name, target_dir=None, script_only=False):
     if template.get("env"):
         (target / ".env").write_text("# Add API keys here (optional - auto_registry finds CLI tools automatically)\n# ANTHROPIC_API_KEY=\n# OPENAI_API_KEY=\n# GEMINI_API_KEY=\n", encoding="utf-8")
 
+    # Skills travel with the package: every run dir gets the interactive-
+    # session skills so `/groundhog-fresh` etc. work out of the box.
+    install_skills(target, quiet=True)
+
     mode = "script" if script_only else "project"
     print(f"Created {mode} in {target}/")
     print(f"  {template['description']}")
@@ -97,6 +104,56 @@ def init(template_name, target_dir=None, script_only=False):
     print("  # edit task.py with your task logic")
     print("  uv run task.py 10")
     return 0
+
+
+def install_skills(target_dir=None, quiet=False) -> int:
+    """Copy the packaged groundhog skills into ``<target>/.claude/skills/``.
+
+    Idempotent and safe to re-run after upgrading groundhog — each
+    groundhog skill dir is overwritten with the packaged version. Only
+    the packaged skill names are touched: non-groundhog skills already
+    in the folder are never modified or removed.
+    """
+    target = Path(target_dir) if target_dir else Path.cwd()
+    if not SKILLS_DIR.exists():
+        print(f"No packaged skills found at {SKILLS_DIR} (broken install?)")
+        return 1
+    names = sorted(p.name for p in SKILLS_DIR.iterdir() if p.is_dir())
+    if not names:
+        print(f"No packaged skills found at {SKILLS_DIR} (broken install?)")
+        return 1
+    dest_root = target / ".claude" / "skills"
+    dest_root.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        # Replace, don't merge: a file the packaged skill dropped must not
+        # survive a re-install as a stale leftover.
+        dest = dest_root / name
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(SKILLS_DIR / name, dest)
+    if not quiet:
+        print(f"Installed {len(names)} groundhog skills into {dest_root}")
+        for name in names:
+            print(f"  {name}")
+        print("Invoke them in a Claude Code session opened in the run dir, "
+              "e.g. /groundhog-fresh")
+    return 0
+
+
+def skills_group(args) -> int:
+    """`groundhog skills <subcommand>` — currently just `install`."""
+    if not args or args[0] in ("-h", "--help"):
+        print("Usage:")
+        print("  groundhog skills install [directory]   "
+              "Copy the packaged skills into <dir>/.claude/skills/")
+        print()
+        print("Idempotent: re-run after upgrading groundhog to refresh them. "
+              "Every `groundhog init*` also installs them.")
+        return 0
+    if args[0] == "install":
+        return install_skills(args[1] if len(args) > 1 else None)
+    print(f"Unknown skills subcommand: {args[0]!r}. Try: groundhog skills --help")
+    return 1
 
 
 def _backend_source(name, backend):
@@ -404,7 +461,9 @@ def attempt_group(args):
     usage = (
         "Usage: groundhog attempt <subcommand>\n"
         "\n"
-        "  new [--parent ID] [--no-seed] [--name NAME]   Open a workspace\n"
+        "  new [--fresh] [--parent ID] [--no-seed] [--name NAME]\n"
+        "                                Open a workspace (--fresh: parentless,\n"
+        "                                founds a new family; default parent = best)\n"
         "  list [--all]                                  List attempts (--all incl. failed)\n"
         "  show <id> [--file F]                          Show an attempt (or one file)\n"
         "  in-progress                                   List open workspaces\n"
@@ -458,6 +517,7 @@ def _opt(args, name):
 
 def _attempt_new(args):
     no_seed, args = _flag(args, "--no-seed")
+    fresh, args = _flag(args, "--fresh")
     parent, args = _opt(args, "--parent")
     name, args = _opt(args, "--name")
 
@@ -466,9 +526,19 @@ def _attempt_new(args):
         return 1
     history, task = run.history, run.task
 
+    # --fresh opens a PARENTLESS workspace — how a new family is founded,
+    # matching the automated fresh strategy (prior=None). This is what makes
+    # the commit-time gates classify it as fresh: the gated finish decides
+    # fresh-vs-child by the parent pointer, and a defaulted best-parent
+    # would silently restore the parent's direction over the new one.
+    # (--parent none is the legacy spelling of the same thing.)
+    if parent == "none":
+        fresh = True
+        parent = None
+
     try:
         # Default parent = current best, if any attempts exist.
-        if parent is None:
+        if parent is None and not fresh:
             scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
             best = history.best(scorer)
             parent = best.id if best else None
@@ -490,6 +560,9 @@ def _attempt_new(args):
         print(f"  path:   {ws.path}")
         if parent is not None:
             print(f"  parent: {parent}")
+        if fresh:
+            print("  fresh:  no parent — write core_direction.md (first line = "
+                  "approach name) before committing")
         print(f"  edit solution.py, then: groundhog attempt commit {ws.display_id} --eval")
         return 0
     except Exception as e:  # noqa: BLE001
@@ -618,8 +691,13 @@ def _attempt_commit(args):
     do_fail, args = _flag(args, "--fail")
     do_eval, args = _flag(args, "--eval")
     through, args = _opt(args, "--through")
-    if not args:
-        print("Usage: groundhog attempt commit <wsid> [--fail] [--eval] [--through STAGE]")
+    strategy, args = _opt(args, "--strategy")
+    strategy = strategy or "manual"
+    # A dangling option (e.g. `--strategy` with no value) or an unknown flag
+    # must not silently commit mislabeled work.
+    if not args or any(a.startswith("--") for a in args) or len(args) > 1:
+        print("Usage: groundhog attempt commit <wsid> [--fail] [--eval] "
+              "[--through STAGE] [--strategy LABEL]")
         return 1
     wsid = args[0]
 
@@ -636,32 +714,88 @@ def _attempt_commit(args):
 
     through = through or getattr(toolkit, "through", None)
     scorer = _scorer_for(task, through=through)
+    parent_id = getattr(ws, "parent", None)
+    prior = history.get(parent_id) if parent_id else None
 
     try:
         if do_eval:
-            from groundhog.utils.results import write_result
+            # The standard finish: evaluate, then gates -> record -> commit
+            # -> score note, exactly as the automated strategies finish.
+            from groundhog.utils.finalize import finalize_attempt
 
             result = task.evaluate(ws.path, through=through)
-            write_result(ws.path, result, metadata={"strategy": "manual", "cost": 0.0})
             print("Evaluation:")
             _print_stage_scores(result, scorer)
-            success = result.completed and not do_fail
+            if do_fail:
+                # The user's verdict: record real work as failed. Shape it
+                # like every other failed record (a failed stage with the
+                # reason), not a bare completed=false.
+                from groundhog.utils.direction import mark_result_failed
+                mark_result_failed(result, "manual",
+                                   "committed as failed by --fail")
+            attempt = finalize_attempt(
+                toolkit, ws, result, prior, strategy=strategy
+            )
+            _print_gate_outcome(attempt.metadata)
         else:
+            # No evaluation of record — but the gates and the producer
+            # metadata apply to every commit. Composed from the same public
+            # pieces the standard finish uses (result.json stays eval-only).
+            from groundhog.utils.direction import (
+                inherit_direction_from_attempt,
+                promote_workspace_direction,
+                workspace_name,
+            )
+            from groundhog.utils.gates import evaluate_gates
+            from groundhog.utils.results import write_metadata
+
+            if prior is None:
+                promote_workspace_direction(ws.path)
+            violations = evaluate_gates(
+                ws.path, prior, history=history, exclude=[ws.display_id]
+            )
+            metadata = {
+                "strategy": strategy,
+                "prior": prior.id if prior else None,
+                "cost": 0.0,
+            }
             success = not do_fail
+            for v in violations:
+                if v.severity == "fail":
+                    metadata["gate_failure"] = v.message
+                    success = False
+                elif v.gate == "direction-modified":
+                    metadata["direction_restored"] = True
+                elif v.gate == "solution-identical":
+                    metadata["non_promotable"] = True
+                    metadata["non_promotable_reason"] = v.message
+            if prior is not None:
+                inherit_direction_from_attempt(prior, ws.path)
+            write_metadata(ws.path, metadata)
+            if not ws.name:
+                derived = workspace_name(ws.path)
+                if derived:
+                    ws.name = derived
+            attempt = ws.commit(success=success)
+            _print_gate_outcome(metadata)
 
-        if not ws.name:
-            from groundhog.utils.direction import workspace_name
-            derived = workspace_name(ws.path)
-            if derived:
-                ws.name = derived
-
-        attempt = ws.commit(success=success)
-        verdict = "done" if success else "fail"
-        print(f"Committed attempt {attempt.id} ({verdict})")
+        print(f"Committed attempt {attempt.id} ({attempt.status})")
         return 0
     except Exception as e:  # noqa: BLE001
         print(f"Commit failed: {e}")
         return 1
+
+
+def _print_gate_outcome(metadata):
+    """Surface what the gates decided so the session user is never surprised."""
+    if metadata.get("gate_failure"):
+        print(f"Gate: {metadata['gate_failure']} -> committed as failed")
+    if metadata.get("non_promotable"):
+        print(f"Gate: {metadata.get('non_promotable_reason', 'non-promotable')} "
+              f"-> flagged non-promotable (commit stays done)")
+    if metadata.get("direction_restored"):
+        print("Gate: inherited core_direction.md was modified -> parent's "
+              "direction restored")
 
 
 def _attempt_abort(args):
@@ -882,6 +1016,7 @@ def main():
         print("  groundhog attempt <subcommand>    Manual attempt lifecycle (new/list/show/commit/...)")
         print("  groundhog eval <path-or-id>       Score a solution dir, .py file, or attempt")
         print("  groundhog tool list|run           Run any toolkit tool from the terminal")
+        print("  groundhog skills install [dir]    Install the session skills into a run dir")
         print()
         print("Options:")
         print("  --script    Script-only mode (no uv project, uses inline deps)")
@@ -914,6 +1049,8 @@ def main():
         sys.exit(cmd_eval(args[1:]))
     elif cmd == "tool":
         sys.exit(tool_group(args[1:]))
+    elif cmd == "skills":
+        sys.exit(skills_group(args[1:]))
     else:
         print(f"Unknown command: {cmd}")
         print("Try: groundhog --help")

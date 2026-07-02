@@ -42,8 +42,9 @@ waiting). The user can move the level in plain language at any time.
 3. **Pre-open K workspaces** (all before spawning anything):
    - improve angle: `groundhog attempt new --parent <id>`
      (seeds from the prior; direction is inherited)
-   - fresh angle: `groundhog attempt new --no-seed`
-     (empty workspace; the charter tells the subagent to create
+   - fresh angle: `groundhog attempt new --fresh`
+     (parentless empty workspace — commits through the fresh-direction
+     gates; the charter tells the subagent to create
      `core_direction.md`)
    Record each printed wsid and workspace path — the charters need
    them, and you commit by wsid later.
@@ -60,14 +61,15 @@ waiting). The user can move the level in plain language at any time.
 5. **Collect and commit — every workspace, no exceptions.**
    Read each report, then finalize:
    - subagent produced a solution:
-     `groundhog attempt commit <wsid> --eval`
+     `groundhog attempt commit <wsid> --eval --strategy session-swarm`
      (the eval at commit is the canonical score; done vs fail follows
      from whether it completes)
    - subagent crashed, went off-charter, or left nothing runnable:
-     `groundhog attempt commit <wsid> --fail`
+     `groundhog attempt commit <wsid> --fail --strategy session-swarm`
    - gotcha: if `commit ... --eval` errors out ("Commit failed"), the
      workspace is still open — fall back to
-     `groundhog attempt commit <wsid> --fail` so the loser is recorded.
+     `groundhog attempt commit <wsid> --fail --strategy session-swarm`
+     so the loser is recorded.
 
 6. **Distill learnings.** Append cross-attempt insights to the run's
    `learnings.md`, one entry per insight, entries separated by `---`

@@ -68,16 +68,18 @@ next one") and single-checkpoint nudges ("always ask before commits").
    - Improve: `groundhog attempt new --parent <id>` (bare
      `groundhog attempt new` seeds from the current best). Preserve
      the inherited `core_direction.md`.
-   - Fresh: `groundhog attempt new --no-seed`, then create
-     `core_direction.md` opening a genuinely NEW family — family
+   - Fresh: `groundhog attempt new --fresh` (parentless — this is
+     what routes the commit through the fresh-direction gates), then
+     create `core_direction.md` opening a genuinely NEW family — family
      identity is the normalized file content, so differ in substance,
-     not just the first line. (Lineage still records a parent; the direction file is
-     what opens the new family.)
+     not just the first line.
 4. **Work the attempt** per groundhog-interface. Check progress
    honestly with `groundhog eval <ws-dir>` (`--json` to parse,
    `--through STAGE` for partial pipelines).
-5. **Commit:** `groundhog attempt commit <wsid> --eval`. Commit weak
-   and failed attempts too — recorded history steers later selection.
+5. **Commit:** `groundhog attempt commit <wsid> --eval --strategy
+   session`. Commit weak and failed attempts too — recorded history
+   steers later selection. The gates run at commit; check-gates
+   (`groundhog tool run check-gates --attempt <wsid>`) previews them.
    Abort (`groundhog attempt abort <wsid>`) only workspaces with
    nothing worth recording.
 6. **Log and check stop rules.** Append one row to your iteration log

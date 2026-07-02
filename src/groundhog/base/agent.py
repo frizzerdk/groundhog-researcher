@@ -82,8 +82,9 @@ class AgentTool:
                 if self._toolkit is None:
                     raise RuntimeError(
                         f"tool {self.name!r} takes a `toolkit` parameter but "
-                        f"none is bound — register it through the task.py "
-                        f"agent_tools hook so assemble_toolkit binds it"
+                        f"none is bound — task tools are bound by the task.py "
+                        f"agent_tools hook; framework defaults must bind "
+                        f"themselves in build_default_agent_tools"
                     )
                 result = self._func(self._toolkit, **coerced)
             else:
