@@ -56,10 +56,9 @@ from groundhog.base.types import EvaluationResult, StageResult
 from groundhog.base.attempt_history import (
     Attempt, Workspace, AttemptHistory, InProgress)
 from groundhog.utils.results import read_result, write_metadata, read_attempt_metadata
-
-_NOTE_KEY = re.compile(r"^[a-z0-9_-]{1,64}$")
 from groundhog.utils.direction import slugify
 
+_NOTE_KEY = re.compile(r"^[a-z0-9_-]{1,64}$")
 
 _IDENTITY_NAME = "Groundhog"
 _IDENTITY_EMAIL = "groundhog@localhost"
