@@ -149,3 +149,28 @@ def test_committed_attempt_view_does_not_duplicate_itself():
             res = tool.execute()
         assert res.success, res.error
         assert "All gates pass" in res.output
+
+
+def test_committed_founder_with_descendants_reports_no_false_duplicate():
+    """A committed fresh attempt whose children inherited its direction must
+    not be reported as duplicating its own family."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tk = _tk(tmp)
+        tool = _tool(tk)
+
+        founder_ws = tk.history.workspace()
+        (founder_ws.path / "solution.py").write_text("print(1)", encoding="utf-8")
+        write_direction(founder_ws.path, "rollout beam search")
+        founder = finalize_attempt(tk, founder_ws, _ok_result(), None)
+
+        child_ws = tk.history.workspace(parent=founder.id)
+        (child_ws.path / "solution.py").write_text("print(2)", encoding="utf-8")
+        write_direction(child_ws.path, "rollout beam search")
+        finalize_attempt(tk, child_ws, _ok_result(), founder)
+
+        with tk.ws.attempt(founder.id):
+            res = tool.execute()
+        assert res.success, res.error
+        assert "direction-duplicate" not in res.output
+        assert "All gates pass" in res.output
+        assert "duplicate-direction gate is skipped" in res.output

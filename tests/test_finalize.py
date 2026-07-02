@@ -224,3 +224,33 @@ def test_bench_binding_runs_the_same_finish():
         attempt = tk.finalize(ws, _ok_result(), strategy="session")
         assert attempt.status == "done"
         assert attempt.metadata["strategy"] == "session"
+
+
+def test_scorer_exception_never_fails_a_finished_attempt():
+    """The score note runs AFTER the commit and calls user scorer code —
+    any exception it raises must be swallowed, or the strategy's except
+    path would abort (delete) the attempt that just committed."""
+
+    class _BoomEval(_Eval):
+        def get_stages(self, data):
+            return [
+                EvalStage(
+                    "eval",
+                    "eval",
+                    lambda cp: StageResult(),
+                    scorer=lambda r: 1 / 0,  # user code: ZeroDivisionError
+                )
+            ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        task = Task(data=_Data(), context=_Ctx(), evaluator=_BoomEval(), name="t")
+        tk = SimpleNamespace(task=task, history=history)
+        ws = tk.history.workspace()
+        (ws.path / "solution.py").write_text("print(1)", encoding="utf-8")
+        write_direction(ws.path, "rollout")
+
+        attempt = finalize_attempt(tk, ws, _ok_result(0.5), None)
+        assert attempt.status == "done"
+        # Note skipped, attempt intact.
+        assert tk.history.get_note(attempt, "score") is None

@@ -130,7 +130,12 @@ def _cache_score_note(toolkit, history, attempt, result) -> None:
         # history.get(), which only sees done attempts — a failed attempt's
         # note would silently vanish (folder backend).
         history.set_note(attempt, "score", value)
-    except (NotImplementedError, KeyError, ValueError, OSError):
+    except Exception:  # noqa: BLE001
+        # Broad on purpose: this runs AFTER the commit, and the scorer is
+        # user code (arbitrary exceptions) while git note writes can hit
+        # ref-lock contention (GitError). An escape here would bubble into
+        # the strategy's except-path, which aborts the workspace — deleting
+        # the attempt that just committed.
         pass
 
 

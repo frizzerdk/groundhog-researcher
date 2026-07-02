@@ -155,12 +155,22 @@ def check_gates(toolkit) -> str:
     ws = handle.current
     history = getattr(toolkit, "history", None)
     parent, parent_known = _resolve_parent(ws, history)
+    committed = getattr(ws, "attempt", None) is not None
 
     lines = []
     if not parent_known:
         lines.append(
             "note: this workspace's parent could not be determined — "
             "checking it as a FRESH attempt (direction gates apply)."
+        )
+    if committed:
+        # A committed record already founded (or joined) its family — its
+        # descendants share its direction, so re-running the duplicate
+        # check against today's store would report the family it created
+        # as a violation.
+        lines.append(
+            "note: committed record — the duplicate-direction gate is "
+            "skipped (its family already exists in the store)."
         )
 
     # Exclude the attempt itself from the duplicate check under every
@@ -176,7 +186,7 @@ def check_gates(toolkit) -> str:
     violations = evaluate_gates(
         handle.path,
         parent,
-        history=history,
+        history=None if committed else history,
         exclude=self_ids,
     )
     if not violations:

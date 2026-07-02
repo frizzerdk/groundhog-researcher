@@ -45,7 +45,9 @@ def init(template_name, target_dir=None, script_only=False):
     template = TEMPLATES[template_name]
     target = Path(target_dir) if target_dir else Path("my_task")
 
-    if target.exists() and any(target.iterdir()):
+    # A lone .claude/ (e.g. from an earlier `groundhog skills install`)
+    # doesn't count as content worth protecting from scaffolding.
+    if target.exists() and any(p.name != ".claude" for p in target.iterdir()):
         print(f"Directory '{target}' already exists and is not empty.")
         return 1
 
@@ -123,7 +125,12 @@ def install_skills(target_dir=None, quiet=False) -> int:
     dest_root = target / ".claude" / "skills"
     dest_root.mkdir(parents=True, exist_ok=True)
     for name in names:
-        shutil.copytree(SKILLS_DIR / name, dest_root / name, dirs_exist_ok=True)
+        # Replace, don't merge: a file the packaged skill dropped must not
+        # survive a re-install as a stale leftover.
+        dest = dest_root / name
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(SKILLS_DIR / name, dest)
     if not quiet:
         print(f"Installed {len(names)} groundhog skills into {dest_root}")
         for name in names:
@@ -454,7 +461,9 @@ def attempt_group(args):
     usage = (
         "Usage: groundhog attempt <subcommand>\n"
         "\n"
-        "  new [--parent ID] [--no-seed] [--name NAME]   Open a workspace\n"
+        "  new [--fresh] [--parent ID] [--no-seed] [--name NAME]\n"
+        "                                Open a workspace (--fresh: parentless,\n"
+        "                                founds a new family; default parent = best)\n"
         "  list [--all]                                  List attempts (--all incl. failed)\n"
         "  show <id> [--file F]                          Show an attempt (or one file)\n"
         "  in-progress                                   List open workspaces\n"
@@ -508,6 +517,7 @@ def _opt(args, name):
 
 def _attempt_new(args):
     no_seed, args = _flag(args, "--no-seed")
+    fresh, args = _flag(args, "--fresh")
     parent, args = _opt(args, "--parent")
     name, args = _opt(args, "--name")
 
@@ -516,9 +526,19 @@ def _attempt_new(args):
         return 1
     history, task = run.history, run.task
 
+    # --fresh opens a PARENTLESS workspace — how a new family is founded,
+    # matching the automated fresh strategy (prior=None). This is what makes
+    # the commit-time gates classify it as fresh: the gated finish decides
+    # fresh-vs-child by the parent pointer, and a defaulted best-parent
+    # would silently restore the parent's direction over the new one.
+    # (--parent none is the legacy spelling of the same thing.)
+    if parent == "none":
+        fresh = True
+        parent = None
+
     try:
         # Default parent = current best, if any attempts exist.
-        if parent is None:
+        if parent is None and not fresh:
             scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
             best = history.best(scorer)
             parent = best.id if best else None
@@ -540,6 +560,9 @@ def _attempt_new(args):
         print(f"  path:   {ws.path}")
         if parent is not None:
             print(f"  parent: {parent}")
+        if fresh:
+            print("  fresh:  no parent — write core_direction.md (first line = "
+                  "approach name) before committing")
         print(f"  edit solution.py, then: groundhog attempt commit {ws.display_id} --eval")
         return 0
     except Exception as e:  # noqa: BLE001
@@ -670,7 +693,9 @@ def _attempt_commit(args):
     through, args = _opt(args, "--through")
     strategy, args = _opt(args, "--strategy")
     strategy = strategy or "manual"
-    if not args:
+    # A dangling option (e.g. `--strategy` with no value) or an unknown flag
+    # must not silently commit mislabeled work.
+    if not args or any(a.startswith("--") for a in args) or len(args) > 1:
         print("Usage: groundhog attempt commit <wsid> [--fail] [--eval] "
               "[--through STAGE] [--strategy LABEL]")
         return 1
@@ -702,7 +727,12 @@ def _attempt_commit(args):
             print("Evaluation:")
             _print_stage_scores(result, scorer)
             if do_fail:
-                result.completed = False  # user's verdict: record real work as failed
+                # The user's verdict: record real work as failed. Shape it
+                # like every other failed record (a failed stage with the
+                # reason), not a bare completed=false.
+                from groundhog.utils.direction import mark_result_failed
+                mark_result_failed(result, "manual",
+                                   "committed as failed by --fail")
             attempt = finalize_attempt(
                 toolkit, ws, result, prior, strategy=strategy
             )

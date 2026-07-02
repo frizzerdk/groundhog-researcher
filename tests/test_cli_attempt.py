@@ -704,3 +704,150 @@ def test_commit_strategy_label_lands_in_metadata(tmp_path, capsys):
         capsys.readouterr()
         a2 = rundir.load_run(run_dir=run_dir).history.get("2")
         assert a2.metadata["strategy"] == "session-swarm"
+
+
+# --- review fixes: fresh flag, failed parents, best() robustness -------------
+
+def test_fresh_flag_founds_new_family_on_populated_store(tmp_path, capsys):
+    """THE fresh-session regression: on a store with a best attempt,
+    `new --fresh` must open parentless so the commit runs the fresh gates
+    and the new direction survives (never restored from a default parent)."""
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        # Founder family.
+        wsid, ws_path = _open_ws(run_dir, capsys)
+        (ws_path / "solution.py").write_text("def solve():\n    return 50.0\n",
+                                             encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
+        attempt_group(["commit", wsid, "--eval"])
+        capsys.readouterr()
+
+        # Fresh session attempt, the way the skill teaches it.
+        rc = attempt_group(["new", "--fresh"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "parent:" not in out
+        assert "fresh:" in out
+        wsid2 = [l for l in out.splitlines()
+                 if l.startswith("Opened workspace")][0].split()[-1]
+        loaded = rundir.load_run(run_dir=run_dir)
+        ws2 = [ip.path for ip in loaded.history.list_in_progress()
+               if ip.workspace_id == wsid2][0]
+        (ws2 / "solution.py").write_text("def solve():\n    return 49.5\n",
+                                         encoding="utf-8")
+        (ws2 / "core_direction.md").write_text(
+            "genetic programming search\n", encoding="utf-8")
+
+        rc = attempt_group(["commit", wsid2, "--eval", "--strategy", "session"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "(done)" in out
+        assert "Gate:" not in out  # no violation, no restore
+
+        attempt = rundir.load_run(run_dir=run_dir).history.get("2")
+        assert attempt.metadata.get("direction_restored") is None
+        assert attempt.metadata.get("gate_failure") is None
+        # The NEW direction survived and named the attempt.
+        assert attempt.name == "genetic-programming-search"
+
+
+def test_child_of_failed_parent_is_still_a_child(tmp_path, capsys):
+    """A failed parent must resolve (folder get() sees failed attempts now) —
+    its child is judged as a child, never gate-failed as a fresh duplicate."""
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        wsid, ws_path = _open_ws(run_dir, capsys)
+        (ws_path / "solution.py").write_text("def solve():\n    return 10.0\n",
+                                             encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
+        attempt_group(["commit", wsid, "--eval", "--fail"])
+        capsys.readouterr()
+
+        rc = attempt_group(["new", "--parent", "1"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "No such parent attempt" not in out
+        wsid2 = [l for l in out.splitlines()
+                 if l.startswith("Opened workspace")][0].split()[-1]
+        loaded = rundir.load_run(run_dir=run_dir)
+        ws2 = [ip.path for ip in loaded.history.list_in_progress()
+               if ip.workspace_id == wsid2][0]
+        (ws2 / "solution.py").write_text("def solve():\n    return 50.0\n",
+                                         encoding="utf-8")
+
+        rc = attempt_group(["commit", wsid2, "--eval"])
+        assert rc == 0
+        capsys.readouterr()
+        attempt = rundir.load_run(run_dir=run_dir).history.get("2")
+        assert attempt.status == "done"
+        assert attempt.metadata.get("gate_failure") is None
+        assert attempt.metadata["prior"] == "1"
+
+
+def test_no_eval_done_commit_does_not_poison_best(tmp_path, capsys):
+    """A done attempt without result.json must be unscored, not a crash —
+    `attempt best` and `attempt new` keep working."""
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        wsid, ws_path = _open_ws(run_dir, capsys)
+        (ws_path / "solution.py").write_text("def solve():\n    return 1.0\n",
+                                             encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
+        attempt_group(["commit", wsid])  # done, no result.json
+        capsys.readouterr()
+
+        assert attempt_group(["best"]) == 0
+        capsys.readouterr()
+        assert attempt_group(["new"]) == 0
+
+
+def test_commit_dangling_strategy_flag_is_a_usage_error(tmp_path, capsys):
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        wsid, ws_path = _open_ws(run_dir, capsys)
+        rc = attempt_group(["commit", wsid, "--strategy"])
+        assert rc == 1
+        assert "Usage:" in capsys.readouterr().out
+        # Workspace untouched — still open.
+        loaded = rundir.load_run(run_dir=run_dir)
+        assert any(ip.workspace_id == wsid
+                   for ip in loaded.history.list_in_progress())
+
+
+def test_eval_fail_records_shaped_failure(tmp_path, capsys):
+    """--eval --fail writes a properly shaped failed record (failed_stage
+    'manual' with the reason), not a bare completed=false."""
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        wsid, ws_path = _open_ws(run_dir, capsys)
+        (ws_path / "solution.py").write_text("def solve():\n    return 50.0\n",
+                                             encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
+        rc = attempt_group(["commit", wsid, "--eval", "--fail"])
+        assert rc == 0
+        capsys.readouterr()
+        attempt = rundir.load_run(run_dir=run_dir).history.list(
+            only_done=False)[0]
+        result = attempt.result
+        assert result.completed is False
+        assert result.failed_stage == "manual"
+
+
+def test_folder_get_resolves_failed_attempts(tmp_path, capsys):
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        wsid, ws_path = _open_ws(run_dir, capsys)
+        (ws_path / "solution.py").write_text("def solve():\n    return 1.0\n",
+                                             encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
+        attempt_group(["commit", wsid, "--eval", "--fail"])
+        capsys.readouterr()
+        history = rundir.load_run(run_dir=run_dir).history
+        failed = history.get("1")
+        assert failed is not None
+        assert failed.status == "fail"

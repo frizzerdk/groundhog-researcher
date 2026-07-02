@@ -42,8 +42,9 @@ waiting). The user can move the level in plain language at any time.
 3. **Pre-open K workspaces** (all before spawning anything):
    - improve angle: `groundhog attempt new --parent <id>`
      (seeds from the prior; direction is inherited)
-   - fresh angle: `groundhog attempt new --no-seed`
-     (empty workspace; the charter tells the subagent to create
+   - fresh angle: `groundhog attempt new --fresh`
+     (parentless empty workspace — commits through the fresh-direction
+     gates; the charter tells the subagent to create
      `core_direction.md`)
    Record each printed wsid and workspace path — the charters need
    them, and you commit by wsid later.

@@ -56,11 +56,14 @@ The complete surface for attempt work. No other flags exist — never
 invent one.
 
 ```
-groundhog attempt new [--parent ID] [--no-seed] [--name NAME]
+groundhog attempt new [--fresh] [--parent ID] [--no-seed] [--name NAME]
     Open a workspace; prints wsid + path. Default parent = current best
     (none when the store is empty). Seeding copies ONLY the parent's
     solution.py and core_direction.md; --no-seed copies nothing but the
-    parent pointer remains as lineage.
+    parent pointer remains — the commit still treats the attempt as that
+    parent's child. --fresh opens a PARENTLESS workspace: the way to
+    found a new family (the commit classifies fresh-vs-child by the
+    parent pointer).
 groundhog attempt commit <wsid> [--fail] [--eval] [--through STAGE] [--strategy LABEL]
     Finalize a workspace through the standard finish: the gates run,
     violations are recorded (a hard violation commits the attempt as
@@ -90,8 +93,8 @@ groundhog tool run <name> [--attempt ID] [-p k=v ...]   Invoke one.
 1. `groundhog attempt new ...` — record the printed wsid and path.
    - Improving a prior: default (seeded); solution.py and
      core_direction.md arrive from the parent.
-   - Fresh direction: add `--no-seed`, then create core_direction.md
-     yourself (see Direction) before committing.
+   - Fresh direction: use `--fresh` (parentless), then create
+     core_direction.md yourself (see Direction) before committing.
 2. Work in the printed path. `solution.py` is the deliverable; keep
    notes, experiments, and scratch under `work/`.
 3. Validate loop: `groundhog eval <ws-path>` after each meaningful
@@ -132,7 +135,9 @@ One default ships everywhere: **check-gates** — the mid-work self-check.
 `groundhog tool run check-gates --attempt <wsid>` reports exactly what
 the commit-time gate would find (direction missing/duplicate, modified
 inherited direction, solution identical to parent), so a failure
-surfaces while you can still fix it. Read-only; changes nothing.
+surfaces while you can still fix it. It never writes files — but note
+that pointing any command at a CRASHED workspace id resumes it (the
+heartbeat becomes this process's; normal when it's your own work).
 
 ## Direction — core_direction.md
 
@@ -185,6 +190,9 @@ live work.
   uncommitted files, so resume-then-commit loses nothing.
 - `attempt reap` aborts CRASHED workspaces past the TTL; it never
   touches live ones.
+- Liveness tracking (live/CRASHED, heartbeats) is a git-backend
+  feature. The folder backend records no heartbeats — treat its
+  in-progress list as advisory and reap only what you know is dead.
 
 ## Autonomy model (shared by all modes)
 

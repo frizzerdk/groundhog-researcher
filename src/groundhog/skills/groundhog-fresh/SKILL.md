@@ -40,9 +40,12 @@ at every level.
    approach, why it could score well, and why no existing family covers
    it. Direction-chosen checkpoint: present the candidates, the user
    picks. At auto level, pick the strongest yourself and log why.
-3. **Open a workspace:** `groundhog attempt new --no-seed`. The parent
-   defaults to the current best; `--no-seed` keeps its files — including
-   its `core_direction.md` — out of your workspace.
+3. **Open a workspace:** `groundhog attempt new --fresh`. A fresh
+   attempt has NO parent — that is what makes the commit run the
+   fresh-direction gates; the direction file you write founds the new
+   family. (`--no-seed` alone is not fresh: the parent still defaults to
+   the current best, and the commit would restore that parent's
+   direction over yours.)
 4. **Write `core_direction.md` first.** First line = the approach name
    itself (no "Core Direction" heading or label); it becomes the display
    name and folder slug. Then build `solution.py`; scratch goes in

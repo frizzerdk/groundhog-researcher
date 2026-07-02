@@ -133,8 +133,18 @@ class GateKit:
     ) -> list[GateViolation]:
         ws_dir = getattr(ws, "path", ws)
         if exclude is None:
-            display_id = getattr(ws, "display_id", None)
-            exclude = [display_id] if display_id else []
+            # Every identity the target may carry in history: a live
+            # workspace's display id, and — when ws is a committed attempt
+            # or a read-only view of one — the record's own id
+            # (display_id is the NAME there, which the duplicate check,
+            # keyed on attempt ids, would ignore).
+            self_ids = {
+                getattr(ws, "display_id", None),
+                getattr(ws, "id", None),
+                getattr(getattr(ws, "attempt", None), "id", None),
+            }
+            self_ids.discard(None)
+            exclude = self_ids
         return evaluate_gates(
             ws_dir,
             parent,

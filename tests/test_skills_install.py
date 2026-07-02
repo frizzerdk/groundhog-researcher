@@ -74,3 +74,24 @@ def test_init_installs_skills(tmp_path, capsys):
     dest = target / ".claude" / "skills"
     installed = {p.name for p in dest.iterdir() if p.is_dir()}
     assert EXPECTED <= installed
+
+
+def test_install_replaces_instead_of_merging(tmp_path):
+    """A file the packaged skill no longer ships must not survive re-install."""
+    install_skills(tmp_path)
+    stale = (tmp_path / ".claude" / "skills" / "groundhog-fresh"
+             / "leftover-from-old-version.md")
+    stale.write_text("stale", encoding="utf-8")
+
+    install_skills(tmp_path)
+    assert not stale.exists()
+
+
+def test_init_succeeds_after_skills_install(tmp_path, capsys):
+    """`skills install <dir>` then `init <dir>` must scaffold — a lone
+    .claude/ is not content worth protecting."""
+    target = tmp_path / "run"
+    install_skills(target)
+    rc = init("init-mock", str(target), script_only=True)
+    assert rc == 0
+    assert (target / "task.py").exists()

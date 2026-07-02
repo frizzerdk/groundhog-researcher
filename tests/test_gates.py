@@ -226,3 +226,29 @@ def test_assemble_installs_gates():
         ws_dir.mkdir()
         violations = tk.gates.evaluate(ws_dir)
         assert [v.gate for v in violations] == [DIRECTION_MISSING]
+
+
+def test_gatekit_excludes_committed_attempt_by_record_id():
+    """kit.evaluate(committed_attempt) must not report the record as
+    duplicating itself — display_id is the NAME there, so the kit also
+    excludes the record's own id."""
+    from types import SimpleNamespace
+
+    from groundhog.base.types import EvaluationResult, StageResult
+    from groundhog.utils.results import write_result
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        ws = history.workspace()
+        (ws.path / "solution.py").write_text("print(1)", encoding="utf-8")
+        write_direction(ws.path, "rollout beam search")
+        write_result(
+            ws.path,
+            EvaluationResult(stages={"e": StageResult(metrics={"score": 0.5})}),
+            metadata={"name": "rollout-beam-search"},
+        )
+        ws.name = "rollout-beam-search"
+        attempt = ws.commit(success=True)
+
+        kit = GateKit(SimpleNamespace(history=history))
+        assert kit.evaluate(attempt) == []

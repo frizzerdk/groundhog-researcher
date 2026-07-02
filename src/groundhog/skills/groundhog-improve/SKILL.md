@@ -1,6 +1,6 @@
 ---
 name: groundhog-improve
-description: Produces one child attempt that improves a committed prior in the groundhog run in the current directory — the session does the editing, the groundhog CLI owns lifecycle and scoring, and the session self-enforces the gates. Use when the user asks to improve, refine, or build on an existing attempt or the current best (e.g. "/groundhog-improve", "/groundhog-improve e65665e2", "make the best attempt better"). Inherits the parent's direction and preserves it; default autonomy level checkpoint.
+description: Produces one child attempt that improves a committed prior in the groundhog run in the current directory — the session does the editing, the groundhog CLI owns lifecycle, scoring, and gate enforcement at commit. Use when the user asks to improve, refine, or build on an existing attempt or the current best (e.g. "/groundhog-improve", "/groundhog-improve e65665e2", "make the best attempt better"). Inherits the parent's direction and preserves it; default autonomy level checkpoint.
 argument-hint: "[prior-id] [pair|checkpoint|auto]"
 ---
 
