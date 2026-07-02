@@ -117,37 +117,31 @@ task = Task(data=PackingData(), context=PackingContext(),
 
 
 # --- Per-task agent tools: the module hook (never a Task method) -------------
-# Called LAST by assemble_toolkit, against the finished bench — so tools can
-# close over toolkit.ws (the attempt in flight), .history, .task. These reach
-# agents during runs and the terminal via `groundhog tool run`.
+# Preferred authoring: plain module-level functions. Name, description, and
+# the agent-visible schema are DERIVED (docstring + signature) — one source
+# of truth. The `toolkit` first parameter is injected at invoke time and
+# hidden from the agent; through it a tool reads the attempt in flight
+# (toolkit.ws), the history, the task. Tools reach agents during runs AND
+# the terminal via `groundhog tool run show-pack -p indices="0 3 7"`.
+
+def show_pack(toolkit, indices: str = "") -> str:
+    """Score a candidate pack (space/comma-separated indices), or the
+    current attempt's solve() when called with no argument."""
+    d = toolkit.task.data.get_test()
+    if indices.strip():
+        picks = [int(x) for x in indices.replace(",", " ").split()]
+    else:
+        ns = {}
+        exec((toolkit.ws.path / "solution.py").read_text(encoding="utf-8"), ns)
+        picks = list(ns["solve"]([tuple(i) for i in d["items"]], d["capacity"]))
+    weight = sum(d["items"][i][0] for i in picks)
+    value = sum(d["items"][i][1] for i in picks)
+    verdict = "OVERWEIGHT" if weight > d["capacity"] else "ok"
+    return f"picks={picks} weight={weight}/{d['capacity']} value={value} [{verdict}]"
+
 
 def agent_tools(toolkit) -> list:
-    ws = toolkit.ws          # stable handle, captured once
-    data = toolkit.task.data
-
-    def show_pack(indices: str = "") -> str:
-        """Score an index list without committing anything — or, with no
-        argument, score the current attempt's solution."""
-        d = data.get_test()
-        if indices.strip():
-            picks = [int(x) for x in indices.replace(",", " ").split()]
-        else:
-            ns = {}
-            exec((ws.path / "solution.py").read_text(encoding="utf-8"), ns)
-            picks = list(ns["solve"]([tuple(i) for i in d["items"]], d["capacity"]))
-        weight = sum(d["items"][i][0] for i in picks)
-        value = sum(d["items"][i][1] for i in picks)
-        verdict = "OVERWEIGHT" if weight > d["capacity"] else "ok"
-        return f"picks={picks} weight={weight}/{d['capacity']} value={value} [{verdict}]"
-
-    return [agent_tool(
-        name="show-pack",
-        description="Score a candidate pack (space/comma-separated indices), "
-                    "or the current attempt's solve() when called bare.",
-        func=show_pack,
-        params={"indices": {"type": "str", "default": "",
-                            "description": "e.g. '0 3 7' — empty = current solution"}},
-    )]
+    return [agent_tool(show_pack)]
 
 
 # --- The bench: build_toolkit() — the run-dir contract ------------------------

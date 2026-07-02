@@ -159,6 +159,10 @@ def test_prompts_match_the_direction_gate(history_factory, commit_attempt):
     fresh = strat._build_prompt_vars(tk, ws, prior=None)["direction_rule"]
     assert "core_direction.md" in fresh
     assert "write" in fresh.lower(), "fresh prompt must instruct CREATING the direction"
+    # The naming convention travels with the instruction: the first line is
+    # the approach name itself — no 'Core Direction' label (round-7 decision:
+    # fix naming at the source, keep the strip only as normalization).
+    assert "first line" in fresh.lower()
     ws.abort()
 
     parent = commit_attempt(history, direction="prototype matching")

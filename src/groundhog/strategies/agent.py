@@ -742,10 +742,14 @@ class AgentStrategy(Strategy):
         if prior is None:
             direction_rule = (
                 "- FRESH attempt: write work/core_direction.md — 1-3 lines "
-                "naming your core approach (the algorithmic backbone, e.g. "
-                "'prototype matching with augmented templates'). Attempts "
-                "without it are REJECTED at commit; duplicating an existing "
-                "family's direction is also rejected."
+                "naming your core approach. Naming convention: the FIRST LINE "
+                "is the approach name itself, nothing else — e.g. 'Data "
+                "augmentation + random forest'. No 'Core Direction' heading, "
+                "no markdown title, no label; the file name already says what "
+                "it is. The first line becomes the attempt's display name and "
+                "folder slug. Attempts without the file are REJECTED at "
+                "commit; duplicating an existing family's direction is also "
+                "rejected."
             )
         else:
             direction_rule = (

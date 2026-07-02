@@ -170,6 +170,9 @@ def collect_task_tools(hook, toolkit) -> list:
                 f"duplicate task tool name {t.name!r} returned by agent_tools()"
             )
         seen.add(t.name)
+        # Derived tools with a `toolkit` first parameter get it here, once —
+        # invisible to the agent's schema, supplied at invoke time.
+        t.bind_toolkit(toolkit)
     return tools
 
 

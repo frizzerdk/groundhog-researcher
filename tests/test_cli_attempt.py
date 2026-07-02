@@ -467,19 +467,19 @@ def test_eval_help(capsys):
 
 _TOOL_HOOK = '''
 
+def read_current(toolkit) -> str:
+    """Read the current attempt's solution."""
+    return (toolkit.ws.path / "solution.py").read_text(encoding="utf-8")
+
+
 def agent_tools(toolkit):
     from groundhog import agent_tool
-    ws = toolkit.ws  # stable handle, captured once — the task.py pattern
-
-    def read_current() -> str:
-        return (ws.path / "solution.py").read_text(encoding="utf-8")
 
     def greet(name: str = "world") -> str:
         return f"hello {name}"
 
     return [
-        agent_tool(name="read-current", description="Read the current attempt's solution.",
-                   func=read_current, params={}),
+        agent_tool(read_current),   # derived form: schema from the function
         agent_tool(name="greet", description="Say hello.", func=greet,
                    params={"name": {"type": "str", "default": "world"}}),
     ]

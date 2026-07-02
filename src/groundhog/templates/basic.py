@@ -80,21 +80,27 @@ task = Task(data=MyData(), context=MyContext(), evaluator=MyEvaluator(), name="M
 
 # --- Optional per-task agent tools ---
 # The blessed hook: a module-level function (NOT a method on Task — the Task
-# stays a pure value object). Called LAST by assemble_toolkit against the
-# fully assembled toolkit, so tools may close over toolkit.task / .history /
-# .learnings / .path. Return [] for none; your tools shadow same-named
-# framework defaults (logged). Wired below via `agent_tools=agent_tools`.
+# stays a pure value object). Wired below via `agent_tools=agent_tools`;
+# assemble_toolkit calls it LAST against the finished toolkit. Your tools
+# shadow same-named framework defaults (logged). Return [] for none.
+#
+# Preferred authoring: a plain module-level function — name, description,
+# and the agent-visible schema are DERIVED from it (docstring + signature),
+# so they cannot drift. A first parameter named `toolkit` is injected at
+# invoke time and hidden from the agent:
+#
+#     def render_sample(toolkit, n: int = 16) -> str:
+#         """Render n input samples to a PNG for inspection."""
+#         data = toolkit.task.data
+#         ...
+#         return f"wrote {n} samples"
 #
 #     def agent_tools(toolkit) -> list:
-#         data = toolkit.task.data                 # closure capture at build
-#         def render_sample(n: int = 16) -> str:
-#             ...                                  # uses `data`
-#             return f"wrote {n} samples"
-#         return [agent_tool(
-#             name="render-sample", description="Render input samples to a PNG.",
-#             func=render_sample,
-#             params={"n": {"type": "int", "default": 16}},
-#         )]
+#         return [agent_tool(render_sample)]
+#
+# (The fully-explicit form agent_tool(name=..., description=..., func=...,
+# params={...}) also works — for lambdas, bound methods, or rich per-param
+# descriptions.)
 
 def agent_tools(toolkit) -> list:
     return []

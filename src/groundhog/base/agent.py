@@ -43,14 +43,28 @@ class AgentTool:
     Wraps any callable with parameter descriptions, type coercion, and
     error handling. The bash wrapper and tool server use get_parameters()
     to build the CLI interface; execute() handles coercion and calling.
+
+    ``inject_toolkit=True`` marks a tool whose wrapped function takes the
+    toolkit as its FIRST parameter (named ``toolkit``). The toolkit is bound
+    once by the agent_tools hook collection and supplied at invoke time —
+    the agent's schema never sees it.
     """
 
     def __init__(self, name: str, description: str, func: Callable,
-                 params: Optional[Dict[str, Dict[str, Any]]] = None):
+                 params: Optional[Dict[str, Dict[str, Any]]] = None,
+                 inject_toolkit: bool = False):
         self.name = name
         self.description = description
         self._func = func
         self._params = params or {}
+        self._inject_toolkit = inject_toolkit
+        self._toolkit = None
+
+    def bind_toolkit(self, toolkit) -> None:
+        """Supply the toolkit an injecting tool receives at invoke time.
+        Called by the hook collection in assemble_toolkit; no-op otherwise."""
+        if self._inject_toolkit:
+            self._toolkit = toolkit
 
     def get_parameters(self) -> Dict[str, Any]:
         """Return parameter schema: {name: {type, default?, description?}}."""
@@ -64,7 +78,16 @@ class AgentTool:
         """
         try:
             coerced = self._coerce_args(kwargs)
-            result = self._func(**coerced)
+            if self._inject_toolkit:
+                if self._toolkit is None:
+                    raise RuntimeError(
+                        f"tool {self.name!r} takes a `toolkit` parameter but "
+                        f"none is bound — register it through the task.py "
+                        f"agent_tools hook so assemble_toolkit binds it"
+                    )
+                result = self._func(self._toolkit, **coerced)
+            else:
+                result = self._func(**coerced)
             output = self._format_output(result)
             return ToolResult(success=True, output=output)
         except Exception as e:
@@ -95,11 +118,91 @@ class AgentTool:
         return str(result)
 
 
-def agent_tool(name: str, description: str, func: Callable,
-               params: Optional[Dict[str, Dict[str, Any]]] = None) -> AgentTool:
-    """Create an AgentTool wrapping any callable.
+# Annotation -> schema type name for the derived form. Anything else is a
+# loud build-time error (the coercion layer only understands these).
+_ANNOTATION_TYPES = {
+    str: "str",
+    int: "int",
+    float: "float",
+    bool: "bool",
+    Path: "path",
+}
 
-    Usage:
+
+def _derive_tool(f: Callable, *, name: Optional[str] = None,
+                 description: Optional[str] = None,
+                 params: Optional[Dict[str, Dict[str, Any]]] = None) -> AgentTool:
+    """Build an AgentTool from a plain function via introspection.
+
+    One source of truth: the schema comes from the function itself —
+    name from ``__name__`` (kebab-cased), description from the docstring,
+    params/types/defaults from the signature. A first parameter named
+    ``toolkit`` marks toolkit injection and is hidden from the agent.
+    Explicit kwargs override any derived field.
+    """
+    import inspect
+
+    if description is None:
+        description = inspect.getdoc(f)
+        if not description:
+            raise ValueError(
+                f"agent_tool({f.__name__}): a derived tool needs a docstring — "
+                f"it IS the description the agent reads (or pass description=...)"
+            )
+
+    sig = inspect.signature(f)
+    inject = False
+    derived_params: Dict[str, Dict[str, Any]] = {}
+    for p in sig.parameters.values():
+        if p.name == "toolkit":
+            inject = True
+            continue
+        if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+            continue  # *args/**kwargs are not agent-addressable
+        if p.annotation is inspect.Parameter.empty:
+            type_name = "str"
+        else:
+            type_name = _ANNOTATION_TYPES.get(p.annotation)
+            if type_name is None:
+                raise ValueError(
+                    f"agent_tool({f.__name__}): unsupported annotation for "
+                    f"parameter {p.name!r}: {p.annotation!r} "
+                    f"(use str / int / float / bool / Path)"
+                )
+        spec: Dict[str, Any] = {"type": type_name}
+        if p.default is not inspect.Parameter.empty:
+            spec["default"] = p.default
+        derived_params[p.name] = spec
+
+    return AgentTool(
+        name=name or f.__name__.replace("_", "-"),
+        description=description,
+        func=f,
+        params=params if params is not None else derived_params,
+        inject_toolkit=inject,
+    )
+
+
+def agent_tool(func_or_name=None, description: Optional[str] = None,
+               func: Optional[Callable] = None,
+               params: Optional[Dict[str, Dict[str, Any]]] = None,
+               *, name: Optional[str] = None) -> AgentTool:
+    """Create an AgentTool — derived from a function, or fully explicit.
+
+    Derived form (preferred): pass the function; name, description, and the
+    param schema come from the function itself, so they cannot drift. A
+    first parameter named ``toolkit`` is injected at invoke time and hidden
+    from the agent:
+
+        def render_digits(toolkit, n: int = 16) -> str:
+            \"\"\"Render a strip of digits to a PNG for inspection.\"\"\"
+            ...
+        tool = agent_tool(render_digits)
+        tool = agent_tool(render_digits, name="show-digits")   # per-field override
+
+    Explicit form (unchanged — for lambdas, bound methods, rich per-param
+    descriptions):
+
         tool = agent_tool(
             name="get-learnings",
             description="Read accumulated learnings",
@@ -110,7 +213,17 @@ def agent_tool(name: str, description: str, func: Callable,
             },
         )
     """
-    return AgentTool(name=name, description=description, func=func, params=params)
+    if callable(func_or_name):
+        return _derive_tool(func_or_name, name=name,
+                            description=description, params=params)
+    resolved_name = name if name is not None else func_or_name
+    if resolved_name is None or func is None:
+        raise TypeError(
+            "agent_tool: pass a function (derived form) or name= + "
+            "description= + func= (explicit form)"
+        )
+    return AgentTool(name=resolved_name, description=description or "",
+                     func=func, params=params)
 
 
 # --- Agent spec and result ---

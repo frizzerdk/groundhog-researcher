@@ -142,3 +142,95 @@ def test_get_tools_strategy_layer_shadows_task_layer():
     # NOT return the task stub's payload.
     assert winner.execute().output != "task-version", \
         "task-layer tool was not shadowed by the strategy layer"
+
+
+# --- Derived form: schema-from-signature + toolkit injection (round-9 final ok)
+
+def test_derived_tool_schema_from_signature(tmp_path):
+    """agent_tool(func): name from __name__ (kebab), description from the
+    docstring, params/types/defaults from the signature — one source of
+    truth, cannot drift."""
+    def render_digits(toolkit, n: int = 16, split: str = "test") -> str:
+        """Render a strip of digits to a PNG for inspection."""
+        return f"{n}-{split}"
+
+    tool = agent_tool(render_digits)
+    assert tool.name == "render-digits"
+    assert tool.description == "Render a strip of digits to a PNG for inspection."
+    schema = tool.get_parameters()
+    assert schema == {
+        "n": {"type": "int", "default": 16},
+        "split": {"type": "str", "default": "test"},
+    }
+    assert "toolkit" not in schema, "toolkit must be hidden from the agent"
+
+
+def test_derived_tool_toolkit_injection_via_hook(tmp_path):
+    """A module-level tool taking `toolkit` gets it injected at invoke time
+    after the hook collection binds it — no closures needed."""
+    def where_am_i(toolkit) -> str:
+        """Report the store root."""
+        return str(toolkit.path)
+
+    tk = assemble_toolkit(_task(), path=tmp_path,
+                          agent_tools=lambda t: [agent_tool(where_am_i)])
+    tool = next(t for t in tk.agent_tools if t.name == "where-am-i")
+    result = tool.execute()
+    assert result.success, result.error
+    assert result.output == str(tk.path)
+
+
+def test_derived_tool_coerces_string_args(tmp_path):
+    """Agent args arrive as strings; the derived int annotation coerces."""
+    def double(toolkit, n: int = 1) -> str:
+        """Double a number."""
+        return str(n * 2)
+
+    tk = assemble_toolkit(_task(), path=tmp_path,
+                          agent_tools=lambda t: [agent_tool(double)])
+    tool = next(t for t in tk.agent_tools if t.name == "double")
+    assert tool.execute(n="21").output == "42"
+
+
+def test_derived_tool_without_docstring_fails_at_build():
+    def nameless(toolkit):
+        return "x"
+    with pytest.raises(ValueError, match="docstring"):
+        agent_tool(nameless)
+
+
+def test_derived_tool_unsupported_annotation_fails_at_build():
+    def bad(toolkit, items: list) -> str:
+        """Has an un-coercible parameter."""
+        return "x"
+    with pytest.raises(ValueError, match="items"):
+        agent_tool(bad)
+
+
+def test_derived_tool_explicit_overrides_beat_derived():
+    def render(toolkit, n: int = 4) -> str:
+        """Derived description."""
+        return "x"
+    tool = agent_tool(render, name="custom-name", description="Override wins.")
+    assert tool.name == "custom-name"
+    assert tool.description == "Override wins."
+    assert tool.get_parameters() == {"n": {"type": "int", "default": 4}}
+
+
+def test_unbound_injecting_tool_fails_clean():
+    """Invoking a toolkit-taking tool that was never registered through the
+    hook surfaces a readable error, not a crash."""
+    def orphan(toolkit) -> str:
+        """Needs a toolkit."""
+        return "x"
+    result = agent_tool(orphan).execute()
+    assert not result.success
+    assert "agent_tools hook" in (result.error or "")
+
+
+def test_explicit_legacy_form_unchanged():
+    tool = agent_tool(name="greet", description="Say hi.",
+                      func=lambda name="world": f"hi {name}",
+                      params={"name": {"type": "str", "default": "world"}})
+    assert tool.name == "greet"
+    assert tool.execute(name="fred").output == "hi fred"
