@@ -252,3 +252,19 @@ def test_gatekit_excludes_committed_attempt_by_record_id():
 
         kit = GateKit(SimpleNamespace(history=history))
         assert kit.evaluate(attempt) == []
+
+
+def test_non_utf8_direction_degrades_instead_of_crashing():
+    """Campaign finding: a hand-written direction in a legacy encoding
+    (e.g. cp1252 em-dash from a shell redirect) crashed every gate and
+    commit with a codec traceback. It must degrade to a comparable
+    string instead."""
+    from groundhog.utils.direction import read_direction
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "core_direction.md"
+        p.write_bytes("rollout beam \x97 search\n".encode("latin-1"))
+        text = read_direction(tmp)
+        assert text is not None and "rollout beam" in text
+        # And the gates run on it without raising.
+        assert evaluate_gates(Path(tmp), None, history=None) == []

@@ -57,12 +57,14 @@ def read_direction(attempt_dir: Path | str) -> Optional[str]:
     """Read the direction text from ``attempt_dir``, or None if absent.
 
     Whitespace is preserved; use :func:`normalize_direction` before
-    comparing for family identity.
+    comparing for family identity. Non-UTF8 bytes are replaced rather
+    than raised: a hand-written direction in a legacy encoding must
+    degrade to a comparable string, never crash the gates or the commit.
     """
     path = find_direction_path(attempt_dir)
     if path is None:
         return None
-    return path.read_text(encoding="utf-8")
+    return path.read_text(encoding="utf-8", errors="replace")
 
 
 def read_direction_from_attempt(attempt) -> Optional[str]:
