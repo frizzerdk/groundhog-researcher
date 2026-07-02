@@ -76,8 +76,10 @@ next one") and single-checkpoint nudges ("always ask before commits").
 4. **Work the attempt** per groundhog-interface. Check progress
    honestly with `groundhog eval <ws-dir>` (`--json` to parse,
    `--through STAGE` for partial pipelines).
-5. **Commit:** `groundhog attempt commit <wsid> --eval`. Commit weak
-   and failed attempts too — recorded history steers later selection.
+5. **Commit:** `groundhog attempt commit <wsid> --eval --strategy
+   session`. Commit weak and failed attempts too — recorded history
+   steers later selection. The gates run at commit; check-gates
+   (`groundhog tool run check-gates --attempt <wsid>`) previews them.
    Abort (`groundhog attempt abort <wsid>`) only workspaces with
    nothing worth recording.
 6. **Log and check stop rules.** Append one row to your iteration log

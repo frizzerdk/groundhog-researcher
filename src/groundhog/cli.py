@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
+SKILLS_DIR = Path(__file__).parent / "skills"
 
 TEMPLATES = {
     "init": {
@@ -86,6 +87,10 @@ def init(template_name, target_dir=None, script_only=False):
     if template.get("env"):
         (target / ".env").write_text("# Add API keys here (optional - auto_registry finds CLI tools automatically)\n# ANTHROPIC_API_KEY=\n# OPENAI_API_KEY=\n# GEMINI_API_KEY=\n", encoding="utf-8")
 
+    # Skills travel with the package: every run dir gets the interactive-
+    # session skills so `/groundhog-fresh` etc. work out of the box.
+    install_skills(target, quiet=True)
+
     mode = "script" if script_only else "project"
     print(f"Created {mode} in {target}/")
     print(f"  {template['description']}")
@@ -97,6 +102,51 @@ def init(template_name, target_dir=None, script_only=False):
     print("  # edit task.py with your task logic")
     print("  uv run task.py 10")
     return 0
+
+
+def install_skills(target_dir=None, quiet=False) -> int:
+    """Copy the packaged groundhog skills into ``<target>/.claude/skills/``.
+
+    Idempotent and safe to re-run after upgrading groundhog — each
+    groundhog skill dir is overwritten with the packaged version. Only
+    the packaged skill names are touched: non-groundhog skills already
+    in the folder are never modified or removed.
+    """
+    target = Path(target_dir) if target_dir else Path.cwd()
+    if not SKILLS_DIR.exists():
+        print(f"No packaged skills found at {SKILLS_DIR} (broken install?)")
+        return 1
+    names = sorted(p.name for p in SKILLS_DIR.iterdir() if p.is_dir())
+    if not names:
+        print(f"No packaged skills found at {SKILLS_DIR} (broken install?)")
+        return 1
+    dest_root = target / ".claude" / "skills"
+    dest_root.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        shutil.copytree(SKILLS_DIR / name, dest_root / name, dirs_exist_ok=True)
+    if not quiet:
+        print(f"Installed {len(names)} groundhog skills into {dest_root}")
+        for name in names:
+            print(f"  {name}")
+        print("Invoke them in a Claude Code session opened in the run dir, "
+              "e.g. /groundhog-fresh")
+    return 0
+
+
+def skills_group(args) -> int:
+    """`groundhog skills <subcommand>` — currently just `install`."""
+    if not args or args[0] in ("-h", "--help"):
+        print("Usage:")
+        print("  groundhog skills install [directory]   "
+              "Copy the packaged skills into <dir>/.claude/skills/")
+        print()
+        print("Idempotent: re-run after upgrading groundhog to refresh them. "
+              "Every `groundhog init*` also installs them.")
+        return 0
+    if args[0] == "install":
+        return install_skills(args[1] if len(args) > 1 else None)
+    print(f"Unknown skills subcommand: {args[0]!r}. Try: groundhog skills --help")
+    return 1
 
 
 def _backend_source(name, backend):
@@ -936,6 +986,7 @@ def main():
         print("  groundhog attempt <subcommand>    Manual attempt lifecycle (new/list/show/commit/...)")
         print("  groundhog eval <path-or-id>       Score a solution dir, .py file, or attempt")
         print("  groundhog tool list|run           Run any toolkit tool from the terminal")
+        print("  groundhog skills install [dir]    Install the session skills into a run dir")
         print()
         print("Options:")
         print("  --script    Script-only mode (no uv project, uses inline deps)")
@@ -968,6 +1019,8 @@ def main():
         sys.exit(cmd_eval(args[1:]))
     elif cmd == "tool":
         sys.exit(tool_group(args[1:]))
+    elif cmd == "skills":
+        sys.exit(skills_group(args[1:]))
     else:
         print(f"Unknown command: {cmd}")
         print("Try: groundhog --help")

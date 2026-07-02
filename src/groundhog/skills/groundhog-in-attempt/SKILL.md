@@ -41,6 +41,11 @@ parent dirs to find the run's `task.py`).
 `result.json`, never estimate or extrapolate a score. Report eval
 output verbatim.
 
+Mid-work self-check: `groundhog tool run check-gates --attempt <wsid>`
+(your orchestrator's charter names the wsid) reports what the
+commit-time gates would find — direction status, solution identical to
+parent. Read-only; use it before recommending commit.
+
 ## Task tools
 
     groundhog tool list

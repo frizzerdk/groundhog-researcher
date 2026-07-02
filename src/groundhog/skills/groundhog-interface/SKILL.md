@@ -61,11 +61,15 @@ groundhog attempt new [--parent ID] [--no-seed] [--name NAME]
     (none when the store is empty). Seeding copies ONLY the parent's
     solution.py and core_direction.md; --no-seed copies nothing but the
     parent pointer remains as lineage.
-groundhog attempt commit <wsid> [--fail] [--eval] [--through STAGE]
-    Finalize a workspace. --eval evaluates it, writes result.json +
-    metadata, prints stage scores; success = evaluation completed and
-    not --fail. If no name is set, the display name derives from
-    core_direction.md's first line.
+groundhog attempt commit <wsid> [--fail] [--eval] [--through STAGE] [--strategy LABEL]
+    Finalize a workspace through the standard finish: the gates run,
+    violations are recorded (a hard violation commits the attempt as
+    failed — recorded, never blocked), and the outcome is printed.
+    --eval evaluates it, writes result.json + metadata, prints stage
+    scores; success = evaluation completed, no hard gate violation, and
+    not --fail. --strategy labels the producer in metadata (default
+    manual; session work passes session / session-swarm). If no name is
+    set, the display name derives from core_direction.md's first line.
 groundhog attempt abort <wsid>       Discard a workspace — no trace left.
 groundhog attempt resume <wsid>      Take over an open workspace (see Coexistence).
 groundhog attempt reap [--ttl S]     Abort CRASHED workspaces older than S (default 300).
@@ -93,9 +97,11 @@ groundhog tool run <name> [--attempt ID] [-p k=v ...]   Invoke one.
 3. Validate loop: `groundhog eval <ws-path>` after each meaningful
    change; fix and re-run until it completes (exit 0). eval only prints —
    nothing is recorded yet.
-4. `groundhog attempt commit <wsid> --eval` — the evaluation of record.
-   Default to `--eval` on every commit; a commit without it records no
-   fresh result.
+4. `groundhog attempt commit <wsid> --eval --strategy session` — the
+   evaluation of record, through the gated standard finish. Default to
+   `--eval` on every commit (a commit without it records no fresh
+   result, though gates and producer metadata apply either way); session
+   work always passes `--strategy session`.
 5. Real work that didn't pan out: `commit <wsid> --fail`. A failed
    attempt is recorded history — the family map remembers it and
    selection skips it. Reserve `abort` for scrap: empty or accidental
@@ -116,11 +122,17 @@ groundhog tool run <name> [--attempt ID] [-p k=v ...]   Invoke one.
 ## Task tools
 
 `groundhog tool list` names this run's tools — the task's own tools
-(defined by its `agent_tools` hook) plus any framework defaults. The set
+(defined by its `agent_tools` hook) plus the framework defaults. The set
 is per-run: always list before assuming. Invoke with
 `groundhog tool run <name> [--attempt ID] [-p k=v ...]`; `--attempt`
 points workspace-relative tools at that attempt's files for the duration
 of the call.
+
+One default ships everywhere: **check-gates** — the mid-work self-check.
+`groundhog tool run check-gates --attempt <wsid>` reports exactly what
+the commit-time gate would find (direction missing/duplicate, modified
+inherited direction, solution identical to parent), so a failure
+surfaces while you can still fix it. Read-only; changes nothing.
 
 ## Direction — core_direction.md
 
@@ -138,16 +150,24 @@ of the call.
 
 ## Gates — the law at every autonomy level
 
-The automated strategies enforce these; session attempts get no
-exemption. Gates are NOT checkpoints and are never relaxed by autonomy
-level:
+The same gates run for every producer: the automated strategies AND
+`groundhog attempt commit` enforce them — session attempts get no
+exemption and need no self-policing. check-gates is the button; the
+commit is the backstop. Gates are NOT checkpoints and are never relaxed
+by autonomy level:
 
 - **Direction present and unique (fresh).** A fresh attempt with no
   core_direction.md, or one whose direction duplicates an existing
-  family (normalized comparison, failed attempts included), is a FAILED
-  attempt. Check the family map before writing one.
-- **No byte-identical children.** A child whose solution.py equals its
-  parent's proves nothing — never commit it as an improvement.
+  family (normalized comparison, failed attempts included), commits as
+  a FAILED attempt with the violation recorded. Check the family map
+  before writing one.
+- **Byte-identical child (flag).** A child whose solution.py equals its
+  parent's proves nothing: it commits as done but is flagged
+  non-promotable, and selection skips it. Don't present one as an
+  improvement.
+- **Modified inherited direction (flag).** The parent's direction is
+  restored at commit and the restoration is recorded — the family
+  invariant survives every session.
 
 ## Coexistence with other producers
 

@@ -49,23 +49,27 @@ at every level.
    `work/`.
 5. **Evaluate as you iterate:** `groundhog eval <ws-dir>`. Scores come
    only from eval — never hand-write results.
-6. **Before-commit checkpoint:** report the direction, the score, and
-   what you tried; recommend commit — a recorded failed family is
-   information; abort (`groundhog attempt abort <wsid>`) only for
-   unusable scraps. Then `groundhog attempt commit <wsid> --eval`.
+6. **Before-commit checkpoint:** run
+   `groundhog tool run check-gates --attempt <wsid>` and report its
+   verdict along with the direction, the score, and what you tried;
+   recommend commit — a recorded failed family is information; abort
+   (`groundhog attempt abort <wsid>`) only for unusable scraps. Then
+   `groundhog attempt commit <wsid> --eval --strategy session`.
 
 ## Uniqueness obligation
 
 **The direction must be unique vs every existing family** (family
 identity = the normalized file content) and `core_direction.md` must
-exist. The automated strategies enforce this in code; **on the session
-path YOU are the gate** — before committing, re-check the family map
-(`groundhog attempt list` + read the leaders' directions) and confirm:
-direction file present, first-line convention followed, genuinely new
-family, solution not byte-identical to any attempt. If your work
-drifted into an existing family mid-build, that is an approach-pivot
-checkpoint — surface it and re-aim; never reword the direction
-cosmetically to make it look distinct.
+exist. The commit enforces this — a violating attempt commits as FAILED,
+recorded with the violation — and **check-gates is your button**: press
+it mid-work to see what the commit would decide, while there is still
+time to fix it. Semantic near-duplicates are still your judgment call:
+the gate compares normalized text, so re-check the family map
+(`groundhog attempt list` + read the leaders' directions) and confirm
+your idea is a genuinely new family, not the same algorithm reworded.
+If your work drifted into an existing family mid-build, that is an
+approach-pivot checkpoint — surface it and re-aim; never reword the
+direction cosmetically to make it look distinct.
 
 ## Out of scope
 
