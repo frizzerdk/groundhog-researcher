@@ -1,12 +1,41 @@
 """Gemini CLI backend. Uses gemini -p for non-interactive mode."""
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 from groundhog.base.backend import LLMBackend, LLMResponse, Prompt, TextPart
+
+
+def _resolve_gemini_invocation() -> list:
+    """Argv prefix to launch gemini-cli. Mirrors the agent backend's resolver.
+
+    On Windows the npm install is ``gemini.cmd`` — ``Popen(["gemini", ...])``
+    fails with WinError 2 (Popen doesn't walk PATHEXT), and the .cmd shim
+    goes through cmd.exe, which mangles multi-line input. Resolve the
+    bundled ``gemini.js`` and call node directly when we can; fall back to
+    whatever ``shutil.which`` finds.
+    """
+    if os.name == "nt":
+        npm_root = os.environ.get("APPDATA")
+        if npm_root:
+            bundle = (
+                Path(npm_root) / "npm" / "node_modules" / "@google"
+                / "gemini-cli" / "bundle" / "gemini.js"
+            )
+            try:
+                if bundle.exists():
+                    node = shutil.which("node") or "node"
+                    return [node, str(bundle)]
+            except OSError:
+                pass
+    found = shutil.which("gemini")
+    return [found] if found else ["gemini"]
 
 
 class GeminiCLIBackend(LLMBackend):
@@ -52,8 +81,10 @@ class GeminiCLIBackend(LLMBackend):
 
         # -p "" + stdin for headless mode (avoids command-line length limits)
         # --approval-mode plan as safety net against tool execution
-        cmd = ["gemini", "-p", "", "-m", self.model, "-o", "json",
-               "--approval-mode", "plan"]
+        # --skip-trust: headless runs from unrecognised dirs otherwise hang
+        # or exit on the directory-trust gate (same as the agent backend)
+        cmd = [*_resolve_gemini_invocation(), "-p", "", "-m", self.model,
+               "-o", "json", "--approval-mode", "plan", "--skip-trust"]
 
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
