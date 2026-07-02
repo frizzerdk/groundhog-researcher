@@ -469,8 +469,7 @@ class AgentStrategy(Strategy):
         result = self._fix_loop(toolkit, ws, session_id, result, prior=prior)
         self._reflect(toolkit, ws, session_id)
 
-        self._finalize(ws, result, prior)
-        attempt = ws.commit(success=result.completed)
+        attempt = self._finalize(ws, result, prior)
         return self._build_log(attempt, prior, result, toolkit)
 
     def _run_per_request(self, toolkit, ws, prior):
@@ -490,8 +489,7 @@ class AgentStrategy(Strategy):
         # Promote local learnings to task-level
         self._collect_learnings(toolkit, ws)
 
-        self._finalize(ws, result, prior)
-        attempt = ws.commit(success=result.completed)
+        attempt = self._finalize(ws, result, prior)
         return self._build_log(attempt, prior, result, toolkit)
 
     # --- Init ---
@@ -957,65 +955,26 @@ class AgentStrategy(Strategy):
     # --- Finalization ---
 
     def _finalize(self, ws, result, prior):
-        """Write result.json. solution.py at root is maintained throughout the
-        run by promote-best (explore) and the fix-loop copy — don't overwrite
-        it here or we'd regress to the agent's last edit.
+        """Run the standard finish and return the committed Attempt.
 
-        Direction handling:
-            - prior is None (fresh-direction strategy): promote any
-              ``work/core_direction.md`` the agent wrote to attempt root.
-            - prior is not None (inheritance strategy): re-copy parent's
-              ``core_direction.md`` to attempt root, overwriting anything
-              the agent might have written. This is the soft-gate that
-              keeps families from forking mid-session.
-
-        Solution-duplicate guard: if the committed ``solution.py`` is
-        byte-identical to the parent's, mark the attempt as non-promotable
-        in metadata so selectors skip it. Diversity > a few BT points.
+        Composes ``finalize_attempt`` — promote/restore direction, gates,
+        record, commit, score note — with this strategy's metadata (real
+        cost) and planned name. solution.py at root is maintained
+        throughout the run by promote-best (explore) and the fix-loop
+        copy — the finish never overwrites it, or we'd regress to the
+        agent's last edit. Subclasses that need pre-gate work (e.g.
+        FreshAgentStrategy's fallback direction) do it before calling
+        super()._finalize.
         """
-        from groundhog.utils.direction import (
-            inherit_direction_from_attempt,
-            mark_result_failed,
-            promote_workspace_direction,
+        from groundhog.utils.finalize import finalize_attempt
+        return finalize_attempt(
+            getattr(self, "_toolkit", None),
+            ws,
+            result,
+            prior,
+            metadata=self._build_metadata(prior),
+            name=self.cfg.name,
         )
-        from groundhog.utils.gates import (
-            DIRECTION_MODIFIED,
-            SOLUTION_IDENTICAL,
-            evaluate_gates,
-        )
-        metadata = self._build_metadata(prior)
-
-        # Mutation first (fresh only): surface the agent-written direction
-        # so the gates judge the post-promote state.
-        if prior is None:
-            promote_workspace_direction(ws.path)
-
-        history = getattr(getattr(self, "_toolkit", None), "history", None)
-        violations = evaluate_gates(
-            ws.path, prior, history=history, exclude=[ws.display_id]
-        )
-        for v in violations:
-            if v.severity == "fail":
-                metadata["gate_failure"] = v.message
-                mark_result_failed(result, "core_direction", v.message)
-            elif v.gate == DIRECTION_MODIFIED:
-                metadata["direction_restored"] = True
-            elif v.gate == SOLUTION_IDENTICAL:
-                metadata["non_promotable"] = True
-                metadata["non_promotable_reason"] = v.message
-
-        # Mutation second (inherited only): restore the parent's direction
-        # unconditionally — the soft-gate that keeps families from forking.
-        if prior is not None:
-            inherit_direction_from_attempt(prior, ws.path)
-
-        from groundhog.utils.results import write_result
-        write_result(ws.path, result, metadata=metadata)
-
-        # Display name: the planned slug if provided (e.g. PlanApproaches),
-        # else a slug of the finalized core direction.
-        from groundhog.utils.direction import workspace_name
-        ws.name = workspace_name(ws.path, explicit=self.cfg.name)
 
     @staticmethod
     def _is_solution_duplicate(ws, prior) -> bool:

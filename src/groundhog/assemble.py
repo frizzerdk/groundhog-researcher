@@ -111,6 +111,14 @@ def assemble_toolkit(
     from groundhog.utils.gates import GateKit
     tk.gates = GateKit(tk)
 
+    # The standard finish: tk.finalize(ws, result, prior=..., strategy=...)
+    # runs promote/gates/record/commit/score-note in one call. A convention
+    # on the bench, never a contract — strategies stay free to compose
+    # their own finish from the same public pieces.
+    from functools import partial
+    from groundhog.utils.finalize import finalize_attempt
+    tk.finalize = partial(finalize_attempt, tk)
+
     # Agent tools LAST, so the task hook sees the finished bench: framework
     # defaults merged with the task.py hook's tools (task wins on a name
     # collision, and the shadow is logged). Set exactly once — no override
