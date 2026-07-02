@@ -142,3 +142,28 @@ def test_pointer_is_live_during_the_attempt(history_factory):
     AgentStrategy()(tk)
 
     assert seen == {"is_set": True, "path_matches": True}
+
+
+def test_prompts_match_the_direction_gate(history_factory, commit_attempt):
+    """The commit gate rejects a FRESH attempt without core_direction.md, so
+    the explore prompt must ASK for one; inherited attempts must be told to
+    preserve it. Regression: a 20-attempt overnight run scored 0 successes
+    because the gate demanded what no prompt ever instructed (2026-07-02)."""
+    history = history_factory()
+    tk = _toolkit(history, ScriptedAgent([GOOD]))
+    strat = AgentStrategy()
+    strat.cfg = strat._resolve_config(None)  # normally done by __call__
+    strat.through = None
+
+    ws = history.workspace()
+    fresh = strat._build_prompt_vars(tk, ws, prior=None)["direction_rule"]
+    assert "core_direction.md" in fresh
+    assert "write" in fresh.lower(), "fresh prompt must instruct CREATING the direction"
+    ws.abort()
+
+    parent = commit_attempt(history, direction="prototype matching")
+    ws2 = history.workspace(parent=parent.id)
+    inherited = strat._build_prompt_vars(tk, ws2, prior=parent)["direction_rule"]
+    assert "core_direction.md" in inherited
+    assert "preserve" in inherited.lower()
+    ws2.abort()

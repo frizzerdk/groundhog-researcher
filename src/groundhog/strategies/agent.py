@@ -193,7 +193,7 @@ automatically move to a submission phase.
 - Edit work/solution.py directly — it will be submitted automatically
 - Run `{eval_command}` to evaluate (reads work/solution.py by default)
 - work/ is your writable area for solution, experiments, and artifacts
-- Preserve core_direction.md as the algorithmic backbone when it exists
+{direction_rule}
 - Do not fall back to the parent solution; byte-identical children are non-promotable
 - Focus on understanding before changing — blind edits waste iterations
 {budget_info}{guidance}
@@ -255,7 +255,7 @@ You have one session to improve the solution.
 - Edit work/solution.py directly — it will be submitted automatically
 - Run `{eval_command}` to evaluate (reads work/solution.py by default)
 - work/ is your writable area for solution, experiments, and artifacts
-- Preserve core_direction.md as the algorithmic backbone when it exists
+{direction_rule}
 - Do not fall back to the parent solution; byte-identical children are non-promotable
 - Focus on understanding before changing — blind edits waste iterations
 {budget_info}{guidance}
@@ -735,6 +735,25 @@ class AgentStrategy(Strategy):
         scoring_context = self._build_scoring_context(toolkit)
         approach_context = self._build_approach_context(ws)
 
+        # The direction rule must match the commit-time gate in _finalize:
+        # a FRESH attempt is rejected without a core_direction.md, so the
+        # prompt has to ASK for one (2026-07-02: all 20 attempts of a run
+        # failed the gate because no prompt ever instructed creation).
+        if prior is None:
+            direction_rule = (
+                "- FRESH attempt: write work/core_direction.md — 1-3 lines "
+                "naming your core approach (the algorithmic backbone, e.g. "
+                "'prototype matching with augmented templates'). Attempts "
+                "without it are REJECTED at commit; duplicating an existing "
+                "family's direction is also rejected."
+            )
+        else:
+            direction_rule = (
+                "- Preserve core_direction.md as the algorithmic backbone — "
+                "it is inherited from the parent and restored at commit if "
+                "changed."
+            )
+
         budget_info = ""
         if self.cfg.budget_usd:
             budget_info = f"\n- Budget: ${self.cfg.budget_usd:.2f} for this exploration phase."
@@ -749,6 +768,7 @@ class AgentStrategy(Strategy):
             eval_command=eval_command,
             scoring_context=scoring_context,
             approach_context=approach_context,
+            direction_rule=direction_rule,
             budget_info=budget_info,
             guidance=guidance,
             sandbox_rules=SANDBOX_RULES,
