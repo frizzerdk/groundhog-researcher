@@ -158,3 +158,48 @@ def test_in_progress_list_resume_abort(history_factory):
     assert (ws2.path / "solution.py").read_text() == "wip edits"
     ws2.abort()
     assert wsid not in [ip.workspace_id for ip in h.list_in_progress()]
+
+
+def test_status_direction_families_on_both_backends(history_factory, commit_attempt, capsys):
+    """Direction families render in status() on BOTH backends.
+
+    Regression: SimpleOptimizer._family_key / _print_trunks guarded direction
+    reads with hasattr(attempt, "path") — GitAttempt has no .path, so on git
+    every family key was None and the "Direction families:" section silently
+    vanished (audit 2026-07-01, bug #4). Reads now go through the
+    backend-agnostic read_direction_from_attempt.
+    """
+    from groundhog import SimpleOptimizer, assemble_toolkit
+    from groundhog.base.types import (
+        Task, Data, Context, Evaluator, EvalStage, StageResult,
+    )
+
+    history = history_factory()
+    a1 = commit_attempt(history, direction="rollout policy", metrics={"score": 0.5})
+    commit_attempt(history, parent=a1.id, direction="rollout policy", metrics={"score": 0.7})
+    commit_attempt(history, direction="mcts search", metrics={"score": 0.4})
+
+    class _Data(Data):
+        def get_train(self): return None
+        def get_test(self): return None
+
+    class _Ctx(Context):
+        def get_brief(self): return "b"
+        def get_extended(self): return "e"
+
+    class _Eval(Evaluator):
+        def evaluate(self, code_or_path, data):
+            return StageResult()
+        def get_stages(self, data):
+            return [EvalStage("eval", "eval", lambda cp: StageResult(),
+                              scorer=lambda r: r.metrics.get("score", 0.0))]
+
+    task = Task(data=_Data(), context=_Ctx(), evaluator=_Eval(), name="t")
+    opt = SimpleOptimizer(assemble_toolkit(task, history=history),
+                          strategy=type("Noop", (), {"__call__": lambda s, t, **k: {}})(),
+                          seed_strategy=None)
+    opt.status()
+    out = capsys.readouterr().out
+    assert "Direction families:" in out
+    assert "rollout policy" in out
+    assert "mcts search" in out

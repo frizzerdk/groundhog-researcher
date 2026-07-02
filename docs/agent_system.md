@@ -10,8 +10,8 @@ Four layers, each with a clear boundary:
 USER CODE (task.py)
 |
 |  task = MNISTTask()
-|  optimizer = SimpleOptimizer(task, strategies=[(AgentStrategy(budget_usd=0.50), 1)])
-|  optimizer.toolkit.llm = auto_registry()
+|  tk = build_toolkit()   # assemble_toolkit(task, ...) + tk.llm = auto_registry()
+|  optimizer = SimpleOptimizer(tk, strategies=[(AgentStrategy(budget_usd=0.50), 1)])
 |  optimizer.run(n=5)
 |
 v

@@ -193,7 +193,7 @@ automatically move to a submission phase.
 - Edit work/solution.py directly — it will be submitted automatically
 - Run `{eval_command}` to evaluate (reads work/solution.py by default)
 - work/ is your writable area for solution, experiments, and artifacts
-- Preserve core_direction.md as the algorithmic backbone when it exists
+{direction_rule}
 - Do not fall back to the parent solution; byte-identical children are non-promotable
 - Focus on understanding before changing — blind edits waste iterations
 {budget_info}{guidance}
@@ -255,7 +255,7 @@ You have one session to improve the solution.
 - Edit work/solution.py directly — it will be submitted automatically
 - Run `{eval_command}` to evaluate (reads work/solution.py by default)
 - work/ is your writable area for solution, experiments, and artifacts
-- Preserve core_direction.md as the algorithmic backbone when it exists
+{direction_rule}
 - Do not fall back to the parent solution; byte-identical children are non-promotable
 - Focus on understanding before changing — blind edits waste iterations
 {budget_info}{guidance}
@@ -434,14 +434,25 @@ class AgentStrategy(Strategy):
             budget_total=self.cfg.budget_usd or 0.0,
         )
 
-        try:
-            self._prepare_workspace(toolkit, ws, prior)
+        # Bracket the attempt lifetime on the toolkit's pointer: the setter
+        # lives where the workspace is born, and the bracket's finally clears
+        # on every exit path. Build-time tools that closed over toolkit.ws
+        # read THIS attempt's dir while we're inside. commit() happens inside
+        # the bracket and is the last ws.path-touching statement (the folder
+        # is renamed at commit).
+        from contextlib import nullcontext
+        handle = getattr(toolkit, "ws", None)
+        bracket = handle.attempt(ws) if handle is not None else nullcontext()
 
-            backend = toolkit.agent.get(self.cfg.tier)
-            if backend.cost_model == "per_request":
-                return self._run_per_request(toolkit, ws, prior)
-            else:
-                return self._run_per_token(toolkit, ws, prior)
+        try:
+            with bracket:
+                self._prepare_workspace(toolkit, ws, prior)
+
+                backend = toolkit.agent.get(self.cfg.tier)
+                if backend.cost_model == "per_request":
+                    return self._run_per_request(toolkit, ws, prior)
+                else:
+                    return self._run_per_token(toolkit, ws, prior)
 
         except Exception as e:
             ws.abort()
@@ -574,8 +585,11 @@ class AgentStrategy(Strategy):
         if allowed is not None and not allowed:
             return []
 
-        # General utilities from toolkit (plotting, KB, etc.)
-        tools = list(getattr(toolkit, 'agent_tools', []))
+        # Base layer: framework defaults + task-hook tools, merged by
+        # assemble_toolkit. Strategy tools below get merged OVER this base
+        # (strategy > task > default) by the same name-keyed rule.
+        base = list(getattr(toolkit, 'agent_tools', []))
+        tools = []
 
         # Learnings tool
         from groundhog.agents.tools import build_learnings_tool
@@ -596,8 +610,12 @@ class AgentStrategy(Strategy):
             elif hasattr(prior, "path"):
                 parent_solution_path = Path(prior.path) / "solution.py"
             else:
-                # git: materialize the parent solution OUTSIDE the workspace so
-                # the eval tool can read it without committing it into the child.
+                # Fallback for path-less attempt objects (both shipped
+                # backends now expose .path — folder natively, git via lazy
+                # materialize — so this is only reachable for custom
+                # backends/stubs): write the parent solution to a tempfile
+                # OUTSIDE the workspace so the eval tool can read it without
+                # committing it into the child.
                 import tempfile
                 _tf = tempfile.NamedTemporaryFile(
                     mode="w", suffix="_parent_solution.py", delete=False,
@@ -628,7 +646,12 @@ class AgentStrategy(Strategy):
                     )
                 )
 
-        return tools
+        # One collision rule for the whole pipeline: strategy tools shadow
+        # same-named base tools (previously a plain concat — duplicates went
+        # to the agent undetected).
+        from groundhog.agents.tools import _merge_agent_tools
+        return _merge_agent_tools(base, tools, layer="strategy",
+                                  log=getattr(toolkit, "log", None))
 
     def _prior_tool_options(self, toolkit, ws, prior):
         """Hook for subclasses that want wider/narrower prior visibility."""
@@ -712,6 +735,25 @@ class AgentStrategy(Strategy):
         scoring_context = self._build_scoring_context(toolkit)
         approach_context = self._build_approach_context(ws)
 
+        # The direction rule must match the commit-time gate in _finalize:
+        # a FRESH attempt is rejected without a core_direction.md, so the
+        # prompt has to ASK for one (2026-07-02: all 20 attempts of a run
+        # failed the gate because no prompt ever instructed creation).
+        if prior is None:
+            direction_rule = (
+                "- FRESH attempt: write work/core_direction.md — 1-3 lines "
+                "naming your core approach (the algorithmic backbone, e.g. "
+                "'prototype matching with augmented templates'). Attempts "
+                "without it are REJECTED at commit; duplicating an existing "
+                "family's direction is also rejected."
+            )
+        else:
+            direction_rule = (
+                "- Preserve core_direction.md as the algorithmic backbone — "
+                "it is inherited from the parent and restored at commit if "
+                "changed."
+            )
+
         budget_info = ""
         if self.cfg.budget_usd:
             budget_info = f"\n- Budget: ${self.cfg.budget_usd:.2f} for this exploration phase."
@@ -726,6 +768,7 @@ class AgentStrategy(Strategy):
             eval_command=eval_command,
             scoring_context=scoring_context,
             approach_context=approach_context,
+            direction_rule=direction_rule,
             budget_info=budget_info,
             guidance=guidance,
             sandbox_rules=SANDBOX_RULES,

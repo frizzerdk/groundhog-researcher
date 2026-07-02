@@ -8,7 +8,7 @@ load_dotenv()
 
 from groundhog import (
     Task, Data, Context, Evaluator, EvalStage, StageResult,
-    SimpleOptimizer, Improve, auto_registry,
+    Toolkit, agent_tool, assemble_toolkit, SimpleOptimizer, Improve, auto_registry,
 )
 
 
@@ -78,24 +78,59 @@ class MyEvaluator(Evaluator):
 task = Task(data=MyData(), context=MyContext(), evaluator=MyEvaluator(), name="MyTask")
 
 
-# --- Optimizer: runs the loop ---
+# --- Optional per-task agent tools ---
+# The blessed hook: a module-level function (NOT a method on Task — the Task
+# stays a pure value object). Called LAST by assemble_toolkit against the
+# fully assembled toolkit, so tools may close over toolkit.task / .history /
+# .learnings / .path. Return [] for none; your tools shadow same-named
+# framework defaults (logged). Wired below via `agent_tools=agent_tools`.
+#
+#     def agent_tools(toolkit) -> list:
+#         data = toolkit.task.data                 # closure capture at build
+#         def render_sample(n: int = 16) -> str:
+#             ...                                  # uses `data`
+#             return f"wrote {n} samples"
+#         return [agent_tool(
+#             name="render-sample", description="Render input samples to a PNG.",
+#             func=render_sample,
+#             params={"n": {"type": "int", "default": 16}},
+#         )]
 
-if __name__ == "__main__":
-    import sys
+def agent_tools(toolkit) -> list:
+    return []
 
-    optimizer = SimpleOptimizer(task, strategy=Improve())
 
-    # Auto-discovers available backends (CLI tools, API keys, local servers)
-    # Run "groundhog backends" to see what's available on your machine
-    optimizer.toolkit.llm = auto_registry()
+# --- Bench: the toolkit every consumer loads ---
+
+def build_toolkit() -> Toolkit:
+    """Assemble + configure this run's bench. The CLI, agents, and notebooks
+    load this too — construct and configure only, never run anything here."""
+    tk = assemble_toolkit(task, agent_tools=agent_tools)
+
+    # Auto-discovers available backends (CLI tools, API keys, local servers).
+    # Run "groundhog backends" to see what's available on your machine.
+    # None when nothing is found — loading stays LLM-free; strategies that
+    # need an LLM fail loudly at run time.
+    llm = auto_registry()
+    if llm:
+        tk.llm = llm
 
     # Or configure manually — uncomment and customize:
     # from groundhog import BackendRegistry, GeminiBackend, AnthropicBackend, OpenAICompatibleBackend, ClaudeCodeBackend
-    # optimizer.toolkit.llm = BackendRegistry(
+    # tk.llm = BackendRegistry(
     #     high=AnthropicBackend(model="claude-opus-4-6"),                # best reasoning
     #     default=ClaudeCodeBackend(model="sonnet"),                     # via Claude Code CLI
     #     cheap=OpenAICompatibleBackend.ollama(model="llama3"),          # free local model
     # )
+    return tk
+
+
+# --- Run: the ONLY place anything executes ---
+
+if __name__ == "__main__":
+    import sys
+
+    optimizer = SimpleOptimizer(build_toolkit(), strategy=Improve())
 
     if len(sys.argv) > 1 and sys.argv[1] == "status":
         optimizer.status()

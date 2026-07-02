@@ -7,22 +7,22 @@ Just a container. Tools are added by the optimizer from various sources.
 Built on SimpleNamespace: strategies access what they need via attributes.
 Overrides are tracked and printed.
 
-User-overridable attributes (set after constructing the optimizer, before
-``run()``):
+User-overridable attributes (configure them in the run dir's
+``build_toolkit()``, before any consumer sees the bench):
 
     toolkit.get_prior(toolkit) -> Optional[Attempt]
         Picks which attempt the next strategy iteration should build on.
-        The default (potential-weighted scoring across trunk leaders) is
-        installed by ``SimpleOptimizer.__init__``. Override to plug in
-        custom selection — e.g. live-rating-based picks for a tournament-
-        style task. The override is preserved across all iterations of
-        ``run()``.
+        The default (potential-weighted scoring across trunk leaders,
+        driven by the ``toolkit.selection`` SelectionPolicy) is installed
+        by ``assemble_toolkit``. Tune it by replacing the policy data;
+        replace the function only for wholly custom selection — e.g.
+        live-rating-based picks for a tournament-style task.
 
     toolkit.agent_through: Optional[str]
         Names the eval stage the agent's eval tools cap at — e.g. ``"validate"``
         keeps cheap-iteration loops fast while final commit-time scoring still
         runs ``through``'s full chain. Set via the ``agent_through=`` kwarg on
-        ``SimpleOptimizer`` or directly on the toolkit afterward.
+        ``assemble_toolkit`` or directly on the toolkit afterward.
 
     toolkit.through: Optional[str]
         Names the eval stage the optimizer scores against. Defaults to the
@@ -42,9 +42,9 @@ from types import SimpleNamespace
 class Toolkit(SimpleNamespace):
     """Dynamic namespace for strategy capabilities.
 
-    The optimizer builds a Toolkit and adds tools to it.
-    Strategies access what they need via attributes.
-    Overrides are tracked and printed.
+    ``assemble_toolkit`` builds a Toolkit and adds tools to it; consumers
+    (optimizer, agents, CLI, notebooks) access what they need via
+    attributes. Overrides are tracked and printed.
     """
 
     def __setattr__(self, name, value):

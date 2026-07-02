@@ -79,50 +79,30 @@ class TinyEvaluator(Evaluator):
 
 task = Task(data=TinyData(), context=TinyContext(), evaluator=TinyEvaluator(),
             name="TinyTask")
+
+
+def build_toolkit():
+    """The run-dir contract: assemble + configure the bench, never run."""
+    from groundhog import assemble_toolkit
+    here = Path(__file__).parent
+    if (here / "attempts" / ".git").exists():
+        from groundhog import GitAttemptHistory
+        history = GitAttemptHistory(here)
+    else:
+        from groundhog import FolderAttemptHistory
+        history = FolderAttemptHistory(here)
+    return assemble_toolkit(task, history=history, path=here)
 '''
 
-# Unguarded variant: builds an optimizer and calls run()/status() at module
-# top level, reading sys.argv — exactly like C:/repo/groundhog-runs/task.py.
-# The loader must NOT let this fire a real optimization or print status. A real
-# run() would seed an attempt into history (seed_strategy writes solution.py +
-# commits), so an empty history after load proves run() was neutralized.
-_UNGUARDED_TAIL = '''
-import sys
-from pathlib import Path
-from groundhog import SimpleOptimizer
-
-from groundhog.strategies.fresh import FreshApproach
-
-# A trivial seed strategy that commits one attempt — if run() actually executes
-# its seeding path, history would become non-empty.
-class _SeedOnce(FreshApproach):
-    def __call__(self, toolkit, *a, **k):
-        ws = toolkit.history.workspace(parent=None)
-        (ws.path / "solution.py").write_text("def solve():\\n    return 50.0\\n", encoding="utf-8")
-        from groundhog.base.types import EvaluationResult, StageResult
-        from groundhog.utils.results import write_result
-        write_result(ws.path, EvaluationResult(stages={"evaluate": StageResult(metrics={"value": 50.0})}))
-        ws.commit(success=True)
-        return {}
-
-optimizer = SimpleOptimizer(task, seed_strategy=_SeedOnce(), path=Path(__file__).parent)
-
-if len(sys.argv) > 1 and sys.argv[1] == "status":
-    optimizer.status()
-else:
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 99
-    optimizer.run(n)
-'''
-
-
-def _write_run_dir(tmp_path, *, unguarded=False, git=False):
-    """Create a run dir with a task.py. Optionally make it unguarded and/or
-    pre-seed a git attempt store so the loader picks the git backend."""
+def _write_run_dir(tmp_path, *, git=False, no_hook=False):
+    """Create a run dir with a contract-shaped task.py. ``git=True`` pre-seeds
+    a git attempt store so build_toolkit() picks the git backend;
+    ``no_hook=True`` strips build_toolkit to exercise the contract error."""
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     body = _TASK_BODY
-    if unguarded:
-        body = body + _UNGUARDED_TAIL
+    if no_hook:
+        body = body.split("def build_toolkit():")[0]
     (run_dir / "task.py").write_text(body, encoding="utf-8")
 
     if git:
@@ -174,17 +154,32 @@ def test_load_run_git_backend(tmp_path):
     assert isinstance(loaded.history, GitAttemptHistory)
 
 
-def test_loader_does_not_run_unguarded_optimizer(tmp_path):
-    """An unguarded task.py calling optimizer.run(99) at module level must load
-    without running — no attempts created, no sentinel written."""
-    run_dir = _write_run_dir(tmp_path, unguarded=True)
+def test_loader_requires_build_toolkit(tmp_path):
+    """The run-dir contract: no build_toolkit() -> a clear, actionable error
+    (the old monkeypatch-and-scan fallback is gone by design)."""
+    run_dir = _write_run_dir(tmp_path, no_hook=True)
+    with pytest.raises(RuntimeError, match="build_toolkit"):
+        rundir.load_run(run_dir=run_dir)
+
+
+def test_loader_rejects_non_toolkit_return(tmp_path):
+    run_dir = _write_run_dir(tmp_path)
+    task_py = run_dir / "task.py"
+    body = task_py.read_text(encoding="utf-8")
+    body = body.split("def build_toolkit():")[0] + (
+        "def build_toolkit():\n    return 42\n"
+    )
+    task_py.write_text(body, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="expected a Toolkit"):
+        rundir.load_run(run_dir=run_dir)
+
+
+def test_loaded_history_is_the_runs_real_store(tmp_path):
+    """The toolkit's history IS the store the run uses — the loader never
+    reconstructs its own (the old wrong-store risk)."""
+    run_dir = _write_run_dir(tmp_path)
     loaded = rundir.load_run(run_dir=run_dir)
-    assert loaded.optimizer is not None
-    assert loaded.task is not None
-    # run() was neutralized to a no-op, so its seed strategy never committed
-    # an attempt — history is empty.
-    assert loaded.history.list() == []
-    assert loaded.history.list(only_done=False) == []
+    assert loaded.history is loaded.toolkit.history
 
 
 def test_find_task_py_searches_parents(tmp_path):
@@ -204,18 +199,16 @@ def test_find_task_py_missing(tmp_path):
 
 
 def test_loader_restores_environment(tmp_path):
-    """cwd, sys.argv, and SimpleOptimizer.run must be restored after load."""
+    """cwd and sys.path must be restored after load (the loader deliberately
+    chdirs into the run dir around the build_toolkit() call)."""
     import sys
-    from groundhog.optimizers.simple import SimpleOptimizer
 
-    run_dir = _write_run_dir(tmp_path, unguarded=True)
+    run_dir = _write_run_dir(tmp_path)
     cwd_before = os.getcwd()
-    argv_before = list(sys.argv)
-    run_before = SimpleOptimizer.run
+    path_before = list(sys.path)
     rundir.load_run(run_dir=run_dir)
     assert os.getcwd() == cwd_before
-    assert sys.argv == argv_before
-    assert SimpleOptimizer.run is run_before
+    assert sys.path == path_before
 
 
 # --- attempt new / commit --eval / list / show ------------------------------
@@ -468,3 +461,102 @@ def test_eval_unresolvable_target(tmp_path, capsys):
 def test_eval_help(capsys):
     assert cmd_eval(["-h"]) == 0
     assert cmd_eval([]) == 1
+
+
+# --- groundhog tool list / run ------------------------------------------------
+
+_TOOL_HOOK = '''
+
+def agent_tools(toolkit):
+    from groundhog import agent_tool
+    ws = toolkit.ws  # stable handle, captured once — the task.py pattern
+
+    def read_current() -> str:
+        return (ws.path / "solution.py").read_text(encoding="utf-8")
+
+    def greet(name: str = "world") -> str:
+        return f"hello {name}"
+
+    return [
+        agent_tool(name="read-current", description="Read the current attempt's solution.",
+                   func=read_current, params={}),
+        agent_tool(name="greet", description="Say hello.", func=greet,
+                   params={"name": {"type": "str", "default": "world"}}),
+    ]
+'''
+
+
+def _write_tool_run_dir(tmp_path):
+    """Contract task.py whose build_toolkit wires the agent_tools hook."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    body = _TASK_BODY.replace(
+        "    return assemble_toolkit(task, history=history, path=here)",
+        "    return assemble_toolkit(task, history=history, path=here, agent_tools=agent_tools)",
+    ) + _TOOL_HOOK
+    (run_dir / "task.py").write_text(body, encoding="utf-8")
+    return run_dir
+
+
+def test_tool_list(tmp_path, capsys):
+    from groundhog.cli import tool_group
+    run_dir = _write_tool_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        rc = tool_group(["list"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "read-current" in out and "greet" in out
+
+
+def test_tool_run_with_params(tmp_path, capsys):
+    from groundhog.cli import tool_group
+    run_dir = _write_tool_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        rc = tool_group(["run", "greet", "-p", "name=frederik"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "hello frederik" in out
+
+
+def test_tool_run_ws_relative_against_committed_attempt(tmp_path, capsys):
+    """A build-time tool closing over toolkit.ws reads a CHOSEN attempt's
+    files when the CLI points the handle via --attempt."""
+    from groundhog.cli import attempt_group, tool_group
+    run_dir = _write_tool_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        assert attempt_group(["new"]) == 0
+        wsid = capsys.readouterr().out.strip().splitlines()[0].split()[-1]
+        # write a distinctive solution, commit it
+        ws_dirs = [p for p in (run_dir / "attempts").iterdir() if p.is_dir()]
+        (ws_dirs[0] / "solution.py").write_text("def solve():\n    return 41.5\n",
+                                                encoding="utf-8")
+        assert attempt_group(["commit", wsid]) == 0
+        capsys.readouterr()
+
+        from groundhog import rundir
+        aid = rundir.load_run().history.list()[0].id
+
+        rc = tool_group(["run", "read-current", "--attempt", aid])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "41.5" in out
+
+
+def test_tool_run_unset_ws_fails_clean(tmp_path, capsys):
+    from groundhog.cli import tool_group
+    run_dir = _write_tool_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        rc = tool_group(["run", "read-current"])   # no --attempt, nothing set
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "no attempt in flight" in out
+
+
+def test_tool_run_unknown_tool(tmp_path, capsys):
+    from groundhog.cli import tool_group
+    run_dir = _write_tool_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        rc = tool_group(["run", "nope"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "No tool named" in out

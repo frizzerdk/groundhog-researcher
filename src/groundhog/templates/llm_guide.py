@@ -39,7 +39,8 @@ load_dotenv()
 
 from groundhog import (
     Task, Data, Context, Evaluator, EvalStage, StageResult,
-    SimpleOptimizer, Improve, FreshApproach, CrossPollinate, auto_registry,
+    Toolkit, assemble_toolkit, SimpleOptimizer,
+    Improve, FreshApproach, CrossPollinate, auto_registry,
 )
 
 
@@ -124,7 +125,7 @@ Example:
 # - "validate" stage: run on a small subset, fast feedback (seconds)
 # - "evaluate" stage: full evaluation, the real score (minutes)
 # - Use the "through" parameter to stop at a stage during optimization:
-#     optimizer = SimpleOptimizer(task, through="evaluate")
+#     tk = assemble_toolkit(task, through="evaluate")
 #
 # SUBPROCESS EXECUTION:
 # For untrusted generated code, use groundhog's subprocess runner:
@@ -230,24 +231,36 @@ task = Task(data=MyData(), context=MyContext(), evaluator=MyEvaluator(), name="M
 #   seed_strategy runs once if there's no history. Default: FreshApproach().
 #   Set seed_strategy=None to skip (e.g. if history already exists).
 
-if __name__ == "__main__":
-    import sys
+# ==========================================================================
+# PER-TASK AGENT TOOLS (optional)
+# ==========================================================================
+# Module-level hook — NOT a Task method. assemble_toolkit calls it LAST,
+# against the finished toolkit, so tools can close over toolkit.task /
+# .history / .learnings / .path. Return [] for none. Your tools shadow
+# same-named framework defaults (the shadow is logged).
 
-    optimizer = SimpleOptimizer(
-        task,
-        strategies=[
-            (Improve(), 14),
-            (CrossPollinate(), 5),
-            (FreshApproach(mode="different"), 1),
-        ],
-        seed_strategy=FreshApproach(mode="blank"),
-    )
-    # Auto-discovers available backends (CLI tools, API keys, local servers)
-    # Run "groundhog backends" to see what's available on your machine
-    optimizer.toolkit.llm = auto_registry()
+def agent_tools(toolkit) -> list:
+    return []
+
+
+# ==========================================================================
+# BENCH — the toolkit every consumer loads (CLI, agents, notebooks, __main__)
+# ==========================================================================
+# build_toolkit() assembles + configures; it never runs anything. That is
+# what makes `groundhog attempt list` / eval safe to call on this file.
+
+def build_toolkit() -> Toolkit:
+    tk = assemble_toolkit(task, agent_tools=agent_tools)
+
+    # Auto-discovers available backends (CLI tools, API keys, local servers).
+    # Run "groundhog backends" to see what's available on your machine.
+    # None when nothing is found — loading stays LLM-free.
+    llm = auto_registry()
+    if llm:
+        tk.llm = llm
 
     # Or configure manually — full control over which models power each tier:
-    # optimizer.toolkit.llm = BackendRegistry(
+    # tk.llm = BackendRegistry(
     #     max=AnthropicBackend(model="claude-opus-4-6"),                    # best reasoning ($5/$25 per MTok)
     #     high=GeminiBackend(model="gemini-3-flash-preview"),               # strong + fast ($0.50/$3)
     #     default=ClaudeCodeBackend(model="sonnet"),                        # via CLI, no API key needed
@@ -258,6 +271,21 @@ if __name__ == "__main__":
     # More providers: .openai(), .groq(), .cerebras(), .xai(), .together(),
     #                 .fireworks(), .openrouter(), .mistral(), .perplexity()
     # Missing tiers fall back to "default".
+    return tk
+
+
+if __name__ == "__main__":
+    import sys
+
+    optimizer = SimpleOptimizer(
+        build_toolkit(),
+        strategies=[
+            (Improve(), 14),
+            (CrossPollinate(), 5),
+            (FreshApproach(mode="different"), 1),
+        ],
+        seed_strategy=FreshApproach(mode="blank"),
+    )
 
     if len(sys.argv) > 1 and sys.argv[1] == "status":
         optimizer.status()

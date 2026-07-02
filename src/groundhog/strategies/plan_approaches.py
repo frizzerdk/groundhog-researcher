@@ -169,10 +169,12 @@ class PlanApproaches(Strategy):
         families = history.derive_families()
         if not families:
             return "(none — empty history)"
-        from groundhog.utils.direction import read_direction, direction_title
+        from groundhog.utils.direction import read_direction_from_attempt, direction_title
         lines = []
         for members in families:
-            sample = read_direction(members[0].path) if hasattr(members[0], "path") else None
+            # Backend-agnostic read (the old hasattr('path') guard blanked
+            # directions on the git backend — same class as audit bug #4).
+            sample = read_direction_from_attempt(members[0])
             title = direction_title(sample or "")
             lines.append(f"  - [{len(members)} attempts] {title}")
         return "\n".join(lines)

@@ -78,7 +78,7 @@ load_dotenv()
 
 from groundhog import (
     Task, Data, Context, Evaluator, EvalStage, StageResult,
-    SimpleOptimizer, Improve, auto_registry,
+    Toolkit, assemble_toolkit, SimpleOptimizer, Improve, auto_registry,
 )
 
 
@@ -113,9 +113,20 @@ class MyEvaluator(Evaluator):
 
 task = Task(data=MyData(), context=MyContext(), evaluator=MyEvaluator(), name="MyTask")
 
-optimizer = SimpleOptimizer(task, strategy=Improve())
-optimizer.toolkit.llm = auto_registry()
-optimizer.run(n=100)
+
+def build_toolkit() -> Toolkit:
+    """The run-dir contract: assemble + configure the bench, never run.
+    The CLI and agents load this file through it — side-effect free."""
+    tk = assemble_toolkit(task)
+    llm = auto_registry()      # None on a keyless machine
+    if llm:
+        tk.llm = llm
+    return tk
+
+
+if __name__ == "__main__":
+    optimizer = SimpleOptimizer(build_toolkit(), strategy=Improve())
+    optimizer.run(n=100)
 ```
 
 ## What happens
@@ -155,7 +166,7 @@ Run multiple strategies in a weighted rotation:
 from groundhog import Improve, FreshApproach, CrossPollinate
 
 optimizer = SimpleOptimizer(
-    task,
+    build_toolkit(),
     strategies=[
         (Improve(), 14),                          # 14 refinement steps
         (CrossPollinate(), 5),                     # 5 cross-pollination steps
@@ -172,7 +183,7 @@ optimizer = SimpleOptimizer(
 ```python
 from groundhog import BackendRegistry, AnthropicBackend, GeminiBackend, OpenAICompatibleBackend
 
-optimizer.toolkit.llm = BackendRegistry(
+tk.llm = BackendRegistry(          # inside build_toolkit()
     high=AnthropicBackend(model="claude-opus-4-6"),
     default=GeminiBackend(model="gemini-2.5-flash"),
     cheap=OpenAICompatibleBackend.ollama(model="llama3"),

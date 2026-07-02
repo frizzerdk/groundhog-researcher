@@ -9,10 +9,46 @@ trunks get deprioritized.
 
 import math
 import random as rand_module
+from dataclasses import asdict, dataclass
 from typing import Callable, List, Optional
 
 from groundhog.base.attempt_history import Attempt, AttemptHistory
 from groundhog.base.types import StageResult
+
+
+@dataclass(frozen=True)
+class SelectionPolicy:
+    """Prior-selection tuning as plain data.
+
+    Lives on the toolkit (``toolkit.selection``); the default ``get_prior``
+    installed by ``assemble_toolkit`` reads it on every call. Consumers tune
+    selection by replacing this object — never by rewriting ``get_prior``.
+    """
+    trunk_weight: float = 0.3
+    direction_weight: float = 0.5
+    direction_decay: float = 0.1
+    exclude_non_promotable: bool = True
+
+    def kwargs(self) -> dict:
+        return asdict(self)
+
+
+def scorer_for(task, through: Optional[str] = None) -> Callable[[StageResult], float]:
+    """The task's live stage scorer: score fn of the last stage through ``through``.
+
+    Shared by the optimizer and the toolkit's default prior selector so there
+    is exactly one way a raw StageResult becomes a comparable score.
+    """
+    stages = task.evaluator.eval_stages(task.data, through=through)
+    return stages[-1].score
+
+
+def default_prior_selector(toolkit) -> Optional[Attempt]:
+    """Default ``toolkit.get_prior``: potential-weighted selection driven by
+    ``toolkit.selection`` (a SelectionPolicy). Installed by assemble_toolkit."""
+    policy = getattr(toolkit, "selection", None) or SelectionPolicy()
+    scorer = scorer_for(toolkit.task, getattr(toolkit, "through", None))
+    return select_prior(toolkit.history, scorer, toolkit.rng, **policy.kwargs())
 
 
 def select_prior(

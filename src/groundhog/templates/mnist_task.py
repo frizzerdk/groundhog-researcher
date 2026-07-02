@@ -20,11 +20,18 @@ from groundhog import Task, Data, Context, Evaluator, EvalStage, StageResult, ru
 
 
 class MNISTData(Data):
+    """Lazy by convention: the MNIST download happens on first get_train() /
+    get_test(), never in __init__ — so loading this task.py (CLI, agents,
+    `groundhog attempt list`) stays instant and side-effect free."""
+
     def __init__(self, samples_per_digit: int = 5):
         self.samples_per_digit = samples_per_digit
-        self._load()
+        self._train = None
+        self._test = None
 
-    def _load(self):
+    def _ensure_loaded(self):
+        if self._train is not None:
+            return
         from sklearn.datasets import fetch_openml
         import sys
         print("Loading MNIST...", file=sys.stderr)
@@ -45,9 +52,11 @@ class MNISTData(Data):
         print(f"Train: {self._train[0].shape}, Test: {self._test[0].shape}", file=sys.stderr)
 
     def get_train(self):
+        self._ensure_loaded()
         return self._train
 
     def get_test(self):
+        self._ensure_loaded()
         return self._test
 
 
@@ -208,19 +217,42 @@ class MNISTTask(Task):
         )
 
 
-if __name__ == "__main__":
-    import sys
+task = MNISTTask()   # cheap: MNISTData is lazy, nothing downloads at import
+
+
+def agent_tools(toolkit) -> list:
+    """Optional per-task agent tools (module hook, not a Task method).
+    Called last by assemble_toolkit; close over toolkit.task/.history/.path."""
+    return []
+
+
+def build_toolkit():
+    """Assemble + configure this run's bench — loadable without running."""
     from dotenv import load_dotenv
     load_dotenv()
-    from groundhog import (
-        SimpleOptimizer, Improve, FreshApproach, CrossPollinate,
-        auto_registry,
-    )
+    from groundhog import assemble_toolkit, auto_registry
 
-    task = MNISTTask()
+    tk = assemble_toolkit(task, through="evaluate", agent_tools=agent_tools)
+
+    # Auto-discovers available backends (CLI tools, API keys, local servers).
+    # None when nothing is found — loading stays LLM-free.
+    llm = auto_registry()
+    if llm:
+        tk.llm = llm
+
+    # Override specific tiers after auto-discovery:
+    # from groundhog import GeminiBackend, AnthropicBackend, OpenAICompatibleBackend
+    # tk.llm.set("high", AnthropicBackend(model="claude-opus-4-6"))
+    # tk.llm.set("cheap", OpenAICompatibleBackend.ollama(model="llama3"))
+    return tk
+
+
+if __name__ == "__main__":
+    import sys
+    from groundhog import SimpleOptimizer, Improve, FreshApproach, CrossPollinate
 
     optimizer = SimpleOptimizer(
-        task,
+        build_toolkit(),
         strategies=[
             (FreshApproach(mode="different"), 1),
             (Improve(), 7),
@@ -229,17 +261,7 @@ if __name__ == "__main__":
             (CrossPollinate(), 3),
         ],
         seed_strategy=FreshApproach(mode="blank"),
-        through="evaluate",
     )
-    # Auto-discovers available backends (CLI tools, API keys, local servers)
-    # Run "groundhog backends" to see what's available on your machine
-    optimizer.toolkit.llm = auto_registry()
-
-    # See what's available with command: 'groundhog backends'
-    # Override specific tiers after auto-discovery:
-    # from groundhog import GeminiBackend, AnthropicBackend, OpenAICompatibleBackend
-    # optimizer.toolkit.llm.set("high", AnthropicBackend(model="claude-opus-4-6"))
-    # optimizer.toolkit.llm.set("cheap", OpenAICompatibleBackend.ollama(model="llama3"))
 
     if len(sys.argv) > 1 and sys.argv[1] == "status":
         optimizer.status()

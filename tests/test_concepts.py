@@ -34,7 +34,7 @@ from pathlib import Path
 from groundhog import (
     Task, Data, Context, Evaluator,
     EvalStage, StageResult, EvaluationResult,
-    Toolkit, SimpleOptimizer, FolderAttemptHistory,
+    Toolkit, SimpleOptimizer, FolderAttemptHistory, assemble_toolkit,
 )
 from groundhog.utils.results import write_result
 
@@ -490,7 +490,7 @@ def test_strategy_return_is_not_depended_on():
                 ws.commit(success=result.completed)
                 return {}  # empty dict — optimizer should still work
 
-        optimizer = SimpleOptimizer(task, strategy=ReturnsNothing(), seed=42, history=history, seed_strategy=None)
+        optimizer = SimpleOptimizer(assemble_toolkit(task, history=history, seed=42), strategy=ReturnsNothing(), seed_strategy=None)
         optimizer.run(n=3)
         assert len(history.list()) == 3
 
@@ -513,7 +513,7 @@ def test_strategy_owns_evaluation_and_recording():
                 recorded.append(attempt.id)
                 return {"attempt": attempt.id}
 
-        optimizer = SimpleOptimizer(task, strategy=TrackingStrategy(), seed=42, history=history, seed_strategy=None)
+        optimizer = SimpleOptimizer(assemble_toolkit(task, history=history, seed=42), strategy=TrackingStrategy(), seed_strategy=None)
         optimizer.run(n=5)
 
         # Strategy recorded all 5
@@ -549,7 +549,7 @@ def test_optimizer_is_deterministic_with_seed():
                     ws.commit(success=result.completed)
                     return {"value": val}
 
-            optimizer = SimpleOptimizer(task, strategy=DeterministicStrategy(rng_values), seed=42, history=history, seed_strategy=None)
+            optimizer = SimpleOptimizer(assemble_toolkit(task, history=history, seed=42), strategy=DeterministicStrategy(rng_values), seed_strategy=None)
             optimizer.run(n=5)
             results.append(rng_values[:])
 
@@ -584,8 +584,9 @@ def test_optimizer_extras_registers_strategy_for_queue():
                 ws.commit(success=result.completed)
 
         opt = SimpleOptimizer(
-            task, strategy=RotationStrat(), extras=[ExtraStrat()],
-            seed=42, path=Path(tmp), history=history, seed_strategy=None,
+            assemble_toolkit(task, history=history, path=Path(tmp), seed=42),
+            strategy=RotationStrat(), extras=[ExtraStrat()],
+            seed_strategy=None,
         )
 
         # Queue the extra by name; first iteration should pick it up.
@@ -611,8 +612,9 @@ def test_optimizer_extras_does_not_overwrite_rotation():
         extra = Improve()
 
         opt = SimpleOptimizer(
-            task, strategy=rotation, extras=[extra],
-            seed=42, path=Path(tmp), history=history, seed_strategy=None,
+            assemble_toolkit(task, history=history, path=Path(tmp), seed=42),
+            strategy=rotation, extras=[extra],
+            seed_strategy=None,
         )
 
         # Rotation registered "improve" first; extras must not clobber it.
@@ -967,8 +969,9 @@ def test_user_agent_through_hook_is_respected():
                 ws.commit(success=result.completed)
 
         opt = SimpleOptimizer(
-            task, strategy=WatchingStrategy(),
-            seed=42, history=history, seed_strategy=None,
+            assemble_toolkit(task, history=history, seed=42),
+            strategy=WatchingStrategy(),
+            seed_strategy=None,
         )
         opt.toolkit.agent_through = "validate"
         opt.run(n=3)
@@ -1049,8 +1052,8 @@ def test_user_get_prior_hook_is_respected():
             called.append(True)
             return None
 
-        optimizer = SimpleOptimizer(task, strategy=RecordingStrategy(),
-                                    seed=42, history=history, seed_strategy=None)
+        optimizer = SimpleOptimizer(assemble_toolkit(task, history=history, seed=42),
+                                    strategy=RecordingStrategy(), seed_strategy=None)
         optimizer.toolkit.get_prior = my_hook
         optimizer.run(n=2)
 
@@ -1932,14 +1935,15 @@ def test_diversity_integration_phases_1_2_4_5():
                 return SR()
 
         opt = SimpleOptimizer(
-            Task(data=FixtureData(), context=FixtureContext(),
-                 evaluator=_Eval(), name="div-int"),
+            assemble_toolkit(
+                Task(data=FixtureData(), context=FixtureContext(),
+                     evaluator=_Eval(), name="div-int"),
+                history=history, path=Path(tmp),
+            ),
             strategy=type("Noop", (), {
                 "__call__": lambda self, t, **k: {},
             })(),
             seed_strategy=None,
-            history=history,
-            path=Path(tmp),
         )
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -1989,7 +1993,7 @@ def test_mock_task_end_to_end():
     with tempfile.TemporaryDirectory() as d:
         task = MockTask(seed=42)
         strategy = MockStrategy()
-        optimizer = SimpleOptimizer(task, strategy=strategy, seed=69, seed_strategy=None, path=Path(d))
+        optimizer = SimpleOptimizer(assemble_toolkit(task, path=Path(d), seed=69), strategy=strategy, seed_strategy=None)
         optimizer.run(n=5)
 
         # Verify attempts were created

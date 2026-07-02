@@ -5,6 +5,8 @@ succeed even when the remote is unreachable. ``fetch_ttl_s=0`` here makes reads
 fetch every time so the assertions are deterministic.
 """
 
+import os
+import shutil
 import subprocess
 
 import pytest
@@ -77,3 +79,68 @@ def test_local_store_never_touches_remote(tmp_path):
     store = GitAttemptHistory(tmp_path / "A")  # no remote
     a = _commit(store)
     assert [x.id for x in store.list()] == [a.id]
+
+
+# --- Real-GitHub e2e (env-gated; never runs in CI) ---------------------------
+#
+# Two stores on one machine syncing through the standing private repo
+# frizzerdk/groundhog-sync-test, plus the synced-clone self-heal: a THIRD
+# fresh store fetches the refs and materializes a worktree it never created.
+# Auth: token-in-URL from `gh auth token` at runtime (the hermetic _git
+# chokepoint strips credential helpers by design). Enable with
+# GROUNDHOG_GITHUB_SYNC=1.
+
+def _github_remote_url():
+    gh = shutil.which("gh")
+    if not gh:
+        return None
+    tok = subprocess.run([gh, "auth", "token"], capture_output=True, text=True)
+    token = (tok.stdout or "").strip()
+    if tok.returncode != 0 or not token:
+        return None
+    return f"https://x-access-token:{token}@github.com/frizzerdk/groundhog-sync-test.git"
+
+
+@pytest.mark.skipif(os.environ.get("GROUNDHOG_GITHUB_SYNC") != "1",
+                    reason="real-GitHub e2e; set GROUNDHOG_GITHUB_SYNC=1")
+def test_github_sync_e2e_two_stores_and_clone_self_heal(tmp_path):
+    from groundhog.histories.git import GitAttemptHistory, SyncPolicy
+
+    url = _github_remote_url()
+    if url is None:
+        pytest.skip("gh CLI not authenticated")
+
+    policy = SyncPolicy(fetch_ttl_s=0.0, timeout_s=60.0)
+    a_store = GitAttemptHistory(tmp_path / "A", remote=url, policy=policy)
+    b_store = GitAttemptHistory(tmp_path / "B", remote=url, policy=policy)
+
+    try:
+        # A commits -> pushes to GitHub; B fetches and reads it back.
+        a1 = _commit(a_store, code="from A via github")
+        assert a1.id in [x.id for x in b_store.list()]
+        assert b_store.get(a1.id).code == "from A via github"
+
+        # B commits; both see both (disjoint per-origin refs, conflict-free).
+        b1 = _commit(b_store, code="from B via github")
+        assert {a1.id, b1.id} <= {x.id for x in a_store.list()}
+        assert {a1.id, b1.id} <= {x.id for x in b_store.list()}
+
+        # The synced-clone self-heal: a FRESH store (no shared disk with A/B)
+        # sees the attempts as objects only — materialize() checks out a
+        # worktree it never had.
+        c_store = GitAttemptHistory(tmp_path / "C", remote=url, policy=policy)
+        assert a1.id in [x.id for x in c_store.list()]
+        p = c_store.materialize(a1.id)
+        assert (p / "solution.py").read_text(encoding="utf-8") == "from A via github"
+    finally:
+        # Leave the standing repo tidy: best-effort delete of this run's refs
+        # (exact names — push --delete does not glob).
+        ls = subprocess.run(["git", "ls-remote", url, "refs/attempts/*"],
+                            capture_output=True, text=True, timeout=60)
+        origins = {a_store.origin, b_store.origin}
+        stale = [line.split("\t", 1)[1] for line in ls.stdout.splitlines()
+                 if "\t" in line and line.split("\t", 1)[1].split("/")[2] in origins]
+        if stale:
+            subprocess.run(["git", "--git-dir", str(a_store._git_dir),
+                            "push", url, "--delete", *stale],
+                           capture_output=True, timeout=120)
