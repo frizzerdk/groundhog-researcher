@@ -112,10 +112,14 @@ class SimpleOptimizer(Optimizer):
         """
         import re
         cls_name = strategy.__class__.__name__
-        names = {
-            cls_name.lower(),
-            re.sub(r'(?<!^)(?=[A-Z])', '_', cls_name).lower(),
-        }
+        snake = re.sub(r'(?<!^)(?=[A-Z])', '_', cls_name).lower()
+        names = {cls_name.lower(), snake}
+        # The conventional short name drops a "_strategy" suffix:
+        # FreshAgentStrategy also answers to "fresh_agent" — the name
+        # PlanApproaches queues under by default (a queue item that
+        # resolves under no name would burn on "unknown strategy").
+        if snake.endswith("_strategy"):
+            names.add(snake[: -len("_strategy")])
         for name in names:
             if not allow_overwrite and name in self._strategy_registry:
                 # Rotation already owns this name; keep it.

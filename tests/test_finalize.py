@@ -254,3 +254,23 @@ def test_scorer_exception_never_fails_a_finished_attempt():
         assert attempt.status == "done"
         # Note skipped, attempt intact.
         assert tk.history.get_note(attempt, "score") is None
+
+
+def test_optimizer_registry_resolves_strategy_suffix_alias():
+    """PlanApproaches queues under "fresh_agent"; FreshAgentStrategy must be
+    resolvable under that conventional short name, or every queued item
+    burns on "unknown strategy" (campaign finding)."""
+    from groundhog import FreshAgentStrategy, Improve, SimpleOptimizer
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tk = _toolkit(tmp)
+        tk.path = Path(tmp)
+        tk.log = type("L", (), {"info": lambda self, m: None,
+                                "end": lambda self: None})()
+        opt = SimpleOptimizer(
+            tk, strategy=Improve(), extras=[FreshAgentStrategy()]
+        )
+        assert "fresh_agent" in opt._strategy_registry
+        assert isinstance(
+            opt._strategy_registry["fresh_agent"], FreshAgentStrategy
+        )
