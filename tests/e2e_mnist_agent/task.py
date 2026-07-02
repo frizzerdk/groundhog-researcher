@@ -31,60 +31,71 @@ from groundhog import (
 from groundhog.base.agent import AgentRegistry
 
 
-backend_name = sys.argv[1] if len(sys.argv) > 1 else "claude"
-
-if backend_name == "claude":
-    agent_backend = ClaudeCodeAgentBackend(model="haiku", max_budget_usd=0.25)
-elif backend_name == "copilot":
-    agent_backend = CopilotAgentBackend(model="gpt-5-mini")
-elif backend_name == "codex":
-    agent_backend = CodexCliAgentBackend(effort="medium")
-elif backend_name in ("llm", "status"):
-    agent_backend = None
-else:
-    raise SystemExit(f"Unknown backend: {backend_name!r} (expected: claude, copilot, codex, llm, status)")
-
 task = MNISTTask()
 
-if backend_name == "llm":
-    # LLM-strategy rotation — one cheap backend on every tier, picked from
-    # whatever auth this machine has.
-    import os
-    from groundhog import ClaudeCodeBackend, OpenAICompatibleBackend
 
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        llm = AnthropicBackend(model="claude-haiku-4-5-20250414")
-    elif os.environ.get("OPENROUTER_API_KEY"):
-        llm = OpenAICompatibleBackend.openrouter(model="google/gemini-3-flash-preview")
+def build_toolkit():
+    """Run-dir contract: the bench, loadable without running."""
+    from pathlib import Path as _P
+    return assemble_toolkit(task, path=_P(__file__).parent,
+                            through="evaluate", agent_through="validate")
+
+
+if __name__ == "__main__":
+    backend_name = sys.argv[1] if len(sys.argv) > 1 else "claude"
+
+    if backend_name == "claude":
+        agent_backend = ClaudeCodeAgentBackend(model="haiku", max_budget_usd=0.25)
+    elif backend_name == "copilot":
+        agent_backend = CopilotAgentBackend(model="gpt-5-mini")
+    elif backend_name == "codex":
+        agent_backend = CodexCliAgentBackend(effort="medium")
+    elif backend_name in ("llm", "status"):
+        agent_backend = None
     else:
-        llm = ClaudeCodeBackend(model="haiku")
+        raise SystemExit(f"Unknown backend: {backend_name!r} (expected: claude, copilot, codex, llm, status)")
 
-    optimizer = SimpleOptimizer(
-        assemble_toolkit(task, through="evaluate"),
-        strategies=[(Improve(), 2), (CrossPollinate(), 1), (FreshApproach(), 1)],
-    )
-    optimizer.toolkit.llm = BackendRegistry(default=llm, high=llm, cheap=llm)
-else:
-    agent_strategy = AgentStrategy()
-    optimizer = SimpleOptimizer(
-        assemble_toolkit(task, through="evaluate", agent_through="validate"),
-        strategy=agent_strategy,
-        seed_strategy=agent_strategy,
-    )
-    optimizer.toolkit.llm = BackendRegistry(
-        default=AnthropicBackend(model="claude-sonnet-4-6-20260217"),
-        cheap=AnthropicBackend(model="claude-haiku-4-5-20250414"),
-    )
+    tk = build_toolkit()
 
-if agent_backend is not None:
-    optimizer.toolkit.agent = AgentRegistry(
-        default=agent_backend,
-        high=agent_backend,
-        budget=agent_backend,
-    )
+    if backend_name == "llm":
+        # LLM-strategy rotation — one cheap backend on every tier, picked from
+        # whatever auth this machine has.
+        import os
+        from groundhog import ClaudeCodeBackend, OpenAICompatibleBackend
 
-if backend_name == "status":
-    optimizer.status()
-else:
-    n = int(sys.argv[2]) if len(sys.argv) > 2 else 1
-    optimizer.run(n=n)
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            llm = AnthropicBackend(model="claude-haiku-4-5-20250414")
+        elif os.environ.get("OPENROUTER_API_KEY"):
+            llm = OpenAICompatibleBackend.openrouter(model="google/gemini-3-flash-preview")
+        else:
+            llm = ClaudeCodeBackend(model="haiku")
+
+        optimizer = SimpleOptimizer(
+            tk,
+            strategies=[(Improve(), 2), (CrossPollinate(), 1), (FreshApproach(), 1)],
+        )
+        tk.llm = BackendRegistry(default=llm, high=llm, cheap=llm)
+    else:
+        agent_strategy = AgentStrategy()
+        optimizer = SimpleOptimizer(
+            tk,
+            strategy=agent_strategy,
+            seed_strategy=agent_strategy,
+        )
+        tk.llm = BackendRegistry(
+            default=AnthropicBackend(model="claude-sonnet-4-6-20260217"),
+            cheap=AnthropicBackend(model="claude-haiku-4-5-20250414"),
+        )
+
+    if agent_backend is not None:
+        tk.agent = AgentRegistry(
+            default=agent_backend,
+            high=agent_backend,
+            budget=agent_backend,
+        )
+
+    if backend_name == "status":
+        optimizer.status()
+    else:
+        n = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+        optimizer.run(n=n)

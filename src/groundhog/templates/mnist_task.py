@@ -234,9 +234,11 @@ def build_toolkit():
 
     tk = assemble_toolkit(task, through="evaluate", agent_tools=agent_tools)
 
-    # Auto-discovers available backends (CLI tools, API keys, local servers)
-    # Run "groundhog backends" to see what's available on your machine
-    tk.llm = auto_registry()
+    # Auto-discovers available backends (CLI tools, API keys, local servers).
+    # None when nothing is found — loading stays LLM-free.
+    llm = auto_registry()
+    if llm:
+        tk.llm = llm
 
     # Override specific tiers after auto-discovery:
     # from groundhog import GeminiBackend, AnthropicBackend, OpenAICompatibleBackend

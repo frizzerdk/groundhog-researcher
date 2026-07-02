@@ -18,3 +18,7 @@ probe_results/
 .coverage
 coverage.xml
 htmlcov/
+examples/*/attempts/
+examples/*/learnings*.md
+examples/*/queue.json
+examples/*/attemptlog.*

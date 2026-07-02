@@ -13,6 +13,7 @@ targets on both backends, and the git reap-keeps-live-sessions regression.
 """
 
 import json
+import shutil as _shutil
 import threading
 import time
 from pathlib import Path
@@ -209,16 +210,20 @@ def test_materialize_unknown_id_raises(history_factory):
 
 # --- git-specific: rematerialize + reap regression --------------------------------
 
+_needs_git = pytest.mark.skipif(_shutil.which("git") is None,
+                                reason="git not on PATH")
+
+
 def _git_history(tmp_path):
     from groundhog.histories.git import GitAttemptHistory
     return GitAttemptHistory(tmp_path / "store")
 
 
+@_needs_git
 def test_git_materialize_recreates_pruned_worktree(tmp_path, commit_attempt):
     """The synced-clone / pruned-disk case: the folder is gone, the objects
     remain — materialize must bring the folder back."""
     import shutil
-    pytest.importorskip("subprocess")
     history = _git_history(tmp_path)
     a = commit_attempt(history, code="def solve(): return 99", name="probe")
 
@@ -232,6 +237,7 @@ def test_git_materialize_recreates_pruned_worktree(tmp_path, commit_attempt):
     assert (p2 / "solution.py").read_text(encoding="utf-8") == "def solve(): return 99"
 
 
+@_needs_git
 def test_git_attempt_path_is_lazy_materialize(tmp_path, commit_attempt):
     history = _git_history(tmp_path)
     a = commit_attempt(history, code="x = 1")
@@ -240,6 +246,7 @@ def test_git_attempt_path_is_lazy_materialize(tmp_path, commit_attempt):
     assert (Path(p) / "solution.py").exists()
 
 
+@_needs_git
 def test_git_reap_leaves_live_session_regardless_of_age(tmp_path):
     """Audit 2026-07-01 bug #2: reap force-removed LIVE sessions older than
     the TTL because the heartbeat was written once and never refreshed. The
@@ -265,6 +272,7 @@ def test_git_reap_leaves_live_session_regardless_of_age(tmp_path):
     assert history.reap_in_progress(ttl_s=1.0) == 1
 
 
+@_needs_git
 def test_set_attempt_refreshes_heartbeat(tmp_path):
     history = _git_history(tmp_path)
     tk = _toolkit(history)
@@ -278,4 +286,105 @@ def test_set_attempt_refreshes_heartbeat(tmp_path):
         refreshed = json.loads(hb_path.read_text(encoding="utf-8"))
         assert time.time() - refreshed["started_at"] < 60, \
             "set_attempt did not refresh the heartbeat"
+    ws.abort()
+
+
+# --- self-review regressions (2026-07-02 pre-merge review) ------------------
+
+@_needs_git
+def test_git_materialize_detached_is_idempotent(tmp_path, commit_attempt):
+    """A SYNCED attempt has no local attempt/<sha> branch — materialize takes
+    the detached path. It must return the SAME worktree on every call, never
+    mint duplicates (review finding #1: duplicate checkouts, GitError on the
+    4th call)."""
+    import subprocess
+    from groundhog.histories.git import GitAttemptHistory, SyncPolicy
+
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)],
+                   check=True, capture_output=True)
+    policy = SyncPolicy(fetch_ttl_s=0.0)
+    a_store = GitAttemptHistory(tmp_path / "A", remote=str(remote), policy=policy)
+    b_store = GitAttemptHistory(tmp_path / "B", remote=str(remote), policy=policy)
+
+    a1 = commit_attempt(a_store, code="def solve(): return 5")
+    assert a1.id in [x.id for x in b_store.list()]  # synced, objects only
+
+    p1 = Path(b_store.materialize(a1.id))
+    p2 = Path(b_store.materialize(a1.id))
+    p3 = Path(b_store.materialize(a1.id))
+    p4 = Path(b_store.materialize(a1.id))
+    assert p1 == p2 == p3 == p4, "detached materialize minted duplicates"
+    assert (p1 / "solution.py").read_text(encoding="utf-8") == "def solve(): return 5"
+
+
+@_needs_git
+def test_resolve_never_steals_a_live_foreign_heartbeat(tmp_path):
+    """Pointing the handle at a wsid owned by another LIVE process must not
+    rewrite its heartbeat (review finding #3: a short-lived CLI read left a
+    dead pid behind, making the owner reapable)."""
+    import json
+    import os
+
+    from groundhog.base.workspace_handle import ForeignWorkspaceView, WorkspaceStateError
+
+    history = _git_history(tmp_path)
+    tk = _toolkit(history)
+    ws = history.workspace()
+    wsid = ws.display_id
+
+    # Simulate a live FOREIGN owner: our parent process is alive and isn't us.
+    hb_path = history._heartbeat(wsid)
+    hb = json.loads(hb_path.read_text(encoding="utf-8"))
+    hb["pid"] = os.getppid()
+    hb_path.write_text(json.dumps(hb), encoding="utf-8")
+
+    view = tk.ws.set_attempt(wsid)
+    assert isinstance(view, ForeignWorkspaceView)
+    assert Path(view.path) == Path(ws.path)
+    with pytest.raises(WorkspaceStateError, match="another process"):
+        view.commit()
+    # The owner's heartbeat is untouched.
+    hb_after = json.loads(hb_path.read_text(encoding="utf-8"))
+    assert hb_after["pid"] == os.getppid(), "heartbeat was stolen"
+    tk.ws.clear()
+    ws.abort()
+
+
+def test_load_run_history_survives_cwd_change(tmp_path, monkeypatch):
+    """Template-style task.py (no explicit path) must yield ABSOLUTE store
+    roots: the loader restores the caller's cwd after build_toolkit(), and a
+    relative 'attempts' would re-root at whatever dir the CLI runs from
+    (review finding #2)."""
+    from groundhog import rundir
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "task.py").write_text(
+        "from groundhog import Task, Data, Context, Evaluator, EvalStage, StageResult, assemble_toolkit\n"
+        "class D(Data):\n"
+        "    def get_train(self): return None\n"
+        "    def get_test(self): return None\n"
+        "class C(Context):\n"
+        "    def get_brief(self): return 'b'\n"
+        "    def get_extended(self): return 'e'\n"
+        "class E(Evaluator):\n"
+        "    def evaluate(self, cp, d): return StageResult()\n"
+        "    def get_stages(self, d):\n"
+        "        return [EvalStage('eval', 'e', lambda cp: StageResult())]\n"
+        "task = Task(data=D(), context=C(), evaluator=E(), name='t')\n"
+        "def build_toolkit():\n"
+        "    return assemble_toolkit(task)   # NO explicit path — the template default\n",
+        encoding="utf-8")
+
+    loaded = rundir.load_run(run_dir=run_dir)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    assert loaded.history.list() == []          # would raise FileNotFoundError before
+    ws = loaded.history.workspace()
+    assert Path(ws.path).is_absolute()
+    assert str(ws.path).startswith(str(run_dir)), \
+        f"store re-rooted outside the run dir: {ws.path}"
     ws.abort()

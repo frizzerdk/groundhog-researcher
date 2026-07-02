@@ -8,9 +8,10 @@ Provides:
   - build_eval_tools(): wrap eval stages as agent tools (called by strategy, not optimizer)
   - build_learnings_tool(): wrap toolkit.learnings as an agent tool
 
-The optimizer puts general utilities on toolkit.agent_tools.
-Eval tools and learnings are built by the strategy, which owns the workspace
-and can add policies like promote-best.
+``assemble_toolkit`` puts general utilities on toolkit.agent_tools (framework
+defaults merged with the task.py ``agent_tools`` hook). Eval tools and
+learnings are built by the strategy, which owns the workspace and can add
+policies like promote-best.
 """
 
 import copy

@@ -238,15 +238,15 @@ def show_backends():
         print(f"  {name:15s} {backend.model:40s} ({source})")
 
     print()
-    try:
-        reg = auto_registry()
+    reg = auto_registry()
+    if reg is None:
+        print("Auto-registry: no backends discoverable")
+    else:
         print("Auto-registry tier assignments:")
         for tier in ["max", "high", "default", "budget", "cheap"]:
             b = reg.get(tier)
             source = _backend_source_from_class(b)
             print(f"  {tier:10s} {b.model:40s} ({source})")
-    except RuntimeError as e:
-        print(f"Auto-registry: {e}")
 
     return 0
 
@@ -348,6 +348,10 @@ def _resolve_run(args=None):
         return rundir.load_run(run_dir=run_dir)
     except FileNotFoundError as e:
         print(str(e))
+        return None
+    except SystemExit as e:
+        # An ill-behaved task.py (module-level sys.exit) must not kill the CLI.
+        print(f"Could not load this run: task.py exited at import ({e})")
         return None
     except Exception as e:  # noqa: BLE001 — surface a clean error to the CLI user
         print(f"Could not load this run: {e}")

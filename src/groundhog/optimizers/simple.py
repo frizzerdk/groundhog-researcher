@@ -304,8 +304,9 @@ class SimpleOptimizer(Optimizer):
         for trunk, best_score in scored_trunks:
             chain = " ->".join(f"#{a.id}" for a in trunk)
             # Show the family's core direction (1st line) from the trunk root.
-            # Backend-agnostic read: GitAttempt has no .path (audit bug #4 —
-            # the old hasattr guard silently dropped directions on git).
+            # Backend-agnostic read via read_file — no on-disk folder needed
+            # (the old hasattr('path') guard silently dropped directions on
+            # git, audit bug #4).
             root = trunk[0]
             from groundhog.utils.direction import read_direction_from_attempt, direction_title
             text = read_direction_from_attempt(root)

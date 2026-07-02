@@ -74,6 +74,44 @@ class ReadOnlyWorkspaceView:
         )
 
 
+class ForeignWorkspaceView:
+    """A LIVE workspace owned by another process, exposed read-only.
+
+    Resolving an in-progress id must never steal ownership: ``resume()``
+    rewrites the pid heartbeat ("this process now owns it"), and a
+    short-lived read would leave a dead pid behind — making the real owner's
+    workspace look crashed and reapable. This view reads the owner's files
+    in place and refuses lifecycle calls.
+    """
+
+    def __init__(self, workspace_id: str, path: Path):
+        self._workspace_id = workspace_id
+        self._path = Path(path)
+
+    @property
+    def display_id(self) -> str:
+        return self._workspace_id
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def heartbeat(self):
+        return None  # never touch a foreign owner's liveness marker
+
+    def commit(self, *a, **k):
+        raise WorkspaceStateError(
+            f"workspace {self._workspace_id!r} is live in another process — "
+            f"read-only here; use `groundhog attempt resume` to take it over"
+        )
+
+    def abort(self, *a, **k):
+        raise WorkspaceStateError(
+            f"workspace {self._workspace_id!r} is live in another process — "
+            f"read-only here; use `groundhog attempt resume` to take it over"
+        )
+
+
 class WorkspaceHandle:
     """One current attempt per toolkit; see module docstring."""
 
@@ -156,14 +194,25 @@ class WorkspaceHandle:
     # --- resolution ----------------------------------------------------------
 
     def _resolve(self, target):
+        import os
         from groundhog.base.attempt_history import Attempt, Workspace
 
-        if isinstance(target, (Workspace, ReadOnlyWorkspaceView)):
+        if isinstance(target, (Workspace, ReadOnlyWorkspaceView, ForeignWorkspaceView)):
             return target
         if isinstance(target, Attempt):
             return ReadOnlyWorkspaceView(target, self._history)
         if isinstance(target, str):
-            # In-progress workspace id first (live re-bind) …
+            # In-progress workspace id first — but NEVER steal a live foreign
+            # session: resume() rewrites the pid heartbeat, and a short-lived
+            # read would leave the real owner looking crashed (reapable).
+            for ip in self._history.list_in_progress():
+                if ip.workspace_id != target:
+                    continue
+                if ip.live and getattr(ip, "path", None) is not None:
+                    hb_pid = self._heartbeat_pid(target)
+                    if hb_pid is not None and hb_pid != os.getpid():
+                        return ForeignWorkspaceView(target, Path(ip.path))
+                break
             try:
                 return self._history.resume(target)
             except (KeyError, NotImplementedError):
@@ -176,3 +225,14 @@ class WorkspaceHandle:
             f"cannot resolve attempt {target!r}: not a live workspace, "
             f"in-progress workspace id, or committed attempt id"
         )
+
+    def _heartbeat_pid(self, workspace_id: str):
+        """The pid recorded in the workspace's heartbeat, if the backend has one."""
+        reader = getattr(self._history, "_read_heartbeat", None)
+        if reader is None:
+            return None
+        try:
+            pid = reader(workspace_id).get("pid")
+            return int(pid) if pid is not None else None
+        except (ValueError, TypeError, OSError):
+            return None

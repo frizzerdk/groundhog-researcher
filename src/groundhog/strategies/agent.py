@@ -610,8 +610,12 @@ class AgentStrategy(Strategy):
             elif hasattr(prior, "path"):
                 parent_solution_path = Path(prior.path) / "solution.py"
             else:
-                # git: materialize the parent solution OUTSIDE the workspace so
-                # the eval tool can read it without committing it into the child.
+                # Fallback for path-less attempt objects (both shipped
+                # backends now expose .path — folder natively, git via lazy
+                # materialize — so this is only reachable for custom
+                # backends/stubs): write the parent solution to a tempfile
+                # OUTSIDE the workspace so the eval tool can read it without
+                # committing it into the child.
                 import tempfile
                 _tf = tempfile.NamedTemporaryFile(
                     mode="w", suffix="_parent_solution.py", delete=False,

@@ -172,7 +172,9 @@ def build_toolkit() -> Toolkit:
         selection=SelectionPolicy(direction_weight=0.6),  # tuning is data
         agent_tools=agent_tools,
     )
-    tk.llm = auto_registry()   # discovers CLI tools / API keys / local servers
+    llm = auto_registry()      # discovers CLI tools / API keys / local servers
+    if llm:                    # None on a keyless machine — loading stays LLM-free
+        tk.llm = llm
     return tk
 
 

@@ -6,10 +6,10 @@ the optimizer, agents, notebooks, the CLI, tests — reaches one step deeper
 for the verb it needs (``tk.task.evaluate()``, ``tk.history.best()``).
 
 This factory assembles that bench without an optimizer anywhere in sight.
-``SimpleOptimizer`` is one consumer: it receives a toolkit (or builds one
-here for the legacy task-first signature), owns the strategy schedule and
-the ``run()`` loop, and tunes prior selection by supplying a
-``SelectionPolicy`` — data on the toolkit, never a rewritten function.
+``SimpleOptimizer`` is one consumer: it receives a finished toolkit, owns
+the strategy schedule and the ``run()`` loop, and tunes prior selection by
+supplying a ``SelectionPolicy`` — data on the toolkit, never a rewritten
+function.
 
 Run-dir contract: a ``task.py`` exposes ``def build_toolkit() -> Toolkit``
 that calls this factory and configures the bench (e.g. ``tk.llm = ...``);
@@ -60,7 +60,11 @@ def assemble_toolkit(
     The caller configures the bench afterwards (``tk.llm = auto_registry()``,
     custom tools) and only then hands it to a consumer.
     """
-    path = Path(path) if path else Path(".")
+    # Resolve to an ABSOLUTE root at assembly time: the loader chdirs into
+    # the run dir around build_toolkit(), then restores the caller's cwd —
+    # a relative default would silently re-root the stores at whatever
+    # directory the CLI was launched from.
+    path = Path(path).resolve() if path else Path.cwd()
     tk = Toolkit(task=task, history=history or FolderAttemptHistory(path), path=path)
     tk.learnings = learnings or MarkdownLearnings(path)
     tk.log = StrategyLog()

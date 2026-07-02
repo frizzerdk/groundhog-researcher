@@ -70,6 +70,7 @@ ignore = [
 "src/groundhog/__init__.py" = ["F401", "E402"]
 "src/groundhog/base/__init__.py" = ["F401"]
 # Templates are illustrative scaffolds: dotenv-before-imports is the documented
-# pattern, and "unused" locals show the user where their code goes.
-"src/groundhog/templates/*" = ["E402", "F841"]
+# pattern, "unused" locals show the user where their code goes, and imports
+# may serve commented-out worked examples.
+"src/groundhog/templates/*" = ["E402", "F841", "F401"]
 "examples/*" = ["E402"]

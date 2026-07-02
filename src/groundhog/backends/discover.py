@@ -171,8 +171,14 @@ def _create_backend(backend_name, model=None):
     return factory(model)
 
 
-def auto_registry() -> BackendRegistry:
+def auto_registry(required: bool = False):
     """Build a BackendRegistry from the best available backends.
+
+    Returns ``None`` when nothing is discoverable (fresh CI box, keyless
+    laptop): run dirs call this inside ``build_toolkit()``, and merely
+    LOADING a run (attempt list, eval, tool run — all LLM-free) must not
+    fail because no LLM exists. Strategies that need one fail loudly at RUN
+    time. Pass ``required=True`` to fail fast here instead.
 
     Respects user preferences from ~/.groundhog/config.json:
       - "prefer": backend name -> use this backend for all tiers
@@ -180,10 +186,12 @@ def auto_registry() -> BackendRegistry:
     """
     available = discover_backends()
     if not available:
-        raise RuntimeError(
-            "No LLM backends found. Install Claude Code, set an API key "
-            "(ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY), or start Ollama."
-        )
+        if required:
+            raise RuntimeError(
+                "No LLM backends found. Install Claude Code, set an API key "
+                "(ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY), or start Ollama."
+            )
+        return None
 
     prefs = _load_preferences()
 

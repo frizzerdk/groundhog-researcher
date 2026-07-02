@@ -49,7 +49,7 @@ def _tool(name="my-tool", reply="ok"):
 
 # --- The hook ---------------------------------------------------------------
 
-def test_hook_runs_last_against_finished_toolkit():
+def test_hook_runs_last_against_finished_toolkit(tmp_path):
     seen = {}
 
     def agent_tools(tk):
@@ -60,29 +60,35 @@ def test_hook_runs_last_against_finished_toolkit():
         seen["get_prior"] = hasattr(tk, "get_prior")
         return [_tool()]
 
-    tk = assemble_toolkit(_task(), agent_tools=agent_tools)
+    tk = assemble_toolkit(_task(), path=tmp_path, agent_tools=agent_tools)
     assert seen == {"history": True, "rng": True, "selection": True, "get_prior": True}
-    assert [t.name for t in tk.agent_tools] == ["my-tool"]
+    assert "my-tool" in [t.name for t in tk.agent_tools]
 
 
-def test_hook_is_optional():
-    tk = assemble_toolkit(_task())
-    assert tk.agent_tools == []
+def test_hook_is_optional(tmp_path):
+    """No hook -> exactly the framework defaults, nothing else."""
+    from groundhog.agents.tools import build_default_agent_tools
+    tk = assemble_toolkit(_task(), path=tmp_path)
+    assert [t.name for t in tk.agent_tools] == \
+        [t.name for t in build_default_agent_tools(tk)]
 
 
-def test_hook_returning_none_means_no_tools():
-    tk = assemble_toolkit(_task(), agent_tools=lambda t: None)
-    assert tk.agent_tools == []
+def test_hook_returning_none_means_no_task_tools(tmp_path):
+    from groundhog.agents.tools import build_default_agent_tools
+    tk = assemble_toolkit(_task(), path=tmp_path, agent_tools=lambda t: None)
+    assert [t.name for t in tk.agent_tools] == \
+        [t.name for t in build_default_agent_tools(tk)]
 
 
-def test_non_agent_tool_return_fails_at_build_time():
+def test_non_agent_tool_return_fails_at_build_time(tmp_path):
     with pytest.raises(TypeError, match="AgentTool"):
-        assemble_toolkit(_task(), agent_tools=lambda t: ["not a tool"])
+        assemble_toolkit(_task(), path=tmp_path, agent_tools=lambda t: ["not a tool"])
 
 
-def test_duplicate_task_tool_names_fail_at_build_time():
+def test_duplicate_task_tool_names_fail_at_build_time(tmp_path):
     with pytest.raises(ValueError, match="duplicate"):
-        assemble_toolkit(_task(), agent_tools=lambda t: [_tool("x"), _tool("x")])
+        assemble_toolkit(_task(), path=tmp_path,
+                         agent_tools=lambda t: [_tool("x"), _tool("x")])
 
 
 def test_collect_task_tools_none_hook():

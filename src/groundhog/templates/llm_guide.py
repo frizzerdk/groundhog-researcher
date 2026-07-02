@@ -125,7 +125,7 @@ Example:
 # - "validate" stage: run on a small subset, fast feedback (seconds)
 # - "evaluate" stage: full evaluation, the real score (minutes)
 # - Use the "through" parameter to stop at a stage during optimization:
-#     optimizer = SimpleOptimizer(task, through="evaluate")
+#     tk = assemble_toolkit(task, through="evaluate")
 #
 # SUBPROCESS EXECUTION:
 # For untrusted generated code, use groundhog's subprocess runner:
@@ -252,9 +252,12 @@ def agent_tools(toolkit) -> list:
 def build_toolkit() -> Toolkit:
     tk = assemble_toolkit(task, agent_tools=agent_tools)
 
-    # Auto-discovers available backends (CLI tools, API keys, local servers)
-    # Run "groundhog backends" to see what's available on your machine
-    tk.llm = auto_registry()
+    # Auto-discovers available backends (CLI tools, API keys, local servers).
+    # Run "groundhog backends" to see what's available on your machine.
+    # None when nothing is found — loading stays LLM-free.
+    llm = auto_registry()
+    if llm:
+        tk.llm = llm
 
     # Or configure manually — full control over which models power each tier:
     # tk.llm = BackendRegistry(

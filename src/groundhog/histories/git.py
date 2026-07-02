@@ -444,6 +444,31 @@ class GitAttemptHistory(AttemptHistory):
                 return Path(cur) if cur else None
         return None
 
+    def _detached_worktree_at(self, sha: str) -> Optional[Path]:
+        """Find an existing DETACHED worktree checked out at ``sha``.
+
+        Only detached ones count: a wip worktree can sit at the same commit
+        (a child branches AT its parent before its first commit), and
+        returning that would expose the child's dirty edits as the parent's
+        content. Detached worktrees are created only by ``materialize``.
+        """
+        out = self._git_text("worktree", "list", "--porcelain")
+        blocks = out.split("\n\n")
+        for block in blocks:
+            path = head = None
+            detached = False
+            for line in block.splitlines():
+                line = line.rstrip()
+                if line.startswith("worktree "):
+                    path = line[len("worktree "):].strip()
+                elif line.startswith("HEAD "):
+                    head = line[len("HEAD "):].strip()
+                elif line == "detached":
+                    detached = True
+            if detached and head == sha and path and Path(path).exists():
+                return Path(path)
+        return None
+
     def list_in_progress(self) -> List[InProgress]:
         out = self._git_text("for-each-ref", "--format=%(refname:short)",
                              "refs/heads/wip/")
@@ -491,7 +516,7 @@ class GitAttemptHistory(AttemptHistory):
             # Contract: leave LIVE sessions alone regardless of age (a working
             # agent easily exceeds any TTL — the old `live and recent` check
             # force-killed it, audit 2026-07-01 bug #2). The TTL is a grace
-            # period for dead pids only, guarding against pid-reuse races.
+            # period applied to dead pids only.
             if ip.live:
                 continue
             if (now - ip.started_at) <= ttl_s:
@@ -528,6 +553,12 @@ class GitAttemptHistory(AttemptHistory):
         existing = self._worktree_for_branch(branch)
         if existing is not None and Path(existing).exists():
             return Path(existing)
+        # Synced attempts have no local branch — their worktrees are detached.
+        # Without this check every call would mint a new duplicate checkout
+        # (and the collision ladder eventually hard-fails).
+        existing = self._detached_worktree_at(sha)
+        if existing is not None:
+            return existing
 
         # Recreate from the object store. Use the attempt branch when it
         # exists locally (keeps the branch<->worktree binding); a synced
