@@ -230,6 +230,9 @@ def test_attempt_new_and_commit_eval(tmp_path, capsys):
                    if ip.workspace_id == wsid][0]
         (ws_path / "solution.py").write_text("def solve():\n    return 50.0\n",
                                              encoding="utf-8")
+        # Fresh attempts face the direction gate at commit now.
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
 
         # commit --eval
         rc = attempt_group(["commit", wsid, "--eval"])
@@ -298,6 +301,8 @@ def test_attempt_new_seeds_from_parent(tmp_path, capsys):
                    if ip.workspace_id == wsid][0]
         (ws_path / "solution.py").write_text("def solve():\n    return 50.0\n",
                                              encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
         attempt_group(["commit", wsid, "--eval"])
         capsys.readouterr()
 
@@ -415,6 +420,8 @@ def test_eval_attempt_id(tmp_path, capsys):
         ws_path = [ip.path for ip in loaded.history.list_in_progress()
                    if ip.workspace_id == wsid][0]
         (ws_path / "solution.py").write_text("def solve():\n    return 50.0\n", encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
         attempt_group(["commit", wsid, "--eval"])
         capsys.readouterr()
 
@@ -530,6 +537,8 @@ def test_tool_run_ws_relative_against_committed_attempt(tmp_path, capsys):
         ws_dirs = [p for p in (run_dir / "attempts").iterdir() if p.is_dir()]
         (ws_dirs[0] / "solution.py").write_text("def solve():\n    return 41.5\n",
                                                 encoding="utf-8")
+        (ws_dirs[0] / "core_direction.md").write_text("constant baseline\n",
+                                                      encoding="utf-8")
         assert attempt_group(["commit", wsid]) == 0
         capsys.readouterr()
 
@@ -560,3 +569,105 @@ def test_tool_run_unknown_tool(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "No tool named" in out
+
+
+# --- the CLI standard finish: gates + producer metadata on every commit ------
+
+def _open_ws(run_dir, capsys):
+    attempt_group(["new"])
+    out = capsys.readouterr().out
+    wsid = [l for l in out.splitlines()
+            if l.startswith("Opened workspace")][0].split()[-1]
+    loaded = rundir.load_run(run_dir=run_dir)
+    ws_path = [ip.path for ip in loaded.history.list_in_progress()
+               if ip.workspace_id == wsid][0]
+    return wsid, ws_path
+
+
+def test_commit_eval_without_direction_records_gate_failure(tmp_path, capsys):
+    """A fresh session attempt without core_direction.md commits as FAILED
+    (recorded, never blocked) — the same law the strategies face."""
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        wsid, ws_path = _open_ws(run_dir, capsys)
+        (ws_path / "solution.py").write_text("def solve():\n    return 50.0\n",
+                                             encoding="utf-8")
+
+        rc = attempt_group(["commit", wsid, "--eval"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Gate: fresh attempt did not create core_direction.md" in out
+        assert "(fail)" in out
+
+        attempt = rundir.load_run(run_dir=run_dir).history.list(
+            only_done=False)[0]
+        assert attempt.metadata["gate_failure"] == (
+            "fresh attempt did not create core_direction.md"
+        )
+        assert attempt.metadata["strategy"] == "manual"
+
+
+def test_commit_without_eval_writes_producer_metadata(tmp_path, capsys):
+    """Sharpening 4: commit without --eval used to write NO metadata at all —
+    the producer label lands on both paths now."""
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        wsid, ws_path = _open_ws(run_dir, capsys)
+        (ws_path / "solution.py").write_text("def solve():\n    return 1.0\n",
+                                             encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
+
+        rc = attempt_group(["commit", wsid])
+        assert rc == 0
+        assert "(done)" in capsys.readouterr().out
+
+        attempt = rundir.load_run(run_dir=run_dir).history.get("1")
+        assert attempt.metadata["strategy"] == "manual"
+        # No evaluation of record: result.json must NOT exist (eval-only).
+        assert "result.json" not in attempt.list_files()
+
+
+def test_commit_without_eval_still_runs_gates(tmp_path, capsys):
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        wsid, ws_path = _open_ws(run_dir, capsys)
+        (ws_path / "solution.py").write_text("def solve():\n    return 1.0\n",
+                                             encoding="utf-8")
+
+        rc = attempt_group(["commit", wsid])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Gate: fresh attempt did not create core_direction.md" in out
+        assert "(fail)" in out
+
+
+def test_commit_duplicate_direction_fails_second_attempt(tmp_path, capsys):
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        wsid, ws_path = _open_ws(run_dir, capsys)
+        (ws_path / "solution.py").write_text("def solve():\n    return 50.0\n",
+                                             encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
+        attempt_group(["commit", wsid, "--eval"])
+        capsys.readouterr()
+
+        # Second FRESH attempt (explicitly parentless) duplicating the family.
+        attempt_group(["new", "--no-seed", "--parent", "none"])
+        out = capsys.readouterr().out
+        wsid2 = [l for l in out.splitlines()
+                 if l.startswith("Opened workspace")][0].split()[-1]
+        loaded = rundir.load_run(run_dir=run_dir)
+        ws2 = [ip.path for ip in loaded.history.list_in_progress()
+               if ip.workspace_id == wsid2][0]
+        (ws2 / "solution.py").write_text("def solve():\n    return 49.0\n",
+                                         encoding="utf-8")
+        (ws2 / "core_direction.md").write_text("constant baseline\n",
+                                               encoding="utf-8")
+
+        rc = attempt_group(["commit", wsid2, "--eval"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Gate: fresh attempt duplicated an existing core direction" in out
+        assert "(fail)" in out

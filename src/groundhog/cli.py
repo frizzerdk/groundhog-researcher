@@ -636,32 +636,83 @@ def _attempt_commit(args):
 
     through = through or getattr(toolkit, "through", None)
     scorer = _scorer_for(task, through=through)
+    parent_id = getattr(ws, "parent", None)
+    prior = history.get(parent_id) if parent_id else None
 
     try:
         if do_eval:
-            from groundhog.utils.results import write_result
+            # The standard finish: evaluate, then gates -> record -> commit
+            # -> score note, exactly as the automated strategies finish.
+            from groundhog.utils.finalize import finalize_attempt
 
             result = task.evaluate(ws.path, through=through)
-            write_result(ws.path, result, metadata={"strategy": "manual", "cost": 0.0})
             print("Evaluation:")
             _print_stage_scores(result, scorer)
-            success = result.completed and not do_fail
+            if do_fail:
+                result.completed = False  # user's verdict: record real work as failed
+            attempt = finalize_attempt(
+                toolkit, ws, result, prior, strategy="manual"
+            )
+            _print_gate_outcome(attempt.metadata)
         else:
+            # No evaluation of record — but the gates and the producer
+            # metadata apply to every commit. Composed from the same public
+            # pieces the standard finish uses (result.json stays eval-only).
+            from groundhog.utils.direction import (
+                inherit_direction_from_attempt,
+                promote_workspace_direction,
+                workspace_name,
+            )
+            from groundhog.utils.gates import evaluate_gates
+            from groundhog.utils.results import write_metadata
+
+            if prior is None:
+                promote_workspace_direction(ws.path)
+            violations = evaluate_gates(
+                ws.path, prior, history=history, exclude=[ws.display_id]
+            )
+            metadata = {
+                "strategy": "manual",
+                "prior": prior.id if prior else None,
+                "cost": 0.0,
+            }
             success = not do_fail
+            for v in violations:
+                if v.severity == "fail":
+                    metadata["gate_failure"] = v.message
+                    success = False
+                elif v.gate == "direction-modified":
+                    metadata["direction_restored"] = True
+                elif v.gate == "solution-identical":
+                    metadata["non_promotable"] = True
+                    metadata["non_promotable_reason"] = v.message
+            if prior is not None:
+                inherit_direction_from_attempt(prior, ws.path)
+            write_metadata(ws.path, metadata)
+            if not ws.name:
+                derived = workspace_name(ws.path)
+                if derived:
+                    ws.name = derived
+            attempt = ws.commit(success=success)
+            _print_gate_outcome(metadata)
 
-        if not ws.name:
-            from groundhog.utils.direction import workspace_name
-            derived = workspace_name(ws.path)
-            if derived:
-                ws.name = derived
-
-        attempt = ws.commit(success=success)
-        verdict = "done" if success else "fail"
-        print(f"Committed attempt {attempt.id} ({verdict})")
+        print(f"Committed attempt {attempt.id} ({attempt.status})")
         return 0
     except Exception as e:  # noqa: BLE001
         print(f"Commit failed: {e}")
         return 1
+
+
+def _print_gate_outcome(metadata):
+    """Surface what the gates decided so the session user is never surprised."""
+    if metadata.get("gate_failure"):
+        print(f"Gate: {metadata['gate_failure']} -> committed as failed")
+    if metadata.get("non_promotable"):
+        print(f"Gate: {metadata.get('non_promotable_reason', 'non-promotable')} "
+              f"-> flagged non-promotable (commit stays done)")
+    if metadata.get("direction_restored"):
+        print("Gate: inherited core_direction.md was modified -> parent's "
+              "direction restored")
 
 
 def _attempt_abort(args):
