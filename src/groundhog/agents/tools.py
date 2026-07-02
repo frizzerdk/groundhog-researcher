@@ -121,10 +121,104 @@ def build_default_agent_tools(toolkit) -> list:
 
     Eval tools and learnings are built by the strategy (which owns the workspace
     and can add policies like promote-best); task-specific tools come from the
-    task.py ``agent_tools(toolkit)`` hook via ``assemble_toolkit``. This layer is
-    currently empty — placeholder for future framework utilities.
+    task.py ``agent_tools(toolkit)`` hook via ``assemble_toolkit``.
+
+    Tools built here bind the toolkit THEMSELVES: assemble_toolkit only
+    binds task-hook tools (collect_task_tools), so a toolkit-injecting
+    default left unbound would raise at invoke time.
     """
-    return []
+    from groundhog.base.agent import agent_tool
+
+    tools = [agent_tool(check_gates)]
+    for t in tools:
+        t.bind_toolkit(toolkit)
+    return tools
+
+
+def check_gates(toolkit) -> str:
+    """Check the attempt in flight against the run's legitimacy gates —
+    core direction present and unique (fresh attempts), inherited direction
+    unmodified, solution not byte-identical to the parent. Reports exactly
+    what the commit-time gate would find, so a failure surfaces mid-work
+    instead of at commit. Read-only; changes nothing.
+    """
+    from groundhog.utils.gates import evaluate_gates
+
+    handle = getattr(toolkit, "ws", None)
+    if handle is None or not handle.is_set():
+        return (
+            "No attempt is in flight — check-gates reads the current "
+            "workspace via toolkit.ws. From the CLI, point it at one with "
+            "`groundhog tool run check-gates --attempt <id>`."
+        )
+
+    ws = handle.current
+    history = getattr(toolkit, "history", None)
+    parent, parent_known = _resolve_parent(ws, history)
+
+    lines = []
+    if not parent_known:
+        lines.append(
+            "note: this workspace's parent could not be determined — "
+            "checking it as a FRESH attempt (direction gates apply)."
+        )
+
+    # Exclude the attempt itself from the duplicate check under every
+    # identity it may carry: a live workspace's display id, and — when the
+    # handle points at a committed attempt (read-only view) — the record's
+    # own id (display_id is the NAME there, which direction_exists ignores).
+    self_ids = {
+        getattr(ws, "display_id", None),
+        getattr(getattr(ws, "attempt", None), "id", None),
+    }
+    self_ids.discard(None)
+
+    violations = evaluate_gates(
+        handle.path,
+        parent,
+        history=history,
+        exclude=self_ids,
+    )
+    if not violations:
+        lines.append("All gates pass: this attempt would commit clean.")
+        return "\n".join(lines)
+
+    lines.append(f"{len(violations)} gate violation(s):")
+    for v in violations:
+        lines.append(f"- [{v.severity.upper()}] {v.gate}: {v.message}")
+        if v.severity == "fail":
+            lines.append(
+                "    -> the standard finish would commit this attempt as FAILED"
+            )
+        else:
+            lines.append(
+                "    -> recorded in metadata; the commit itself stays done"
+            )
+    return "\n".join(lines)
+
+
+def _resolve_parent(ws, history):
+    """Best-effort parent Attempt for the gate check.
+
+    Returns (parent, known): ``known`` is False only when the workspace
+    carries no parent information at all (e.g. a foreign live workspace),
+    in which case the caller should say it assumed fresh.
+    """
+    parent_id = getattr(ws, "parent", None)
+    if parent_id is None:
+        attempt = getattr(ws, "attempt", None)  # ReadOnlyWorkspaceView
+        if attempt is not None:
+            parent_id = getattr(attempt, "parent", None)
+        elif not hasattr(ws, "parent"):
+            return None, False  # no parent channel at all
+    if parent_id in (None, "", "none"):
+        return None, True  # genuinely fresh
+    if history is None:
+        return None, False
+    parent = history.get(parent_id)
+    if parent is None:
+        return None, False
+    return parent, True
 
 
 def _merge_agent_tools(lower: list, higher: list, *, layer: str, log=None) -> list:
