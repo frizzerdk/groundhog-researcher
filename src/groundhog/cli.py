@@ -618,8 +618,11 @@ def _attempt_commit(args):
     do_fail, args = _flag(args, "--fail")
     do_eval, args = _flag(args, "--eval")
     through, args = _opt(args, "--through")
+    strategy, args = _opt(args, "--strategy")
+    strategy = strategy or "manual"
     if not args:
-        print("Usage: groundhog attempt commit <wsid> [--fail] [--eval] [--through STAGE]")
+        print("Usage: groundhog attempt commit <wsid> [--fail] [--eval] "
+              "[--through STAGE] [--strategy LABEL]")
         return 1
     wsid = args[0]
 
@@ -651,7 +654,7 @@ def _attempt_commit(args):
             if do_fail:
                 result.completed = False  # user's verdict: record real work as failed
             attempt = finalize_attempt(
-                toolkit, ws, result, prior, strategy="manual"
+                toolkit, ws, result, prior, strategy=strategy
             )
             _print_gate_outcome(attempt.metadata)
         else:
@@ -672,7 +675,7 @@ def _attempt_commit(args):
                 ws.path, prior, history=history, exclude=[ws.display_id]
             )
             metadata = {
-                "strategy": "manual",
+                "strategy": strategy,
                 "prior": prior.id if prior else None,
                 "cost": 0.0,
             }

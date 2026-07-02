@@ -671,3 +671,36 @@ def test_commit_duplicate_direction_fails_second_attempt(tmp_path, capsys):
         out = capsys.readouterr().out
         assert "Gate: fresh attempt duplicated an existing core direction" in out
         assert "(fail)" in out
+
+
+def test_commit_strategy_label_lands_in_metadata(tmp_path, capsys):
+    """--strategy labels the producer on BOTH commit paths (default: manual)."""
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        # --eval path
+        wsid, ws_path = _open_ws(run_dir, capsys)
+        (ws_path / "solution.py").write_text("def solve():\n    return 50.0\n",
+                                             encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
+        rc = attempt_group(["commit", wsid, "--eval", "--strategy", "session"])
+        assert rc == 0
+        capsys.readouterr()
+        attempt = rundir.load_run(run_dir=run_dir).history.get("1")
+        assert attempt.metadata["strategy"] == "session"
+
+        # no-eval path
+        attempt_group(["new"])
+        out = capsys.readouterr().out
+        wsid2 = [l for l in out.splitlines()
+                 if l.startswith("Opened workspace")][0].split()[-1]
+        loaded = rundir.load_run(run_dir=run_dir)
+        ws2 = [ip.path for ip in loaded.history.list_in_progress()
+               if ip.workspace_id == wsid2][0]
+        (ws2 / "solution.py").write_text("def solve():\n    return 49.0\n",
+                                         encoding="utf-8")
+        rc = attempt_group(["commit", wsid2, "--strategy", "session-swarm"])
+        assert rc == 0
+        capsys.readouterr()
+        a2 = rundir.load_run(run_dir=run_dir).history.get("2")
+        assert a2.metadata["strategy"] == "session-swarm"
