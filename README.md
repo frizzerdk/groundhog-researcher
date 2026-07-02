@@ -26,7 +26,7 @@ groundhog backends
 groundhog init my_task           # basic template
 # groundhog init-llm my_task    # detailed template with full LLM guide
 # groundhog init-mock my_task   # mock task, no LLM needed, for testing
-# groundhog init-mnist my_task  # 5 sample MNIST digit classification, real ML task
+# groundhog init-mnist my_task  # 50-sample MNIST digit classification, real ML task
 
 cd my_task
 uv run python task.py 10
@@ -60,6 +60,16 @@ groundhog backends                Show available backends and tier assignments
 groundhog prefer <backend>        Prefer a backend for all tiers
 groundhog prefer-tier <tier> <backend> [model]
 groundhog prefer reset            Reset all preferences
+
+groundhog attempt <subcommand>    Manual attempt lifecycle: new (--fresh founds a
+                                  new family) / list / show / commit (gated,
+                                  --strategy labels the producer) / abort /
+                                  resume / reap / in-progress / best
+groundhog eval <path-or-id>       Score a solution dir, .py file, or attempt
+groundhog tool list|run           Run any toolkit tool from the terminal
+                                  (check-gates ships as a framework default)
+groundhog skills install [dir]    Install the Claude Code session skills into a
+                                  run dir (every init does this automatically)
 
 groundhog --version
 ```
@@ -139,12 +149,12 @@ my_task/
     .env                    # API keys (optional)
     learnings.md            # what the optimizer has learned
     attempts/               # every candidate
-        001_none/           # first attempt (no parent)
-            solution.py
+        001_none_done/      # first attempt (no parent; committed attempts
+            solution.py     #   gain a _done/_fail suffix)
             result.json
             attemptlog.jsonl    # every event: prompts, responses, evals, costs
             attemptlog.md       # the same, human-readable
-        002_1/              # second attempt (parent=1)
+        002_1_done/         # second attempt (parent=1)
             ...
 ```
 
@@ -229,8 +239,10 @@ class MyStrategy(Strategy):
         ws = toolkit.history.workspace(parent=None)
         # ... generate code, write to ws.path / "solution.py" ...
         result = toolkit.task.evaluate(ws.path, through="evaluate")
-        attempt = ws.commit(result, metadata={"strategy": "mine"})
-        return {"attempt": attempt.number}
+        from groundhog.utils.finalize import finalize_attempt
+        attempt = finalize_attempt(toolkit, ws, result, None,
+                                   strategy="mine")
+        return {"attempt": attempt.id}
 ```
 
 ## Core concepts
@@ -248,15 +260,17 @@ class MyStrategy(Strategy):
 
 ```
 base/           # interfaces only -- Task, Strategy, Optimizer, AttemptHistory, etc.
-strategies/     # Improve, FreshApproach, CrossPollinate, Analyse
+strategies/     # Improve, FreshApproach, CrossPollinate, Analyse + agent variants
 optimizers/     # SimpleOptimizer
-histories/      # FolderAttemptHistory
+histories/      # FolderAttemptHistory, GitAttemptHistory
 backends/       # Gemini, Anthropic, OpenAI-compatible, Claude Code CLI, + more
+agents/         # agent backends -- Claude Code, Gemini CLI, Copilot, Codex, OpenCode
 learnings/      # MarkdownLearnings
 acceptance/     # DefaultAcceptance
 tools/          # attempt_logger, attempt_log (console), cost_estimate, queue
-utils/          # codegen, subprocess_runner, selection
+utils/          # codegen, subprocess_runner, selection, gates, finalize
 templates/      # task scaffolding templates (used by groundhog init)
+skills/         # packaged Claude Code session skills (groundhog skills install)
 ```
 
 `base/` defines interfaces. Everything else is implementations. Build your own by subclassing the interfaces.

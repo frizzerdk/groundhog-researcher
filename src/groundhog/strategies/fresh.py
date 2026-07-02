@@ -82,7 +82,7 @@ class FreshApproach(Strategy):
     def _prepare_workspace(self, toolkit, ws):
         (ws.path / "TASK_CONTEXT.md").write_text(toolkit.task.context.get(), encoding="utf-8")
         # Learnings are included in the prompt via build_prompt(learnings=...),
-        # and logged in conversation.json — no need to duplicate as a file.
+        # and logged in the attempt log — no need to duplicate as a file.
 
     # --- Core work ---
 

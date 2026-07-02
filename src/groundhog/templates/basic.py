@@ -61,7 +61,11 @@ class MyEvaluator(Evaluator):
         return [
             EvalStage("smoke", "Syntax check", lambda cp: self._smoke(cp)),
             EvalStage("evaluate", "Full evaluation",
-                      lambda cp: self.evaluate(cp, data)),
+                      lambda cp: self.evaluate(cp, data),
+                      # Scorer reads metrics — result.score is never
+                      # persisted, so a committed attempt re-scores from
+                      # metrics read-side.
+                      scorer=lambda r: r.metrics.get("score", 0.0)),
         ]
 
     def _smoke(self, code_or_path):

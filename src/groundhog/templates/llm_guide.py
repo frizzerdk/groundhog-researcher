@@ -116,7 +116,9 @@ Example:
 #   StageResult(errors={"runtime": "division by zero"})     — failure
 #
 # Each stage has a SCORER — a function that extracts a comparable score
-# from the StageResult. The default scorer returns metrics["score"].
+# from the StageResult. The default scorer returns result.score, which is
+# NOT persisted across runs — give each scored stage a scorer that reads
+# metrics (as below).
 # Custom scorers let you score by any metric:
 #   EvalStage("eval", "...", call, scorer=lambda r: r.metrics["accuracy"])
 #

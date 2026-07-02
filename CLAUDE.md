@@ -11,7 +11,7 @@ The package is published to PyPI as `groundhog-researcher` and exposes the `grou
 ## Common commands
 
 ```bash
-# Test suite (~129 tests, fast — runs in seconds)
+# Test suite (~336 tests, fast — runs in under a minute)
 pytest
 
 # Iterating on a single area (preferred during work)
@@ -23,8 +23,13 @@ pytest tests/test_concepts.py -k <name>
 
 # CLI (after installing the package or running from source)
 groundhog backends                        # show discovered backends and tier assignments
-groundhog init my_task                    # scaffold a task
+groundhog init my_task                    # scaffold a task (installs the session skills too)
 groundhog prefer <backend>                # preference written to ~/.groundhog/config.json
+groundhog attempt <sub>                   # manual attempt lifecycle -- new (--fresh), list,
+                                          #   show, commit (gated, --strategy), abort, ...
+groundhog eval <path-or-id>               # score a solution dir, .py file, or attempt
+groundhog tool list|run                   # run toolkit tools (check-gates is a default)
+groundhog skills install [dir]            # copy the packaged session skills into a run dir
 
 # Sandbox probe — runs each agent backend through a 9-op gauntlet, reports filesystem ground truth.
 # Use before changes that touch agent sandboxing. Costs API/CLI calls.
@@ -42,7 +47,7 @@ cd tests/e2e_mnist_agent && uv run task.py llm 4      # LLM-strategy rotation (I
 - **base/ is interfaces only.** No implementation in base/; base classes are the essence of the concept, nothing more.
 - **Strategies own the full loop.** Select prior → workspace → generate → evaluate → record. Strategy-specific logic never leaks into the optimizer.
 - **Composed method pattern.** Strategy `__call__` reads like a story of named step methods; details live in the steps.
-- **Raw results, never scores.** Attempts store metrics dicts; scoring is read-side via per-stage scorers. Never persist a score.
+- **Raw results, never scores.** Attempts store metrics dicts; scoring is read-side via per-stage scorers. Never persist a score in the attempt record — the one sanctioned carve-out is the mutable score NOTE (notes.json / git note), a display-only cache that is never read for decisions.
 - **Toolkit is capabilities, not tools.** Strategies `hasattr`-check and fall back gracefully; never assume a capability exists.
 - **Config is self-documenting.** Every knob is `param(default, "description")`, introspectable via `Config.describe()`.
 - **Nothing is discarded.** Every attempt — success or failure — is recorded; failures inform future strategies.
@@ -50,14 +55,13 @@ cd tests/e2e_mnist_agent && uv run task.py llm 4      # LLM-strategy rotation (I
 
 ## Releasing
 
-Two version locations must match — they're checked by CI:
+The version lives in ONE place: `src/groundhog/__init__.py` `__version__`
+(`pyproject.toml` is hatch-dynamic and reads it). The publish workflow's
+version-check job rejects a tag that doesn't equal `__version__`.
 
-- `pyproject.toml` `[project] version`
-- `src/groundhog/__init__.py` `__version__`
+Push a tag `v<version>` to trigger the GitHub Actions trusted-publishing workflow that releases to PyPI (it reruns the full test matrix first). Every release is a discrete decision — confirm with the user before commit/push/tag.
 
-Push a tag `v<version>` to trigger the GitHub Actions trusted-publishing workflow that releases to PyPI. Every release is a discrete decision — confirm with the user before commit/push/tag.
-
-Full pre-release checklist: `checklist.md` (repo root) — the consistency manifest covering everything tests can't catch (templates, README, vault alignment, model IDs). Run it before any release commit. Note CI runs test files **as scripts** (no pytest): new test files need a `__main__` runner, no pytest fixtures, and entries in both workflows.
+Full pre-release checklist: `checklist.md` (repo root) — the consistency manifest covering everything tests can't catch (templates, README, vault alignment, model IDs). Run it before any release commit. CI runs the whole suite via `pytest tests/` — new test files are auto-discovered, no workflow edits needed.
 
 ## Architecture
 
@@ -73,7 +77,7 @@ USER CODE  →  OPTIMIZER  →  STRATEGY  →  AGENT BACKEND  →  AGENT CLI
 - **`Task`** = `Data + Context + Evaluator`. The problem definition.
 - **`Evaluator.get_stages()`** returns ordered `EvalStage`s (cheap → expensive). Each stage has a `scorer` callable that maps `StageResult.metrics` to a float — **scores are computed, not persisted**, so changing the scorer reinterprets history without re-running anything.
 - **`Strategy.__call__(toolkit, config=None)`** is the unit of progress. It selects a prior, creates a `Workspace`, generates+evaluates a candidate, and `ws.commit(result, ...)` writes an immutable `Attempt`.
-- **`Toolkit`** is a `SimpleNamespace`-like container the optimizer hands to strategies (holds `task`, `history`, `learnings`, `llm`, `agent`, `agent_tools`, `attempt_logger`, `attempt_log`, plus user-added capabilities). `Toolkit.__setattr__` warns when overriding a public attribute; **underscore-prefixed names skip the warning** — use `_foo` for private bookkeeping the optimizer passes through (e.g. `_current_queue_label`).
+- **`Toolkit`** is a `SimpleNamespace`-like container the optimizer hands to strategies (holds `task`, `history`, `learnings`, `llm`, `agent`, `agent_tools`, `attempt_logger`, `attempt_log`, `ws` (the attempt pointer), `gates` (GateKit — pure legitimacy facts, utils/gates.py), `finalize` (the standard finish — promote/gates/record/commit/score-note in one call, utils/finalize.py), plus user-added capabilities). `Toolkit.__setattr__` warns when overriding a public attribute; **underscore-prefixed names skip the warning** — use `_foo` for private bookkeeping the optimizer passes through (e.g. `_current_queue_label`).
 - **`AttemptHistory`** is the immutable-tree interface (`workspace(parent)`, `get(num)`, iteration, `best(scorer)` — re-scores on demand, never persists scores). `FolderAttemptHistory` is the default implementation; its on-disk convention (`attempts/<num>_<parent>/` directories with `solution.py`, `result.json`, `attemptlog.jsonl`/`.md`, agent raw streams) is implementation detail, not part of the interface contract — other backends (DB, object store, etc.) can implement the same interface differently.
 - **`AgentBackend.run(spec: AgentSpec) → AgentResult`** is the contract every CLI agent wrapper implements. `AgentSpec` carries `goal`, `workspace`, `tools` (a list of `AgentTool`s exposed via the HTTP tool server), `allowed_tools` / `denied_tools` (permission rules), `model`, `effort`, `budget_usd`, `session_id`, and `on_event` (callback fired per streamed event — **every backend's subprocess loop must call this**).
 
@@ -114,7 +118,7 @@ Agents must write only to `attempt/work/`. Reads from `attempt/` (sibling soluti
 
 **npm `.cmd` shims truncate multi-line argv on Windows** at the first `\n` (cmd.exe interprets newlines as command terminators in `%*` expansion). When wrapping a Node CLI, resolve to the `.exe` directly or call `node path/to/bundle.js`. Symptom: model receives only the first line of the prompt. Linux is unaffected — the shim issue is cmd.exe-specific.
 
-**Removed patterns, do not reintroduce**: (a) `self.log.start / inline / tock` as the rendering surface (replaced by `AttemptLog` in v0.2.17); (b) `conversation_log` / per-attempt `conversation.json` (replaced by the typed event stream). Emit per-attempt events with `toolkit.attempt_logger.log(UserEvent/AssistantEvent/ToolCallEvent/...)`; lifecycle via `.attempt_start(ws.path, ...)`, `.attempt_done(...)`, `.attempt_failed(...)`. Attempt cost is **derived from the log** (`logger.total_cost()`), not accumulated on the strategy.
+**Removed patterns, do not reintroduce**: (a) `self.log.start / inline / tock` as the per-attempt rendering surface (replaced by `AttemptLog` in v0.2.17; two plain-LLM strategies still use `StrategyLog` for console progress lines only); (b) `conversation_log` / per-attempt `conversation.json` (replaced by the typed event stream). Emit per-attempt events with `toolkit.attempt_logger.log(UserEvent/AssistantEvent/ToolCallEvent/...)`; lifecycle via `.attempt_start(ws.path, ...)`, `.attempt_done(...)`, `.attempt_failed(...)`. Attempt cost is **derived from the log** (`logger.total_cost()`), not accumulated on the strategy.
 
 **Claude permission semantics**: `deny > allow`. A narrow allow is shadowed by a broader deny — check both lists when permissions misbehave.
 

@@ -106,7 +106,7 @@ class Improve(Strategy):
         from groundhog.utils.direction import inherit_direction_from_attempt
         inherit_direction_from_attempt(prior, ws.path)
         # Learnings are included in the prompt via build_prompt(learnings=...),
-        # and logged in conversation.json — no need to duplicate as a file.
+        # and logged in the attempt log — no need to duplicate as a file.
 
     # --- Prior results context ---
 

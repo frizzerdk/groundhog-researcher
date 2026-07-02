@@ -15,13 +15,8 @@ Information is duplicated across code, templates, README, vault docs, and CLI ou
 
 ## Automated checks (run these first)
 
-- [ ] `pytest` — full suite green (local convenience; CI has no pytest)
-- [ ] `uv run python tests/test_concepts.py` — all pass
-- [ ] `uv run python tests/test_agent_concepts.py` — all pass
-- [ ] `uv run python tests/test_attempt_logger.py` — all pass
-- [ ] CI runs test files **as scripts** — a new test file needs a
-      `__main__` runner, no pytest fixtures, and entries in BOTH
-      workflows (test.yml + publish.yml)
+- [ ] `pytest` — full suite green (the same command CI runs across the
+      OS/Python matrix; new test files are auto-discovered)
 - [ ] `uv build` — package builds
 - [ ] `uv run python -c "from groundhog import *"` — all exports work
 
@@ -70,7 +65,7 @@ What to walk (no list here — a list in a drift-checklist drifts):
 - [ ] All strategies use `extract_code(response.text, prior_code)` — no `_apply_response`, no direct `parse_diff`/`apply_diff`
 - [ ] core_direction.md: fresh strategies mint a new one, Improve/CrossPollinate inherit and re-enforce the parent's (legacy approach.md read as fallback)
 - [ ] Improve system prompt reflects current research methodology
-      (per vault `Optimizer/Research Methodology/Overview.md`)
+      (per vault `Optimizer/Research Methodology/Research Methodology Overview.md`)
 
 ## Backends
 
@@ -87,8 +82,9 @@ What to walk (no list here — a list in a drift-checklist drifts):
       removed-patterns list, smoke instructions)
 - [ ] `docs/sandboxing.md` + `docs/agent_system.md` match per-backend
       behavior (permission rules, phase flow)
-- [ ] Both workflows (test.yml + publish.yml) list every test file —
-      check the list, not just new additions
+- [ ] Both workflows still run the whole suite via `pytest tests/` —
+      new test files need no workflow edits, just a `tests/test_*.py`
+      name so pytest collects them
 
 ## Smoke (when behavior changed)
 
@@ -99,9 +95,9 @@ What to walk (no list here — a list in a drift-checklist drifts):
 
 ## Version + release
 
-- [ ] Version bumped in BOTH `pyproject.toml` and
-      `src/groundhog/__init__.py` (CI rejects a mismatch)
+- [ ] Version bumped in `src/groundhog/__init__.py` (the single
+      source — pyproject.toml is hatch-dynamic)
 - [ ] Commit message describes the release; no tool attribution
 - [ ] Commit approved explicitly; tag + push approved separately —
-      pushing tag `v<version>` (must equal both file versions) triggers
-      the PyPI publish
+      pushing tag `v<version>` (must equal `__version__`; the publish
+      workflow's version-check enforces it) triggers the PyPI publish

@@ -44,10 +44,11 @@ LLM TIERS:
   toolkit.llm.get("cheap")    — bulk/fast operations
   Missing tiers fall back to "default".
 
-CONVERSATION LOGGING:
-  self.log_conversation(ws.path, prompt, role="User")           # log a prompt
-  self.log_conversation(ws.path, response)                      # log an LLMResponse
-  self.log_conversation(ws.path, response, label="Learnings")   # tagged segment
+ATTEMPT-EVENT LOGGING (costs ride on events; totals derive from the log):
+  self.logger.log(UserEvent(content=prompt))                    # log a prompt
+  self.logger.log(AssistantEvent(content=response.text,
+                                 role=response.model,
+                                 cost=response.cost))           # log a response
 
 RETURN VALUE:
   Return a Dict[str, Any] for logging/debug. Nothing depends on it.

@@ -126,19 +126,24 @@ def discover_backends() -> Dict[str, LLMBackend]:
 
 
 # Alias map: user-friendly names -> discovery names
+# ("gemini" used to alias to gemini_cli; the CLI's free tier is discontinued,
+# so the bare name now resolves naturally to the API backend's own key.)
 BACKEND_ALIASES = {
-    "gemini": "gemini_cli",   # "gemini" prefers CLI over API
     "claude": "claude_code",
 }
 
 # Tier definitions: name, priority list, variant function
 # Tiers from strongest to cheapest: max > high > default > budget > cheap
+# gemini_cli sits at the tail of every tier: Google discontinued the CLI's
+# free individual tier (2026), so it only makes sense as a last resort on
+# machines where it still authenticates. The paid-key "gemini" API backend
+# keeps its normal placement.
 TIER_DEFS = {
-    "max":     ["anthropic", "openai", "gemini", "gemini_cli", "claude_code", "copilot", "openrouter"],
-    "high":    ["gemini", "gemini_cli", "anthropic", "openai", "claude_code", "copilot", "openrouter"],
-    "default": ["claude_code", "anthropic", "gemini", "gemini_cli", "openai", "deepseek", "copilot", "openrouter", "opencode", "groq"],
-    "budget":  ["deepseek", "groq", "gemini", "gemini_cli", "openai", "claude_code", "copilot", "ollama"],
-    "cheap":   ["ollama", "deepseek", "groq", "gemini", "gemini_cli", "openai", "claude_code", "copilot"],
+    "max":     ["anthropic", "openai", "gemini", "claude_code", "copilot", "openrouter", "gemini_cli"],
+    "high":    ["gemini", "anthropic", "openai", "claude_code", "copilot", "openrouter", "gemini_cli"],
+    "default": ["claude_code", "anthropic", "gemini", "openai", "deepseek", "copilot", "openrouter", "opencode", "groq", "gemini_cli"],
+    "budget":  ["deepseek", "groq", "gemini", "openai", "claude_code", "copilot", "ollama", "gemini_cli"],
+    "cheap":   ["ollama", "deepseek", "groq", "gemini", "openai", "claude_code", "copilot", "gemini_cli"],
 }
 
 

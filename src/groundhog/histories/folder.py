@@ -6,8 +6,8 @@ Directory structure:
             001_none/       ← first attempt (no parent)
                 solution.py
                 result.json
-                conversation.json
-                conversation.md
+                metadata.json
+                notes.json          (mutable annotations, e.g. score cache)
                 TASK_CONTEXT.md
             002_1/          ← second attempt (parent=1)
                 ...
@@ -185,6 +185,13 @@ class FolderAttemptHistory(AttemptHistory):
             except FileExistsError:
                 # Another process is mid-claim at this number. Brief backoff
                 # so we don't spin while they finish, then re-scan.
+                time.sleep(0.05)
+                continue
+            except PermissionError:
+                # Windows: a sentinel being rmdir'd by its winner is briefly
+                # in a "delete pending" state — mkdir at the same path raises
+                # PermissionError instead of FileExistsError. Same contention,
+                # same treatment: back off and re-scan.
                 time.sleep(0.05)
                 continue
 

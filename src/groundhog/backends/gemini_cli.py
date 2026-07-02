@@ -41,7 +41,10 @@ def _resolve_gemini_invocation() -> list:
 class GeminiCLIBackend(LLMBackend):
     """Google Gemini via the Gemini CLI. Uses Google account auth.
 
-    Free tier: 1000 requests/day with Google sign-in.
+    NOTE: Google discontinued the CLI's free individual tier (2026) —
+    auth now requires paid Gemini Code Assist or an API key, so this
+    backend is auto-discovered at the lowest tier priority. Prefer the
+    API backend (GEMINI_API_KEY) or OpenRouter for Gemini models.
     Install: npm install -g @google/gemini-cli
     """
 
