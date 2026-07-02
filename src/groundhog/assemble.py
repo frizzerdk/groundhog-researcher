@@ -104,6 +104,13 @@ def assemble_toolkit(
     tk.ws = WorkspaceHandle(tk.history)
     tk.workspace = tk.ws
 
+    # Legitimacy gates: pure facts about a workspace (direction present /
+    # unique, solution identical to parent). Bound before the agent-tools
+    # block so default tools (check-gates) and the task hook can close over
+    # it. Responding to violations stays with the caller — see utils/gates.
+    from groundhog.utils.gates import GateKit
+    tk.gates = GateKit(tk)
+
     # Agent tools LAST, so the task hook sees the finished bench: framework
     # defaults merged with the task.py hook's tools (task wins on a name
     # collision, and the shadow is logged). Set exactly once — no override

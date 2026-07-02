@@ -974,42 +974,40 @@ class AgentStrategy(Strategy):
         in metadata so selectors skip it. Diversity > a few BT points.
         """
         from groundhog.utils.direction import (
-            direction_exists,
+            inherit_direction_from_attempt,
             mark_result_failed,
             promote_workspace_direction,
-            read_direction,
+        )
+        from groundhog.utils.gates import (
+            DIRECTION_MODIFIED,
+            SOLUTION_IDENTICAL,
+            evaluate_gates,
         )
         metadata = self._build_metadata(prior)
 
+        # Mutation first (fresh only): surface the agent-written direction
+        # so the gates judge the post-promote state.
         if prior is None:
             promote_workspace_direction(ws.path)
-            direction = read_direction(ws.path)
-            history = getattr(getattr(self, "_toolkit", None), "history", None)
-            if not direction:
-                reason = "fresh attempt did not create core_direction.md"
-                metadata["gate_failure"] = reason
-                mark_result_failed(result, "core_direction", reason)
-            elif direction_exists(
-                history,
-                direction,
-                exclude=[ws.display_id],
-                only_done=False,
-            ):
-                reason = "fresh attempt duplicated an existing core direction"
-                metadata["gate_failure"] = reason
-                mark_result_failed(result, "core_direction", reason)
-        elif prior is not None:
-            from groundhog.utils.direction import (
-                inherit_direction_from_attempt,
-                inherited_direction_changed_from,
-            )
-            if inherited_direction_changed_from(ws.path, prior):
-                metadata["direction_restored"] = True
-            inherit_direction_from_attempt(prior, ws.path)
 
-        if self._is_solution_duplicate(ws, prior):
-            metadata["non_promotable"] = True
-            metadata["non_promotable_reason"] = "solution.py is byte-identical to parent"
+        history = getattr(getattr(self, "_toolkit", None), "history", None)
+        violations = evaluate_gates(
+            ws.path, prior, history=history, exclude=[ws.display_id]
+        )
+        for v in violations:
+            if v.severity == "fail":
+                metadata["gate_failure"] = v.message
+                mark_result_failed(result, "core_direction", v.message)
+            elif v.gate == DIRECTION_MODIFIED:
+                metadata["direction_restored"] = True
+            elif v.gate == SOLUTION_IDENTICAL:
+                metadata["non_promotable"] = True
+                metadata["non_promotable_reason"] = v.message
+
+        # Mutation second (inherited only): restore the parent's direction
+        # unconditionally — the soft-gate that keeps families from forking.
+        if prior is not None:
+            inherit_direction_from_attempt(prior, ws.path)
 
         from groundhog.utils.results import write_result
         write_result(ws.path, result, metadata=metadata)
