@@ -43,6 +43,7 @@ never depend on machine configuration; ``core.autocrlf`` is forced off.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -55,6 +56,8 @@ from groundhog.base.types import EvaluationResult, StageResult
 from groundhog.base.attempt_history import (
     Attempt, Workspace, AttemptHistory, InProgress)
 from groundhog.utils.results import read_result, write_metadata, read_attempt_metadata
+
+_NOTE_KEY = re.compile(r"^[a-z0-9_-]{1,64}$")
 from groundhog.utils.direction import slugify
 
 
@@ -532,6 +535,34 @@ class GitAttemptHistory(AttemptHistory):
             self._clear_heartbeat(ip.workspace_id)
             reaped += 1
         return reaped
+
+    def set_note(self, attempt_or_id, key: str, value: str) -> None:
+        """Mutable annotation as a real git note (``refs/notes/groundhog/<key>``).
+
+        Shows up natively in the browsable store:
+        ``git log --show-notes=groundhog/<key>``. Overwrites on re-set; the
+        attempt commit itself is untouched (immutability holds — notes are a
+        scratch channel, e.g. the latest computed score cache).
+        """
+        if not _NOTE_KEY.match(key or ""):
+            raise ValueError(f"invalid note key {key!r} (use [a-z0-9_-], max 64)")
+        sha = attempt_or_id.id if hasattr(attempt_or_id, "id") else str(attempt_or_id)
+        res = self._git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}",
+                        check=False)
+        if res.returncode != 0:
+            raise KeyError(f"unknown attempt {sha!r}")
+        self._git("notes", f"--ref=refs/notes/groundhog/{key}",
+                  "add", "-f", "-m", str(value), sha)
+
+    def get_note(self, attempt_or_id, key: str) -> Optional[str]:
+        if not _NOTE_KEY.match(key or ""):
+            return None
+        sha = attempt_or_id.id if hasattr(attempt_or_id, "id") else str(attempt_or_id)
+        res = self._git("notes", f"--ref=refs/notes/groundhog/{key}",
+                        "show", sha, check=False)
+        if res.returncode != 0:
+            return None
+        return res.stdout.decode("utf-8", errors="replace").strip()
 
     def materialize(self, attempt_or_id) -> Path:
         """Ensure the attempt's worktree folder exists on disk; return it.

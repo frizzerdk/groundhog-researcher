@@ -553,6 +553,9 @@ def _attempt_show(args):
     print(f"status:  {attempt.status}")
     print(f"name:    {attempt.name}")
     print(f"created: {attempt.created_at}")
+    cached = history.get_note(attempt.id, "score")
+    if cached is not None:
+        print(f"note[score]: {cached}   (mutable cache — canonical score is read-side)")
     print(f"metadata: {attempt.metadata}")
     print()
     print("stages:")

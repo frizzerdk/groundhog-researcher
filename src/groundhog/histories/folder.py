@@ -15,6 +15,7 @@ Directory structure:
 """
 
 import json
+import re
 import shutil
 import time
 from pathlib import Path
@@ -237,6 +238,36 @@ class FolderAttemptHistory(AttemptHistory):
             if attempt.id == id:
                 return attempt
         return None
+
+    def set_note(self, attempt_or_id, key: str, value: str) -> None:
+        """Mutable annotation in a ``notes.json`` sidecar beside the record.
+
+        The attempt record (solution/result/metadata) stays immutable —
+        notes are an explicitly mutable scratch channel (e.g. the latest
+        computed score cache)."""
+        if not re.match(r"^[a-z0-9_-]{1,64}$", key or ""):
+            raise ValueError(f"invalid note key {key!r} (use [a-z0-9_-], max 64)")
+        a = self.get(attempt_or_id) if isinstance(attempt_or_id, str) else attempt_or_id
+        if a is None:
+            raise KeyError(f"unknown attempt {attempt_or_id!r}")
+        notes_path = Path(a.path) / "notes.json"
+        try:
+            notes = json.loads(notes_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            notes = {}
+        notes[key] = str(value)
+        notes_path.write_text(json.dumps(notes, indent=2), encoding="utf-8")
+
+    def get_note(self, attempt_or_id, key: str) -> Optional[str]:
+        a = self.get(attempt_or_id) if isinstance(attempt_or_id, str) else attempt_or_id
+        if a is None:
+            return None
+        try:
+            notes = json.loads((Path(a.path) / "notes.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        v = notes.get(key)
+        return None if v is None else str(v)
 
     def best(self, scorer: Callable[[StageResult], float]) -> Optional[FolderAttempt]:
         attempts = self.list()

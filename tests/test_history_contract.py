@@ -203,3 +203,73 @@ def test_status_direction_families_on_both_backends(history_factory, commit_atte
     assert "Direction families:" in out
     assert "rollout policy" in out
     assert "mcts search" in out
+
+
+def test_notes_are_mutable_annotations(history_factory, commit_attempt):
+    """set_note/get_note: a MUTABLE scratch channel beside the immutable
+    record (git: real git notes; folder: notes.json sidecar). Overwrites
+    win; missing reads are None; the attempt record is untouched."""
+    h = history_factory()
+    a = commit_attempt(h, code="def solve(): return 1")
+
+    assert h.get_note(a.id, "score") is None
+    h.set_note(a.id, "score", "0.8136")
+    assert h.get_note(a.id, "score") == "0.8136"
+    h.set_note(a.id, "score", "0.9000")          # mutable: re-set wins
+    assert h.get_note(a.id, "score") == "0.9000"
+    h.set_note(a, "tag", "baseline")             # attempt object works too
+    assert h.get_note(a, "tag") == "baseline"
+    # The record itself is untouched.
+    assert h.get(a.id).code == "def solve(): return 1"
+
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        h.set_note(a.id, "Bad Key!", "x")
+    with _pytest.raises(KeyError):
+        h.set_note("no-such-attempt", "score", "x")
+
+
+def test_optimizer_caches_score_note_per_attempt(history_factory):
+    """The run loop writes the latest computed score as a note on each new
+    attempt — refreshed whenever scoring runs, never part of the record."""
+    from groundhog import SimpleOptimizer, assemble_toolkit
+    from groundhog.base.types import (
+        Task, Data, Context, Evaluator, EvalStage, StageResult,
+    )
+    from groundhog.utils.results import write_result
+    from groundhog.base.types import EvaluationResult
+
+    class _Data(Data):
+        def get_train(self): return None
+        def get_test(self): return None
+
+    class _Ctx(Context):
+        def get_brief(self): return "b"
+        def get_extended(self): return "e"
+
+    class _Eval(Evaluator):
+        def evaluate(self, code_or_path, data):
+            return StageResult(metrics={"score": 0.75})
+        def get_stages(self, data):
+            return [EvalStage("eval", "e",
+                              lambda cp: StageResult(metrics={"score": 0.75}),
+                              scorer=lambda r: r.metrics.get("score", 0.0))]
+
+    class _Strat:
+        def __call__(self, toolkit, config=None):
+            ws = toolkit.history.workspace()
+            (ws.path / "solution.py").write_text("x = 1", encoding="utf-8")
+            write_result(ws.path, EvaluationResult(
+                stages={"eval": StageResult(metrics={"score": 0.75})}))
+            ws.commit(success=True)
+            return {}
+
+    history = history_factory()
+    task = Task(data=_Data(), context=_Ctx(), evaluator=_Eval(), name="t")
+    opt = SimpleOptimizer(assemble_toolkit(task, history=history),
+                          strategy=_Strat(), seed_strategy=None)
+    opt.run(n=1)
+
+    attempts = history.list()
+    assert len(attempts) == 1
+    assert history.get_note(attempts[0].id, "score") == "0.7500"

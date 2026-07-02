@@ -182,6 +182,21 @@ class AttemptHistory(ABC):
         Returns the number reaped. Default: nothing to reap."""
         return 0
 
+    def set_note(self, attempt_or_id, key: str, value: str) -> None:
+        """Attach/replace a MUTABLE annotation on a committed attempt.
+
+        Notes are a scratch channel beside the record, never part of it: the
+        attempt itself stays immutable and scores stay read-side-derived.
+        Use for low-effort caches like the latest computed score. Git backend
+        = real ``git notes`` (visible in ``git log``); folder backend = a
+        ``notes.json`` sidecar. Best-effort semantics; keys ``[a-z0-9_-]``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support notes")
+
+    def get_note(self, attempt_or_id, key: str) -> Optional[str]:
+        """Read a note set by :meth:`set_note`; ``None`` when absent."""
+        return None
+
     def materialize(self, attempt_or_id) -> Path:
         """Ensure the attempt's files exist as a folder on disk; return it.
 

@@ -293,6 +293,15 @@ def direction_title(text: str, max_len: int = 60) -> str:
         line = line.lstrip("#").strip()
         if not line:
             continue
+        # Strip a redundant "Core Direction:" label — the file IS the core
+        # direction, and agents often title it exactly that way. Keeping it
+        # would leak into every slug (core-direction-data-augmentation-...),
+        # status line, and family title. A line that is ONLY the label falls
+        # through to the first real content line.
+        stripped = re.sub(r"(?i)^core[\s_-]*direction\s*[:\-—]*\s*", "", line).strip()
+        if stripped != line and not stripped:
+            continue
+        line = stripped or line
         # ASCII ellipsis on purpose: this string goes to stdout and Windows
         # consoles on legacy codepages render "…" as garbage.
         if len(line) > max_len:
