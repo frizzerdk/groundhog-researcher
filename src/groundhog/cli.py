@@ -468,7 +468,8 @@ def attempt_group(args):
         "  show <id> [--file F]                          Show an attempt (or one file)\n"
         "  in-progress                                   List open workspaces\n"
         "  resume <wsid>                                 Re-acquire an open workspace\n"
-        "  commit <wsid> [--fail] [--eval] [--through S] Finalize a workspace\n"
+        "  commit <wsid> [--fail] [--eval] [--through S]\n"
+        "         [--note-score FLOAT]                   Finalize a workspace\n"
         "  abort <wsid>                                  Discard an open workspace\n"
         "  reap [--ttl S]                                Abort crashed workspaces\n"
         "  best                                          Show the best attempt\n"
@@ -693,13 +694,20 @@ def _attempt_commit(args):
     through, args = _opt(args, "--through")
     strategy, args = _opt(args, "--strategy")
     strategy = strategy or "manual"
+    note_score, args = _opt(args, "--note-score")
     # A dangling option (e.g. `--strategy` with no value) or an unknown flag
     # must not silently commit mislabeled work.
     if not args or any(a.startswith("--") for a in args) or len(args) > 1:
         print("Usage: groundhog attempt commit <wsid> [--fail] [--eval] "
-              "[--through STAGE] [--strategy LABEL]")
+              "[--through STAGE] [--strategy LABEL] [--note-score FLOAT]")
         return 1
     wsid = args[0]
+    if note_score is not None:
+        try:
+            note_score = float(note_score)
+        except ValueError:
+            print(f"--note-score must be a float, got {note_score!r}")
+            return 1
 
     run = _resolve_run()
     if run is None:
@@ -759,6 +767,10 @@ def _attempt_commit(args):
                 "prior": prior.id if prior else None,
                 "cost": 0.0,
             }
+            if not (Path(ws.path) / "result.json").exists():
+                print("WARNING: committing with no recorded evaluation - "
+                      "best/scoring will treat this attempt as unscored")
+                metadata["no_recorded_result"] = True
             success = not do_fail
             for v in violations:
                 if v.severity == "fail":
@@ -778,6 +790,14 @@ def _attempt_commit(args):
                     ws.name = derived
             attempt = ws.commit(success=success)
             _print_gate_outcome(metadata)
+
+        if note_score is not None:
+            # The display-only score NOTE cache, never read for decisions.
+            try:
+                history.set_note(attempt, "score", f"{note_score:.4f}")
+                print(f"note[score] = {note_score:.4f}")
+            except Exception as e:  # noqa: BLE001 — a cache miss never fails a commit
+                print(f"Could not write score note: {e}")
 
         print(f"Committed attempt {attempt.id} ({attempt.status})")
         return 0
