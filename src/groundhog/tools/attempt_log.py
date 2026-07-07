@@ -43,6 +43,23 @@ from dataclasses import dataclass
 from typing import IO, Optional
 
 
+# --- Honest cost formatting ----------------------------------------------
+
+def format_attempt_cost(cost: float, cost_model: str = "per_token") -> str:
+    """Render an attempt's cost honestly, per how its backend charges.
+
+    Backends differ: an API-billed run reports real dollars, a subscription
+    run reports request-credit "value", and some report nothing at all. A
+    single ``$0.00`` across all three lies about the last two — this maps
+    ``cost_model`` (recorded in attempt metadata) to a truthful string.
+    """
+    if cost_model == "none":
+        return "unreported (subscription)"
+    if cost_model == "per_request":
+        return f"${cost:.4f} (plan value)"
+    return f"${cost:.4f}"
+
+
 # --- ANSI helpers ---------------------------------------------------------
 
 class _ANSI:
@@ -182,7 +199,7 @@ class AttemptLog:
 
     def attempt_done(self, attempt_num: int, score: float, delta: float,
                      total_cost: float, cumulative_cost: float,
-                     summary_line: str = ""):
+                     summary_line: str = "", cost_model: str = "per_token"):
         with self._lock:
             self._stop_heartbeat()
             # Strategies that don't open the live box (seed, deterministic,
@@ -193,16 +210,19 @@ class AttemptLog:
                 score=score, delta=delta,
                 total_cost=total_cost, cumulative_cost=cumulative_cost,
                 summary_line=summary_line[: self.cfg.summary_max_chars],
+                cost_model=cost_model,
             )
 
     def attempt_failed(self, attempt_num: int, stage: str, errors: str,
-                       total_cost: float, cumulative_cost: float):
+                       total_cost: float, cumulative_cost: float,
+                       cost_model: str = "per_token"):
         with self._lock:
             self._stop_heartbeat()
             self.state["attempt_num"] = attempt_num
             self.renderer.attempt_failed(
                 stage=stage, errors=errors,
                 total_cost=total_cost, cumulative_cost=cumulative_cost,
+                cost_model=cost_model,
             )
 
     # ---- internal ----
@@ -239,9 +259,10 @@ class Renderer:
     def refresh(self): ...
     def attempt_done(self, score: float, delta: float,
                      total_cost: float, cumulative_cost: float,
-                     summary_line: str): ...
+                     summary_line: str, cost_model: str = "per_token"): ...
     def attempt_failed(self, stage: str, errors: str,
-                       total_cost: float, cumulative_cost: float): ...
+                       total_cost: float, cumulative_cost: float,
+                       cost_model: str = "per_token"): ...
 
 
 class TwoPaneRenderer(Renderer):
@@ -258,7 +279,8 @@ class TwoPaneRenderer(Renderer):
     def refresh(self):
         self._draw()
 
-    def attempt_done(self, score, delta, total_cost, cumulative_cost, summary_line):
+    def attempt_done(self, score, delta, total_cost, cumulative_cost,
+                     summary_line, cost_model="per_token"):
         # Freeze the live region — leave the box+tail in scrollback as history.
         self._lines_drawn = 0
         out = self.log.out
@@ -267,22 +289,25 @@ class TwoPaneRenderer(Renderer):
         marker = c(_ANSI.GREEN, " ★") if delta > 0 else ""
         score_str = c(_ANSI.BOLD, f"{score:.1f}")
         n = self.log.state.get("attempt_num")
+        cost_str = format_attempt_cost(total_cost, cost_model)
         out.write(f"  [{n:>3}] {score_str} ({sign}{delta:.4f}){marker}  "
-                  f"${total_cost:.4f} ({c(_ANSI.DIM, f'${cumulative_cost:.4f}')})\n")
+                  f"{cost_str} ({c(_ANSI.DIM, f'${cumulative_cost:.4f}')})\n")
         if summary_line:
             out.write(f"         {c(_ANSI.DIM, summary_line)}\n")
         out.write("\n")
         out.flush()
 
-    def attempt_failed(self, stage, errors, total_cost, cumulative_cost):
+    def attempt_failed(self, stage, errors, total_cost, cumulative_cost,
+                       cost_model="per_token"):
         self._lines_drawn = 0
         cfg = self.log.cfg
         out = self.log.out
         c = self._color
         n = self.log.state.get("attempt_num")
         msg = errors[: cfg.summary_max_chars]
+        cost_str = format_attempt_cost(total_cost, cost_model)
         out.write(f"  [{n:>3}] {c(_ANSI.RED, 'FAIL')}  {stage}: {msg}  "
-                  f"${total_cost:.4f} ({c(_ANSI.DIM, f'${cumulative_cost:.4f}')})\n\n")
+                  f"{cost_str} ({c(_ANSI.DIM, f'${cumulative_cost:.4f}')})\n\n")
         out.flush()
 
     # ---- drawing ----
@@ -453,23 +478,27 @@ class AppendedRenderer(Renderer):
         self._last_event_idx = len(events)
         out.flush()
 
-    def attempt_done(self, score, delta, total_cost, cumulative_cost, summary_line):
+    def attempt_done(self, score, delta, total_cost, cumulative_cost,
+                     summary_line, cost_model="per_token"):
         out = self.log.out
         sign = "+" if delta >= 0 else ""
         n = self.log.state.get("attempt_num")
+        cost_str = format_attempt_cost(total_cost, cost_model)
         out.write(f"  [{n:>3}] {score:.1f} ({sign}{delta:.4f})  "
-                  f"${total_cost:.4f} (${cumulative_cost:.4f})\n")
+                  f"{cost_str} (${cumulative_cost:.4f})\n")
         if summary_line:
             out.write(f"         {summary_line}\n")
         out.write("\n")
         out.flush()
 
-    def attempt_failed(self, stage, errors, total_cost, cumulative_cost):
+    def attempt_failed(self, stage, errors, total_cost, cumulative_cost,
+                       cost_model="per_token"):
         out = self.log.out
         n = self.log.state.get("attempt_num")
         msg = errors[: self.log.cfg.summary_max_chars]
+        cost_str = format_attempt_cost(total_cost, cost_model)
         out.write(f"  [{n:>3}] FAIL  {stage}: {msg}  "
-                  f"${total_cost:.4f} (${cumulative_cost:.4f})\n\n")
+                  f"{cost_str} (${cumulative_cost:.4f})\n\n")
         out.flush()
 
 

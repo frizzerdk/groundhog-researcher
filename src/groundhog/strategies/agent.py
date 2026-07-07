@@ -11,6 +11,8 @@ Tools are provided by toolkit.agent_tools (built by optimizer).
 The strategy filters which tools are available per phase.
 """
 
+import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -21,6 +23,23 @@ from groundhog.tools.attempt_logger import (
     AssistantEvent, LogEvent, MarkdownAttemptLogger,
     ToolCallEvent, UserEvent, eval_event,
 )
+
+
+# --- Preflight probe ---
+#
+# One trivial tool call issued through the SAME wrapper chain the agent will
+# use, before the explore phase spends any budget. Motivating incident: codex
+# ran three full attempts with every groundhog tool dead (a sandbox /
+# interpreter breakage) and committed unverified work — nothing caught it
+# until a manual read. The probe fails loudly first.
+
+PREFLIGHT_TOOL = "groundhog-preflight"
+PREFLIGHT_TOKEN = "groundhog-preflight-ok"
+
+
+def _preflight_ping() -> str:
+    """Preflight connectivity probe run before the explore phase."""
+    return PREFLIGHT_TOKEN
 
 
 # --- Config ---
@@ -45,6 +64,13 @@ class AgentConfig(StrategyConfig):
         "core direction at commit.",
     )
     tier: str = param("default", "Agent backend tier (default/high/budget)")
+    preflight: bool = param(
+        True,
+        "Before the explore phase, issue one trivial tool call through the "
+        "same wrapper chain the agent uses. If the tools are unreachable "
+        "(dead sandbox, broken interpreter), abort the attempt loudly before "
+        "spending any agent budget instead of running blind.",
+    )
     core_direction: str = param(
         "",
         "Optional initial core_direction.md text. Canonical name for fresh "
@@ -413,6 +439,76 @@ class AgentStrategy(Strategy):
             [r for a, r in rules if a == "deny"],
         )
 
+    # --- Preflight ---
+
+    def _preflight_probe(self, backend):
+        """Round-trip one trivial tool call through the real wrapper chain.
+
+        Serves a ping tool exactly as a real run does (same ToolServer +
+        generate_wrappers), then invokes the generated wrapper through the
+        backend-appropriate shell — the same path the agent's shell resolves.
+        Returns ``(ok, wrapper_label, detail)``; ``ok`` is False whenever the
+        wrapper can't reach the tool server or doesn't echo the token back.
+        """
+        import subprocess
+        import tempfile
+
+        from groundhog.base.agent import agent_tool
+        from groundhog.agents.tool_server import (
+            ToolServer, cleanup_wrappers, generate_wrappers,
+        )
+
+        ping = agent_tool(_preflight_ping, name=PREFLIGHT_TOOL)
+        server = ToolServer([ping])
+        bin_dir = Path(tempfile.mkdtemp(prefix="ghg_preflight_"))
+        try:
+            port = server.start()
+            generate_wrappers([ping], bin_dir, port)
+            argv, label = self._preflight_invocation(backend, bin_dir)
+            try:
+                proc = subprocess.run(
+                    argv, capture_output=True, text=True, timeout=30,
+                )
+            except Exception as e:
+                return False, label, str(e)
+            out = (proc.stdout or "").strip()
+            if proc.returncode != 0 or PREFLIGHT_TOKEN not in out:
+                detail = (proc.stderr or "").strip() or f"exit={proc.returncode} out={out!r}"
+                return False, label, detail
+            return True, label, out
+        finally:
+            server.stop()
+            cleanup_wrappers(bin_dir)
+
+    def _preflight_invocation(self, backend, bin_dir):
+        """Pick the wrapper variant + shell the backend's CLI resolves tools with.
+
+        Mirrors the per-platform outputs of tool_server.generate_wrappers and
+        each CLI's shell tool. Unknown/custom backends (and hosts missing the
+        expected shell) fall back to the portable Python wrapper, which still
+        exercises the HTTP tool server round-trip.
+        """
+        name = PREFLIGHT_TOOL
+        bname = type(backend).__name__
+        if sys.platform == "win32":
+            # pwsh-shell CLIs resolve the .ps1 wrapper.
+            if bname in ("CodexCliAgentBackend", "CopilotAgentBackend",
+                         "OpenCodeAgentBackend"):
+                shell = shutil.which("pwsh") or shutil.which("powershell")
+                if shell:
+                    return (
+                        [shell, "-NoProfile", "-File", str(bin_dir / f"{name}.ps1")],
+                        f"{name}.ps1",
+                    )
+            # git-bash CLIs (claude, gemini) resolve the extensionless wrapper.
+            if bname in ("ClaudeCodeAgentBackend", "GeminiCliAgentBackend"):
+                bash = shutil.which("bash")
+                if bash:
+                    return [bash, str(bin_dir / name)], name
+            return [sys.executable, str(bin_dir / f"{name}.py")], f"{name}.py"
+        # POSIX: every CLI resolves the extensionless executable wrapper.
+        return [str(bin_dir / name)], name
+
     def __call__(self, toolkit, config=None):
         self._init(toolkit, config)
 
@@ -446,9 +542,20 @@ class AgentStrategy(Strategy):
 
         try:
             with bracket:
+                backend = toolkit.agent.get(self.cfg.tier)
+                self._backend_cost_model = getattr(backend, "cost_model", "per_token")
+
+                if self.cfg.preflight:
+                    ok, wrapper, detail = self._preflight_probe(backend)
+                    if not ok:
+                        msg = (f"agent tools unreachable via {wrapper}: "
+                               f"{detail} — aborting attempt")
+                        self.logger.log(LogEvent(type="error", data={"error": msg}))
+                        ws.abort()
+                        return {"skipped": f"preflight failed: {msg}"}
+
                 self._prepare_workspace(toolkit, ws, prior)
 
-                backend = toolkit.agent.get(self.cfg.tier)
                 if backend.cost_model == "per_request":
                     return self._run_per_request(toolkit, ws, prior)
                 else:
@@ -989,6 +1096,7 @@ class AgentStrategy(Strategy):
             "strategy": self.name,
             "prior": prior.id if prior else None,
             "cost": round(self.logger.total_cost(), 6),
+            "cost_model": getattr(self, "_backend_cost_model", "per_token"),
         }
 
     def _build_log(self, attempt, prior, result, toolkit):

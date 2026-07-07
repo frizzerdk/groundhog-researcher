@@ -86,7 +86,10 @@ class CodexCliAgentBackend(AgentBackend):
     Tools exposed via HTTP tool server + bash wrappers on PATH.
     Resume via ``codex exec resume <session_id>``.
     """
-    cost_model = "per_token"
+    # Codex reports no usable per-run cost (the CLI surfaces nothing and the
+    # underlying spend is on a subscription); "none" tells display sites to
+    # say "unreported" rather than lie with $0.00.
+    cost_model = "none"
 
     def __init__(self,
                  model: Optional[str] = None,
