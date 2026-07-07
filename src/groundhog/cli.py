@@ -993,6 +993,198 @@ def tool_group(args):
     return 1
 
 
+def strategy_group(args):
+    """`groundhog strategy list|show|run` — the strategy surface.
+
+    Discovery is a scan (``discover_strategies``): built-ins always, plus the
+    run dir's task.py strategies when the cwd resolves to a run. ``list`` and
+    ``show`` work outside a run dir; ``run`` requires one.
+    """
+    usage = (
+        "Usage: groundhog strategy <subcommand>\n"
+        "\n"
+        "  list                                 List discoverable strategies\n"
+        "  show <name> [--json]                 Show a strategy's parameters\n"
+        "  run <name> [--set k=v ...] [-n N]    Run a strategy N times in this run dir\n"
+    )
+    if not args or args[0] in ("-h", "--help"):
+        print(usage)
+        return 0
+    sub, rest = args[0], args[1:]
+    handlers = {
+        "list": _strategy_list,
+        "show": _strategy_show,
+        "run": _strategy_run,
+    }
+    handler = handlers.get(sub)
+    if handler is None:
+        print(f"Unknown strategy subcommand: {sub}")
+        print(usage)
+        return 1
+    return handler(rest)
+
+
+def _discover_strategies_here():
+    """Built-ins plus, when the cwd resolves to a run dir, the task module's
+    strategies. Loader failures mean "no task module", never an error —
+    list/show must work outside a run dir."""
+    from groundhog import rundir
+    from groundhog.strategies.discover import discover_strategies
+
+    module = None
+    try:
+        module = rundir.load_run().module
+    except (Exception, SystemExit):
+        pass
+    return discover_strategies(module=module)
+
+
+def _strategy_list(args):
+    entries = _discover_strategies_here()
+    width = max(len(e["name"]) for e in entries)
+    for e in entries:
+        print(f"  {e['name']:<{width}}  {e['source']:<7}  {e['doc']}")
+    return 0
+
+
+def _type_name(t):
+    return t.__name__ if isinstance(t, type) else str(t)
+
+
+def _strategy_show(args):
+    as_json, args = _flag(args, "--json")
+    if not args:
+        print("Usage: groundhog strategy show <name> [--json]")
+        return 1
+    name = args[0]
+    entry = next(
+        (e for e in _discover_strategies_here() if e["name"] == name), None)
+    if entry is None:
+        print(f"No strategy named {name!r}. Try: groundhog strategy list")
+        return 1
+    params = entry["params"]
+
+    if as_json:
+        import json
+        out = {
+            "name": entry["name"],
+            "source": entry["source"],
+            "doc": entry["doc"],
+            "params": {
+                k: {
+                    "type": _type_name(v["type"]),
+                    "default": v["default"],
+                    "description": v["description"],
+                }
+                for k, v in params.items()
+            },
+        }
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+
+    print(f"{entry['name']} ({entry['source']})  {entry['doc']}")
+    if not params:
+        print("  (no parameters)")
+        return 0
+    width = max(len(k) for k in params)
+    for k, v in params.items():
+        print(f"  {k:<{width}}  {_type_name(v['type']):<8}  "
+              f"default={v['default']!r}  {v['description']}")
+    return 0
+
+
+def _coerce_param(value, default):
+    """Coerce a --set string by the param default's type; a None default
+    keeps the string (no type to coerce by)."""
+    if isinstance(default, bool):
+        low = value.lower()
+        if low in ("1", "true", "yes", "on"):
+            return True
+        if low in ("0", "false", "no", "off"):
+            return False
+        raise ValueError(f"expected a boolean, got {value!r}")
+    if isinstance(default, int):
+        return int(value)
+    if isinstance(default, float):
+        return float(value)
+    return value
+
+
+def _strategy_run(args):
+    n_str, args = _opt(args, "-n")
+    sets = []
+    while True:
+        item, args = _opt(args, "--set")
+        if item is None:
+            break
+        sets.append(item)
+    # A dangling option or unknown flag must not silently run misconfigured.
+    if not args or any(a.startswith("-") for a in args) or len(args) > 1:
+        print("Usage: groundhog strategy run <name> [--set k=v ...] [-n N]")
+        return 1
+    name = args[0]
+    try:
+        n = int(n_str) if n_str is not None else 1
+    except ValueError:
+        print(f"-n expects an integer, got {n_str!r}")
+        return 1
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    from groundhog.strategies.discover import discover_strategies
+    entry = next(
+        (e for e in discover_strategies(module=run.module)
+         if e["name"] == name), None)
+    if entry is None:
+        print(f"No strategy named {name!r}. Try: groundhog strategy list")
+        return 1
+
+    config = {}
+    for item in sets:
+        if "=" not in item:
+            print(f"--set expects k=v, got {item!r}")
+            return 1
+        k, v = item.split("=", 1)
+        if k not in entry["params"]:
+            print(f"Unknown config key {k!r} for {name!r}. "
+                  f"See: groundhog strategy show {name}")
+            return 1
+        try:
+            config[k] = _coerce_param(v, entry["params"][k]["default"])
+        except ValueError as e:
+            print(f"--set {k}: {e}")
+            return 1
+
+    toolkit = run.toolkit
+    scorer = _scorer_for(run.task, through=getattr(toolkit, "through", None))
+    strategy = entry["cls"](config)
+    for _ in range(n):
+        count_before = len(run.history.list(only_done=False))
+        try:
+            out = strategy(toolkit) or {}
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+            break
+        except Exception as e:  # noqa: BLE001 — CLI surface, print and exit
+            print(f"[{name}] ERROR: {e}")
+            return 1
+        finally:
+            if hasattr(toolkit, "log"):
+                toolkit.log.end()
+        attempts = run.history.list(only_done=False)
+        if len(attempts) > count_before:
+            latest = attempts[-1]
+            result = latest.result
+            if result.completed:
+                print(f"  [{latest.id}] {_attempt_score(latest, scorer):.4f}")
+            else:
+                print(f"  [{latest.id}] FAIL ({result.failed_stage})")
+        elif out.get("skipped"):
+            print(f"  skipped: {out['skipped']}")
+    return 0
+
+
 def main():
     args = sys.argv[1:]
 
@@ -1015,6 +1207,7 @@ def main():
         print()
         print("  groundhog attempt <subcommand>    Manual attempt lifecycle (new/list/show/commit/...)")
         print("  groundhog eval <path-or-id>       Score a solution dir, .py file, or attempt")
+        print("  groundhog strategy list|show|run  Discover and run strategies from the terminal")
         print("  groundhog tool list|run           Run any toolkit tool from the terminal")
         print("  groundhog skills install [dir]    Install the session skills into a run dir")
         print()
@@ -1047,6 +1240,8 @@ def main():
         sys.exit(attempt_group(args[1:]))
     elif cmd == "eval":
         sys.exit(cmd_eval(args[1:]))
+    elif cmd == "strategy":
+        sys.exit(strategy_group(args[1:]))
     elif cmd == "tool":
         sys.exit(tool_group(args[1:]))
     elif cmd == "skills":
