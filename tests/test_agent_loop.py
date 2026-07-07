@@ -144,6 +144,66 @@ def test_pointer_is_live_during_the_attempt(history_factory):
     assert seen == {"is_set": True, "path_matches": True}
 
 
+def test_preflight_failure_aborts_before_explore(history_factory):
+    """A dead tool path is caught by the preflight probe: the agent backend
+    is never called, no attempt is committed, and the skip names the wrapper.
+    Regression: codex ran 3 full attempts with every tool dead (2026-07)."""
+    class _DeadPreflight(AgentStrategy):
+        def _preflight_probe(self, backend):
+            return (False, "groundhog-preflight.ps1", "connection refused")
+
+    history = history_factory()
+    backend = ScriptedAgent([GOOD])
+    tk = _toolkit(history, backend)
+
+    log = _DeadPreflight()(tk)
+
+    assert "preflight failed" in log.get("skipped", "")
+    assert "groundhog-preflight.ps1" in log["skipped"]
+    assert "aborting attempt" in log["skipped"]
+    assert backend.calls == [], "explore ran despite a failed preflight"
+    assert history.list() == [], "a dead-tool attempt was committed"
+    assert tk.ws.is_set() is False
+
+
+def test_preflight_success_proceeds(history_factory):
+    """The real probe round-trips a ping tool through the wrapper chain; on
+    success the attempt runs normally and records the backend's cost_model."""
+    history = history_factory()
+    backend = ScriptedAgent([GOOD])  # per_request
+    tk = _toolkit(history, backend)
+
+    log = AgentStrategy()(tk)  # preflight defaults on -> real probe runs
+
+    assert not log.get("skipped"), f"strategy skipped: {log}"
+    attempts = history.list()
+    assert len(attempts) == 1
+    assert attempts[0].result.completed
+    assert attempts[0].metadata.get("cost_model") == "per_request"
+    assert len(backend.calls) == 1
+
+
+def test_preflight_can_be_disabled(history_factory):
+    """preflight=False skips the probe entirely (the attempt still runs)."""
+    history = history_factory()
+    backend = ScriptedAgent([GOOD])
+    tk = _toolkit(history, backend)
+
+    probed = {"called": False}
+    strat = AgentStrategy()
+    orig = strat._preflight_probe
+    def _spy(b):
+        probed["called"] = True
+        return orig(b)
+    strat._preflight_probe = _spy
+
+    log = strat(tk, config={"preflight": False})
+
+    assert not log.get("skipped"), f"strategy skipped: {log}"
+    assert probed["called"] is False
+    assert len(history.list()) == 1
+
+
 def test_prompts_match_the_direction_gate(history_factory, commit_attempt):
     """The commit gate rejects a FRESH attempt without core_direction.md, so
     the explore prompt must ASK for one; inherited attempts must be told to

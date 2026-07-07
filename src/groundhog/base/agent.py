@@ -271,9 +271,14 @@ class AgentBackend(ABC):
     a multi-turn session where the agent reasons, calls tools, and acts
     autonomously. Each run() call is one job — the strategy decides phasing.
 
-    cost_model: how the backend charges. Strategy adapts execution pattern:
-        "per_token"   — cost scales with work. Multi-phase calls are fine.
-        "per_request" — fixed cost per call. One big call is cheapest.
+    cost_model: how the backend charges. Strategy adapts execution pattern;
+    display sites annotate the reported cost honestly:
+        "per_token"   — API-billed, cost scales with work. Multi-phase calls
+                        are fine; shown as a plain dollar amount.
+        "per_request" — fixed cost per call (subscription request credits).
+                        One big call is cheapest; shown as "$X (plan value)".
+        "none"        — backend reports no usable cost (e.g. codex). Shown as
+                        "unreported (subscription)" instead of a false $0.00.
     """
     cost_model: str = "per_token"
 

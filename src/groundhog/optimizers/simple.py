@@ -205,12 +205,20 @@ class SimpleOptimizer(Optimizer):
         except Exception:
             return 0.0
 
+    def _get_attempt_cost_model(self, attempt):
+        try:
+            return attempt.metadata.get("cost_model", "per_token")
+        except Exception:
+            return "per_token"
+
     def _log_attempt(self, attempt, scorer, best_score, cumulative_cost):
         """Print per-attempt summary via AttemptLog so the score is fresh
         (computed via the current scorer) and the metric dump compresses
         to a single highlight line. The full metrics still live in
         result.json for anyone who wants the dump."""
+        from groundhog.tools.attempt_log import format_attempt_cost
         cost = self._get_attempt_cost(attempt)
+        cost_model = self._get_attempt_cost_model(attempt)
         result = attempt.result
         log = getattr(self.toolkit, "attempt_log", None)
 
@@ -223,10 +231,11 @@ class SimpleOptimizer(Optimizer):
                     errors=str(errors),
                     total_cost=cost,
                     cumulative_cost=cumulative_cost,
+                    cost_model=cost_model,
                 )
             else:
                 print(f"  [{attempt.id:>3}] FAIL  {result.failed_stage}: {errors}  "
-                      f"${cost:.4f} (${cumulative_cost:.4f})")
+                      f"{format_attempt_cost(cost, cost_model)} (${cumulative_cost:.4f})")
                 print()
             return
 
@@ -240,12 +249,13 @@ class SimpleOptimizer(Optimizer):
                 score=score, delta=delta,
                 total_cost=cost, cumulative_cost=cumulative_cost,
                 summary_line=self._summary_line(last),
+                cost_model=cost_model,
             )
         else:
             marker = " *" if delta > 0 else ""
             sign = "+" if delta >= 0 else ""
             print(f"  [{attempt.id:>3}] {score:.4f} ({sign}{delta:.4f}){marker}  "
-                  f"${cost:.4f} (${cumulative_cost:.4f})")
+                  f"{format_attempt_cost(cost, cost_model)} (${cumulative_cost:.4f})")
             print(self._format_metrics(last))
             print()
 

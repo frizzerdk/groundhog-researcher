@@ -569,6 +569,37 @@ def test_cost_model_claude():
     assert ClaudeCodeAgentBackend().cost_model == "per_token"
 
 
+def test_cost_model_codex_none():
+    """CodexCliAgentBackend reports nothing usable -> the 'none' model."""
+    from groundhog.agents.codex_cli import CodexCliAgentBackend
+    assert CodexCliAgentBackend().cost_model == "none"
+
+
+# === Honest cost display ===
+
+def test_format_cost_per_token_is_plain_dollars():
+    """API-billed backends show a plain dollar amount."""
+    from groundhog.tools.attempt_log import format_attempt_cost
+    assert format_attempt_cost(1.2345, "per_token") == "$1.2345"
+
+
+def test_format_cost_per_request_annotates_plan_value():
+    """Subscription per-request cost is plan value, not real dollars."""
+    from groundhog.tools.attempt_log import format_attempt_cost
+    assert format_attempt_cost(3.2, "per_request") == "$3.2000 (plan value)"
+
+
+def test_format_cost_none_says_unreported():
+    """A backend that reports nothing must not display a false $0.00."""
+    from groundhog.tools.attempt_log import format_attempt_cost
+    assert format_attempt_cost(0.0, "none") == "unreported (subscription)"
+
+
+def test_format_cost_default_model_is_per_token():
+    from groundhog.tools.attempt_log import format_attempt_cost
+    assert format_attempt_cost(0.5) == "$0.5000"
+
+
 # === Permission translation ===
 
 def test_copilot_permission_translation():
