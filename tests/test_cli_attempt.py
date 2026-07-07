@@ -14,7 +14,7 @@ from contextlib import contextmanager
 import pytest
 
 from groundhog import rundir
-from groundhog.cli import attempt_group, cmd_eval
+from groundhog.cli import attempt_group, cmd_eval, cmd_summary
 
 
 # --- Minimal, dependency-free task.py contents -----------------------------
@@ -851,3 +851,101 @@ def test_folder_get_resolves_failed_attempts(tmp_path, capsys):
         failed = history.get("1")
         assert failed is not None
         assert failed.status == "fail"
+
+
+# --- JSON read layer: attempt list/show --json + groundhog summary ----------
+#
+# Thin shims over utils/queries — these tests pin the CLI wiring (flags,
+# exit codes, parseable output); the query semantics live in test_queries.py.
+
+def _commit_one(run_dir, capsys, value="50.0", direction="constant baseline"):
+    wsid, ws_path = _open_ws(run_dir, capsys)
+    (ws_path / "solution.py").write_text(
+        f"def solve():\n    return {value}\n", encoding="utf-8")
+    (ws_path / "core_direction.md").write_text(direction + "\n",
+                                               encoding="utf-8")
+    attempt_group(["commit", wsid, "--eval"])
+    capsys.readouterr()
+    return wsid
+
+
+def test_attempt_list_json(tmp_path, capsys):
+    import json
+
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        _commit_one(run_dir, capsys)
+        rc = attempt_group(["list", "--json"])
+        assert rc == 0
+        rows = json.loads(capsys.readouterr().out)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["id"] == "1"
+        assert row["status"] == "done"
+        assert row["score"] == 1.0
+        assert row["strategy"] == "manual"
+        assert row["cost"] == 0.0
+        assert "created_at" in row and "parent" in row and "name" in row
+
+
+def test_attempt_list_json_empty(tmp_path, capsys):
+    import json
+
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        rc = attempt_group(["list", "--json"])
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == []
+
+
+def test_attempt_show_json(tmp_path, capsys):
+    import json
+
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        _commit_one(run_dir, capsys)
+        rc = attempt_group(["show", "1", "--json"])
+        assert rc == 0
+        detail = json.loads(capsys.readouterr().out)
+        assert detail["id"] == "1"
+        assert detail["stages"]["evaluate"]["score"] == 1.0
+        assert detail["metadata"]["strategy"] == "manual"
+        assert "solution.py" in detail["files"]
+        assert detail["lineage"] == ["1"]
+        assert detail["sub_results"] == {}
+
+        rc = attempt_group(["show", "999", "--json"])
+        assert rc == 1
+
+
+def test_summary_json(tmp_path, capsys):
+    import json
+
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        _commit_one(run_dir, capsys)
+        rc = cmd_summary(["--json"])
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        s = out["summary"]
+        assert s["n_attempts"] == 1
+        assert s["best"]["id"] == "1"
+        assert s["best"]["score"] == 1.0
+        assert s["n_families"] == 1
+        assert len(s["score_trajectory"]) == 1
+        fams = out["families"]
+        assert len(fams) == 1
+        assert fams[0]["family_name"] == "constant baseline"
+        assert fams[0]["members"] == ["1"]
+
+
+def test_summary_text(tmp_path, capsys):
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        _commit_one(run_dir, capsys)
+        rc = cmd_summary([])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "attempts: 1" in out
+        assert "best:" in out
+        assert "constant baseline" in out
