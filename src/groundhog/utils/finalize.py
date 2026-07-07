@@ -78,6 +78,14 @@ def finalize_attempt(
             "cost": round(cost, 6),
         }
 
+    # The metadata pass-through: a wrapping strategy (e.g. ABTest) sets
+    # toolkit._extra_attempt_metadata around an inner strategy's call to
+    # stamp attribution onto whatever it commits, without touching the
+    # inner strategy at all.
+    extra = getattr(toolkit, "_extra_attempt_metadata", None)
+    if extra:
+        metadata = {**metadata, **extra}
+
     # Mutation first (fresh only): surface the agent-written direction so
     # the gates judge the post-promote state.
     if prior is None:
