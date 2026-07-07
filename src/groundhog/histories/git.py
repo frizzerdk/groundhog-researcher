@@ -46,6 +46,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -262,9 +263,14 @@ class GitAttemptHistory(AttemptHistory):
         for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
                     "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"):
             env.pop(var, None)
-        env["GIT_CONFIG_GLOBAL"] = os.devnull
-        env["GIT_CONFIG_SYSTEM"] = os.devnull
-        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        # Config isolation keeps commits hermetic, but credential helpers
+        # live in global/system config — stripping them makes authenticated
+        # remotes fail on every push/fetch. Network ops keep the user's
+        # config; identity stays forced via the env vars below.
+        if str(args[0]) not in ("push", "fetch", "ls-remote"):
+            env["GIT_CONFIG_GLOBAL"] = os.devnull
+            env["GIT_CONFIG_SYSTEM"] = os.devnull
+            env["GIT_CONFIG_NOSYSTEM"] = "1"
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = _IDENTITY_NAME
         env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = _IDENTITY_EMAIL
@@ -668,13 +674,19 @@ class GitAttemptHistory(AttemptHistory):
         if not (self._remote and self._policy.push_after_commit):
             return
         ref = f"refs/attempts/{self.origin}/{sha}"
+        last_err = None
         for _ in range(max(1, self._policy.push_retries)):
             try:
                 self._git("push", self._remote, f"{ref}:{ref}",
                           timeout=self._policy.timeout_s)
                 return
-            except (GitError, subprocess.SubprocessError, OSError):
+            except (GitError, subprocess.SubprocessError, OSError) as e:
+                last_err = e
                 continue
+        # Best-effort, but not silent: a store that never syncs looks
+        # identical to one that does unless somebody says otherwise.
+        print(f"WARNING: attempt {sha[:12]} committed locally but could not "
+              f"be pushed to {self._remote} ({last_err})", file=sys.stderr)
 
     def _maybe_fetch(self):
         if not (self._remote and self._policy.fetch_before_reads):
