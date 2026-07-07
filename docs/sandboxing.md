@@ -84,6 +84,15 @@ Workarounds that *would* fix it:
   Linux, paths translate, perf hit.
 - **Docker wrapper** — see "Future: Docker isolation" below.
 
+The AppContainer also cuts the *other* way: it cannot traverse
+`WindowsApps` reparse points, so a venv based on the **Microsoft Store
+Python** (`pyvenv.cfg` `home = ...WindowsApps...`) is unlaunchable from
+inside the sandbox. Every generated tool wrapper then fails with
+`No Python at "...WindowsApps..."` — the agent sees broken tools, not a
+broken interpreter, and runs blind. `generate_wrappers` warns when it
+detects this; the cure is rebasing the env on a regular interpreter
+(`uv python install && uv python pin && uv sync`).
+
 ### copilot path-pattern denies
 
 GitHub copilot-cli's `--deny-tool 'write(<path>)'` pattern matching is

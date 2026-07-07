@@ -144,6 +144,35 @@ def _get_ordered_params(tool: AgentTool) -> tuple:
 
 # --- Bash wrapper generation ---
 
+def _warn_if_store_python(python_path: Path) -> None:
+    """Microsoft Store Python breaks sandboxed agents' tool wrappers.
+
+    A venv based on the Store interpreter redirects through WindowsApps,
+    which AppContainer-sandboxed CLIs (codex) cannot traverse — every tool
+    call then dies with "No Python at ...". Detect it up front and say so,
+    because inside the agent the failure looks like a broken tool, not a
+    broken interpreter.
+    """
+    probe = [python_path]
+    cfg = python_path.parent.parent / "pyvenv.cfg"
+    if cfg.is_file():
+        try:
+            for line in cfg.read_text(encoding="utf-8").splitlines():
+                if line.strip().lower().startswith("home"):
+                    probe.append(Path(line.split("=", 1)[1].strip()))
+                    break
+        except OSError:
+            pass
+    if any("windowsapps" in str(p).lower() for p in probe):
+        print(
+            "WARNING: agent tools run on a Microsoft Store Python "
+            f"({python_path}); sandboxed agents (codex) cannot launch it. "
+            "Rebase the environment on a regular interpreter, e.g.: "
+            "uv python install && uv python pin && uv sync",
+            file=sys.stderr,
+        )
+
+
 def generate_wrappers(tools: List[AgentTool], bin_dir: Path, port: int) -> None:
     """Generate wrapper scripts for each tool in bin_dir.
 
@@ -154,6 +183,9 @@ def generate_wrappers(tools: List[AgentTool], bin_dir: Path, port: int) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     python_path = sys.executable
     is_windows = sys.platform == "win32"
+
+    if is_windows:
+        _warn_if_store_python(Path(python_path))
 
     for tool in tools:
         ordered_names, required_count, defaults, path_params = _get_ordered_params(tool)
@@ -172,12 +204,15 @@ def generate_wrappers(tools: List[AgentTool], bin_dir: Path, port: int) -> None:
             )
             # PowerShell launcher (for codex/copilot CLIs on Windows that use
             # pwsh as their shell — they don't auto-resolve .cmd via PATHEXT
-            # when invoked as `pwsh -Command <name>`).
+            # when invoked as `pwsh -Command <name>`). Native PowerShell HTTP
+            # client, no Python: sandboxed CLIs (codex AppContainer) cannot
+            # launch WindowsApps- or uv-based interpreters at all.
             ps1_path = bin_dir / f"{tool.name}.ps1"
-            ps1_python = python_path.replace("\\", "/")
             ps1_path.write_text(
-                f'$env:PYTHONIOENCODING = "utf-8"\n'
-                f'& "{ps1_python}" "$PSScriptRoot/{tool.name}.py" @args\n',
+                _build_ps1_wrapper(
+                    tool.name, ordered_names, required_count, defaults,
+                    path_params, port,
+                ),
                 encoding="utf-8",
             )
             # Extensionless bash wrapper for Git Bash (Claude Code on Windows)
@@ -193,6 +228,94 @@ def generate_wrappers(tools: List[AgentTool], bin_dir: Path, port: int) -> None:
             script_path = bin_dir / tool.name
             script_path.write_text(f"#!/usr/bin/env python3\n{py_script}", encoding="utf-8")
             script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+_PS1_BODY = r'''
+$argList = @($args | ForEach-Object { "$_" })
+$kwMode = [bool]($argList | Where-Object { $_.StartsWith('--') })
+
+if (-not $kwMode -and $argList.Count -lt $REQUIRED) {
+    $usagePos = (@($NAMES[0..([Math]::Max($REQUIRED - 1, 0))] | ForEach-Object { "<$_>" }) -join ' ')
+    [Console]::Error.WriteLine("Usage: $TOOL $usagePos")
+    [Console]::Error.WriteLine("       $TOOL " + (@($NAMES | ForEach-Object { "--$_ <val>" }) -join ' '))
+    exit 1
+}
+
+$params = @{}
+if ($kwMode) {
+    $i = 0
+    while ($i -lt $argList.Count) {
+        if ($argList[$i].StartsWith('--') -and ($i + 1) -lt $argList.Count) {
+            $params[$argList[$i].Substring(2)] = $argList[$i + 1]
+            $i += 2
+        } else { $i += 1 }
+    }
+    foreach ($n in $NAMES) {
+        if (-not $params.ContainsKey($n) -and $DEFAULTS.ContainsKey($n)) { $params[$n] = $DEFAULTS[$n] }
+    }
+} else {
+    for ($i = 0; $i -lt $NAMES.Count; $i++) {
+        if ($i -lt $argList.Count) { $params[$NAMES[$i]] = $argList[$i] }
+        elseif ($DEFAULTS.ContainsKey($NAMES[$i])) { $params[$NAMES[$i]] = $DEFAULTS[$NAMES[$i]] }
+    }
+}
+
+foreach ($n in $PATH_PARAMS) {
+    if ($params.ContainsKey($n) -and $params[$n] -is [string]) {
+        try { $params[$n] = [IO.Path]::GetFullPath($params[$n], (Get-Location).Path) }
+        catch { $params[$n] = [IO.Path]::GetFullPath((Join-Path (Get-Location).Path $params[$n])) }
+    }
+}
+
+$body = if ($params.Count -gt 0) { ConvertTo-Json $params -Compress } else { '{}' }
+try {
+    $r = Invoke-RestMethod -Uri "http://127.0.0.1:$PORT/$TOOL" -Method Post `
+        -ContentType 'application/json' -Body $body
+} catch {
+    [Console]::Error.WriteLine("Error calling ${TOOL}: $($_.Exception.Message)")
+    exit 1
+}
+if ($r.success) { Write-Output $r.output } else { [Console]::Error.WriteLine("$($r.error)"); exit 1 }
+'''
+
+
+def _ps_literal(v) -> str:
+    if isinstance(v, bool):
+        return "$true" if v else "$false"
+    if v is None:
+        return "$null"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def _build_ps1_wrapper(
+    tool_name: str,
+    param_names: List[str],
+    required_count: int,
+    defaults: Dict[str, Any],
+    path_params: set,
+    port: int,
+) -> str:
+    """Native PowerShell tool client — same protocol as the Python wrapper.
+
+    Exists because sandboxed Windows CLIs (codex AppContainer) cannot launch
+    Python interpreters that live behind WindowsApps or uv-managed dirs;
+    Invoke-RestMethod needs nothing outside pwsh itself.
+    """
+    names = "@(" + ", ".join(_ps_literal(n) for n in param_names) + ")"
+    dflts = ("@{" + "; ".join(f"{_ps_literal(k)} = {_ps_literal(v)}"
+                              for k, v in defaults.items()) + "}") if defaults else "@{}"
+    paths = "@(" + ", ".join(_ps_literal(p) for p in sorted(path_params)) + ")"
+    header = (
+        f"$NAMES = {names}\n"
+        f"$DEFAULTS = {dflts}\n"
+        f"$PATH_PARAMS = {paths}\n"
+        f"$REQUIRED = {required_count}\n"
+        f"$PORT = {port}\n"
+        f"$TOOL = {_ps_literal(tool_name)}\n"
+    )
+    return header + _PS1_BODY
 
 
 def _build_python_wrapper(

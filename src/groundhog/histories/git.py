@@ -720,7 +720,7 @@ class GitAttemptHistory(AttemptHistory):
 
         def score_attempt(attempt):
             result = attempt.result
-            if not result.completed:
+            if not result.completed or not result.stages:
                 return -1.0
             last_stage = list(result.stages.values())[-1]
             return scorer(last_stage)

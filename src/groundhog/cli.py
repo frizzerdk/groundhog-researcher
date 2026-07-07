@@ -438,10 +438,21 @@ def _short(value, n=8):
     return s[:n] if len(s) > n else s
 
 
-def _print_stage_scores(result, scorer):
+def _stage_scorers(task):
+    """Per-stage scorers by name — each stage is scored by its own scorer;
+    the through-stage scorer is only meaningful for the overall score."""
+    try:
+        return {s.name: s.score for s in task.evaluator.get_stages(task.data)}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _print_stage_scores(result, scorer, task=None):
     """Print per-stage score + the final overall line."""
+    per_stage = _stage_scorers(task) if task is not None else {}
     for name, stage in result.stages.items():
-        print(f"  {name}: score={scorer(stage):.4f}")
+        stage_score = per_stage.get(name, scorer)(stage)
+        print(f"  {name}: score={stage_score:.4f}")
     overall = _score_result(result, scorer)
     if result.completed:
         print(f"  overall: {overall:.4f}  (completed)")
@@ -634,8 +645,10 @@ def _attempt_show(args):
     print("stages:")
     try:
         result = attempt.result
+        per_stage = _stage_scorers(task)
         for name, stage in result.stages.items():
-            print(f"  {name}: score={scorer(stage):.4f} metrics={stage.metrics}")
+            stage_score = per_stage.get(name, scorer)(stage)
+            print(f"  {name}: score={stage_score:.4f} metrics={stage.metrics}")
         print(f"  overall: {_score_result(result, scorer):.4f} "
               f"({'completed' if result.completed else 'failed at ' + str(result.failed_stage)})")
     except Exception as e:  # noqa: BLE001
@@ -725,7 +738,7 @@ def _attempt_commit(args):
 
             result = task.evaluate(ws.path, through=through)
             print("Evaluation:")
-            _print_stage_scores(result, scorer)
+            _print_stage_scores(result, scorer, task=task)
             if do_fail:
                 # The user's verdict: record real work as failed. Shape it
                 # like every other failed record (a failed stage with the
@@ -780,6 +793,12 @@ def _attempt_commit(args):
             _print_gate_outcome(metadata)
 
         print(f"Committed attempt {attempt.id} ({attempt.status})")
+        # The folder backend renames the workspace dir at commit (suffix
+        # _done/_fail) — echo the new location so scripts don't chase a
+        # stale path.
+        loc = getattr(attempt, "path", None)
+        if loc:
+            print(f"  at: {loc}")
         return 0
     except Exception as e:  # noqa: BLE001
         print(f"Commit failed: {e}")
@@ -881,6 +900,11 @@ def cmd_eval(args):
         print(f"Evaluation crashed: {e}")
         return 1
 
+    per_stage = _stage_scorers(task)
+
+    def _stage_score(name, stage):
+        return per_stage.get(name, scorer)(stage)
+
     if as_json:
         import json
 
@@ -890,7 +914,7 @@ def cmd_eval(args):
             "overall_score": _score_result(result, scorer),
             "stages": {
                 name: {
-                    "score": scorer(stage),
+                    "score": _stage_score(name, stage),
                     "metrics": stage.metrics,
                     "errors": stage.errors,
                     "warnings": stage.warnings,
@@ -902,7 +926,7 @@ def cmd_eval(args):
         print(json.dumps(out, indent=2, default=str))
     else:
         for name, stage in result.stages.items():
-            print(f"[{name}] score={scorer(stage):.4f}")
+            print(f"[{name}] score={_stage_score(name, stage):.4f}")
             if stage.metrics:
                 print(f"  metrics:   {stage.metrics}")
             if stage.errors:
