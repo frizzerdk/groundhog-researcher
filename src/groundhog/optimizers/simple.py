@@ -1,14 +1,112 @@
 """Simple optimizer: weighted strategy rotation, potential-based prior selection."""
 
+import copy
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from itertools import cycle
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+from groundhog.base.attempt_history import Workspace
 from groundhog.base.strategy import Strategy
 from groundhog.base.optimizer import Optimizer
 from groundhog.base.toolkit import Toolkit
+from groundhog.tools.log import StrategyLog
 from groundhog.tools.queue import read_next as read_queue
 from groundhog.utils.selection import SelectionPolicy, scorer_for
+
+
+class _LockedWorkspace(Workspace):
+    """Workspace wrapper that serializes commit/abort on the run's attempt lock.
+
+    Folder-backend commit is a directory rename and git-backend commit is a
+    chain of ref updates — both must never interleave with another worker's
+    allocation or commit."""
+
+    def __init__(self, ws, lock):
+        object.__setattr__(self, "_ws", ws)
+        object.__setattr__(self, "_lock", lock)
+
+    def commit(self, success: bool = True):
+        with self._lock:
+            return self._ws.commit(success=success)
+
+    def abort(self):
+        with self._lock:
+            return self._ws.abort()
+
+    def checkpoint(self):
+        return self._ws.checkpoint()
+
+    def heartbeat(self):
+        return self._ws.heartbeat()
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_ws"), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._ws, name, value)
+
+
+class _LockedHistory:
+    """History proxy for concurrent strategy calls.
+
+    The write/allocation entry points (``workspace``, ``resume``,
+    ``set_note``) serialize on one re-entrant lock, and returned workspaces
+    commit/abort under the same lock. Reads pass through unlocked."""
+
+    def __init__(self, history, lock):
+        self._history = history
+        self._lock = lock
+
+    def workspace(self, parent=None):
+        with self._lock:
+            return _LockedWorkspace(self._history.workspace(parent=parent), self._lock)
+
+    def resume(self, workspace_id):
+        with self._lock:
+            return _LockedWorkspace(self._history.resume(workspace_id), self._lock)
+
+    def set_note(self, attempt_or_id, key, value):
+        with self._lock:
+            return self._history.set_note(attempt_or_id, key, value)
+
+    def __getattr__(self, name):
+        return getattr(self._history, name)
+
+
+class _LineAtomicLog(StrategyLog):
+    """Per-worker StrategyLog: inline fragments buffer until the line is
+    complete, then print atomically — concurrent workers interleave at line
+    granularity, never mid-line."""
+
+    def __init__(self, print_lock):
+        super().__init__()
+        self._print_lock = print_lock
+        self._buffer = ""
+
+    def start(self, text):
+        self._flush_inline()
+        with self._print_lock:
+            print(f"{self.INDENT}{text}")
+        self.tick()
+
+    def inline(self, text):
+        self._buffer += text
+        self._inline_dirty = True
+
+    def info(self, text):
+        self._flush_inline()
+        with self._print_lock:
+            print(f"{self.INDENT}{text}")
+
+    def _flush_inline(self):
+        if self._buffer:
+            with self._print_lock:
+                print(f"{self.INDENT}{self._buffer.rstrip()}")
+            self._buffer = ""
+        self._inline_dirty = False
+        self._line_started = False
 
 
 class SimpleOptimizer(Optimizer):
@@ -29,6 +127,38 @@ class SimpleOptimizer(Optimizer):
     SelectionPolicy data — never by rewriting the function.
 
     At end of run, prints trunk summary showing improvement chains.
+
+    Parallel execution — EXPERIMENTAL, strictly opt-in via ``concurrency=N``
+    ------------------------------------------------------------------------
+    ``concurrency=1`` (the default) is exactly the historical serial loop.
+    With N > 1, the first iteration runs serially (so an empty history gets
+    its root), then up to N strategy calls run at once in a thread pool.
+    Queue consumption and the seed strategy stay serial. Each worker receives
+    a shallow toolkit VIEW: shared capabilities (task, llm, learnings,
+    selection, gates), but a private lock-guarded history proxy, workspace
+    handle, line-atomic console log, and attempt logger. Prior selection,
+    workspace allocation, commit/finalize, and score notes all serialize on
+    one re-entrant lock (also exposed as ``toolkit._ws_lock``); the work
+    between them runs concurrently.
+
+    Caveats, loudly:
+
+    - The folder backend commits by RENAMING the attempt directory. On
+      Windows a transient handle on that directory (antivirus, indexer, an
+      open explorer/shell) can fail the rename. The git history backend
+      commits into the object store and is the RECOMMENDED history for
+      concurrent runs.
+    - History reads are deliberately unlocked; a read that races a folder
+      commit-rename can transiently miss that attempt — the same window
+      external orchestration always had.
+    - The live console box is disabled for workers (concurrent attempts
+      cannot share one in-place pane); worker output is line-atomic plain
+      text, and per-attempt event streams still land in each attempt's
+      ``attemptlog.jsonl``/``.md``.
+    - Strategy instances are shallow-copied per dispatch (their per-call
+      instance state is not thread-safe). Agent strategies whose build-time
+      tools closed over the ROOT toolkit's workspace handle are not
+      parallel-safe yet.
     """
 
     def __init__(self, toolkit: Toolkit,
@@ -40,8 +170,13 @@ class SimpleOptimizer(Optimizer):
                  direction_decay: Optional[float] = None,
                  exclude_non_promotable: Optional[bool] = None,
                  direction_bonus: Optional[float] = None,
-                 skip_non_promotable: Optional[bool] = None):
+                 skip_non_promotable: Optional[bool] = None,
+                 concurrency: int = 1):
         """Configure the optimizer around a finished toolkit.
+
+        ``concurrency`` (EXPERIMENTAL): number of strategy calls to run at
+        once. 1 (default) is the exact serial path; N > 1 fans out to a
+        thread pool — see the class docstring for the contract and caveats.
 
         ``extras`` registers strategies that are reachable from the queue but
         do not appear in the rotation schedule — useful for one-shot strategies
@@ -82,6 +217,7 @@ class SimpleOptimizer(Optimizer):
         self.exclude_non_promotable = base.exclude_non_promotable
 
         self.seed_strategy = FreshApproach() if seed_strategy == "default" else seed_strategy
+        self.concurrency = max(1, int(concurrency))
 
         # Build rotation schedule from strategies or single strategy
         if strategies:
@@ -400,28 +536,35 @@ class SimpleOptimizer(Optimizer):
                     self._log_attempt(best, scorer, best_score, total_cost)
             print()
 
-        # Rotation: cycle through schedule
+        if self.concurrency > 1:
+            best_score, total_cost = self._run_parallel(n, scorer, best_score, total_cost)
+        else:
+            best_score, total_cost = self._run_serial(n, scorer, best_score, total_cost)
+
+        # Print trunk summary
+        self._print_trunks(scorer)
+
+        best_str = f"Best: {best_score:.4f}" if best_score is not None else "No successful attempts"
+        print(f"{best_str}  Total cost: ${total_cost:.4f}")
+
+    def _next_dispatch(self, rotation):
+        """Pick the next (strategy, config, queue_label) — queue overrides rotation."""
+        queue_item = read_queue(self.path)
+        if queue_item:
+            strategy_name = queue_item.get("strategy", "")
+            strategy = self._strategy_registry.get(strategy_name)
+            if strategy:
+                queue_label = f"{strategy_name} from {queue_item.get('source', '?')}"
+                self.toolkit.log.info(f"[queue] {queue_label}")
+                return strategy, queue_item.get("config"), queue_label
+            self.toolkit.log.info(f"[queue] unknown strategy: {strategy_name}, skipping")
+        return next(rotation), None, ""
+
+    def _run_serial(self, n, scorer, best_score, total_cost):
         rotation = cycle(self._schedule)
-        queue_path = self.path
 
         for _ in range(n):
-            # Check queue first — override rotation if there's a queued item
-            queue_item = read_queue(queue_path)
-            queue_label = ""
-            if queue_item:
-                strategy_name = queue_item.get("strategy", "")
-                strategy = self._strategy_registry.get(strategy_name)
-                if strategy:
-                    config = queue_item.get("config")
-                    queue_label = f"{strategy_name} from {queue_item.get('source', '?')}"
-                    self.toolkit.log.info(f"[queue] {queue_label}")
-                else:
-                    self.toolkit.log.info(f"[queue] unknown strategy: {strategy_name}, skipping")
-                    strategy = next(rotation)
-                    config = None
-            else:
-                strategy = next(rotation)
-                config = None
+            strategy, config, queue_label = self._next_dispatch(rotation)
             # Stash the queue label so AgentStrategy can pass it to
             # attempt_log.attempt_start. Empty string when not from queue.
             self.toolkit._current_queue_label = queue_label
@@ -458,8 +601,126 @@ class SimpleOptimizer(Optimizer):
                     if best_score is None or current_score > best_score:
                         best_score = current_score
 
-        # Print trunk summary
-        self._print_trunks(scorer)
+        return best_score, total_cost
 
-        best_str = f"Best: {best_score:.4f}" if best_score is not None else "No successful attempts"
-        print(f"{best_str}  Total cost: ${total_cost:.4f}")
+    def _run_parallel(self, n, scorer, best_score, total_cost):
+        """EXPERIMENTAL fan-out loop — see the class docstring for the contract.
+
+        Main thread owns dispatch (queue reads stay serial) and accounting;
+        workers own strategy execution on per-worker toolkit views. One
+        re-entrant lock serializes the racy sections: prior selection,
+        workspace allocation, commit/finalize, score notes."""
+        lock = threading.RLock()
+        print_lock = threading.Lock()
+        self.toolkit._ws_lock = lock
+        rotation = cycle(self._schedule)
+        seen = {a.id for a in self.history.list()}
+
+        def run_one(strategy, config, queue_label):
+            view = self._worker_view(lock, print_lock, queue_label)
+            # Shallow-copy per dispatch: strategies stash per-call state on self.
+            strat = copy.copy(strategy)
+            try:
+                if config is not None:
+                    strat(view, config=config)
+                else:
+                    strat(view)
+            finally:
+                view.log.end()
+
+        def account():
+            # Under the attempt lock: an accounting scan must never interleave
+            # with a commit (a git ref mid-update or a folder dir mid-rename
+            # reads back as a torn, stage-less result).
+            nonlocal best_score, total_cost
+            with lock:
+                for attempt in self.history.list():
+                    if attempt.id in seen:
+                        continue
+                    seen.add(attempt.id)
+                    cost = self._get_attempt_cost(attempt)
+                    total_cost += cost
+                    self._log_attempt(attempt, scorer, best_score, total_cost)
+                    score = self._score_attempt(attempt, scorer)
+                    if best_score is None or score > best_score:
+                        best_score = score
+
+        interrupted = False
+        with ThreadPoolExecutor(max_workers=self.concurrency,
+                                thread_name_prefix="groundhog-strategy") as pool:
+            pending: Dict = {}
+            dispatched = 0
+            try:
+                # First iteration serial: an empty history gets its root
+                # attempt before workers fan out and all pick priors at once.
+                if n > 0:
+                    strategy, config, queue_label = self._next_dispatch(rotation)
+                    dispatched = 1
+                    try:
+                        run_one(strategy, config, queue_label)
+                    except Exception as e:
+                        print(f"\n  [{strategy.__class__.__name__}] ERROR: {e}")
+                    account()
+
+                while dispatched < n or pending:
+                    while dispatched < n and len(pending) < self.concurrency:
+                        strategy, config, queue_label = self._next_dispatch(rotation)
+                        future = pool.submit(run_one, strategy, config, queue_label)
+                        pending[future] = strategy.__class__.__name__
+                        dispatched += 1
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        strategy_name = pending.pop(future)
+                        exc = future.exception()
+                        if exc is not None:
+                            with print_lock:
+                                print(f"\n  [{strategy_name}] ERROR: {exc}")
+                    account()
+            except KeyboardInterrupt:
+                interrupted = True
+                for future in pending:
+                    future.cancel()
+                with print_lock:
+                    print("\n  Interrupted by user (waiting for running attempts)")
+        if interrupted:
+            account()
+        return best_score, total_cost
+
+    def _worker_view(self, lock, print_lock, queue_label):
+        """A shallow per-worker toolkit view: shared capabilities, private
+        per-attempt surfaces (history proxy, workspace handle, logs)."""
+        from groundhog.base.workspace_handle import WorkspaceHandle
+        from groundhog.tools.attempt_logger import MarkdownAttemptLogger
+        from groundhog.utils.finalize import finalize_attempt
+
+        root = self.toolkit
+        view = Toolkit()
+        # Copy through __dict__ so Toolkit's override tracking stays silent.
+        view.__dict__.update(
+            {k: v for k, v in vars(root).items() if k != "_overrides"})
+        d = view.__dict__
+        history = _LockedHistory(root.history, lock)
+        d["history"] = history
+        d["ws"] = WorkspaceHandle(history)
+        d["workspace"] = d["ws"]
+        d["log"] = _LineAtomicLog(print_lock)
+        # No console: the shared live box cannot render concurrent attempts.
+        # Event streams still land in each attempt's attemptlog.jsonl/.md.
+        d["attempt_logger"] = MarkdownAttemptLogger()
+        d["_current_queue_label"] = queue_label
+        d["_ws_lock"] = lock
+
+        def locked_finalize(*args, **kwargs):
+            with lock:
+                return finalize_attempt(view, *args, **kwargs)
+
+        d["finalize"] = locked_finalize
+
+        base_get_prior = getattr(root, "get_prior", None)
+        if base_get_prior is not None:
+            def locked_get_prior(toolkit):
+                with lock:
+                    return base_get_prior(toolkit)
+            d["get_prior"] = locked_get_prior
+
+        return view
