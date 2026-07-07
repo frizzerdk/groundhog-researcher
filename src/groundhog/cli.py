@@ -920,6 +920,159 @@ def cmd_eval(args):
     return 0 if result.completed else 2
 
 
+def _resolve_optimizer(run):
+    """Resolve a run dir's optimizer without executing task.py's __main__.
+
+    Preference order: a module-level ``optimizer``, then a
+    ``build_optimizer()`` hook (handed the loaded toolkit when it accepts an
+    argument), then the default ``SimpleOptimizer`` over the classic rotation.
+    Returns ``(optimizer, description)`` — the caller prints what was chosen.
+    """
+    module = run.module
+    opt = getattr(module, "optimizer", None)
+    if opt is not None:
+        if not callable(getattr(opt, "run", None)):
+            raise RuntimeError(
+                f"task.py's module-level `optimizer` is {type(opt).__name__}, "
+                f"expected an optimizer with .run(n)")
+        return opt, "module-level optimizer from task.py"
+
+    hook = getattr(module, "build_optimizer", None)
+    if callable(hook):
+        import inspect
+        try:
+            takes_toolkit = len(inspect.signature(hook).parameters) >= 1
+        except (TypeError, ValueError):
+            takes_toolkit = False
+        opt = hook(run.toolkit) if takes_toolkit else hook()
+        if not callable(getattr(opt, "run", None)):
+            raise RuntimeError(
+                f"build_optimizer() returned {type(opt).__name__}, "
+                f"expected an optimizer with .run(n)")
+        return opt, "build_optimizer() from task.py"
+
+    from groundhog.optimizers.simple import SimpleOptimizer
+    from groundhog.strategies.improve import Improve
+    from groundhog.strategies.cross_pollinate import CrossPollinate
+    from groundhog.strategies.fresh import FreshApproach
+    opt = SimpleOptimizer(
+        run.toolkit,
+        strategies=[
+            (Improve(), 14),
+            (CrossPollinate(), 5),
+            (FreshApproach(mode="different"), 1),
+        ],
+        seed_strategy=FreshApproach(mode="blank"),
+    )
+    return opt, ("default SimpleOptimizer (14x Improve + 5x CrossPollinate + "
+                 "1x FreshApproach) - task.py defines no optimizer")
+
+
+def cmd_run(args):
+    """`groundhog run [N]` — run the run dir's optimizer, no __main__ needed."""
+    if args and args[0] in ("-h", "--help"):
+        print("Usage: groundhog run [N]   Run N optimizer iterations (default 10)")
+        return 0
+    n = 10
+    if args:
+        try:
+            n = int(args[0])
+        except ValueError:
+            print(f"N must be an integer, got {args[0]!r}")
+            return 1
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    try:
+        optimizer, chosen = _resolve_optimizer(run)
+    except Exception as e:  # noqa: BLE001 — user code, surface cleanly
+        print(f"Could not resolve an optimizer: {e}")
+        return 1
+    print(f"Optimizer: {chosen}")
+
+    import os
+    saved = os.getcwd()
+    try:
+        # task.py __main__ runs from the run dir; give the optimizer the
+        # same footing (relative artifact paths, queue.json siblings).
+        os.chdir(run.run_dir)
+        optimizer.run(n=n)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+    except Exception as e:  # noqa: BLE001
+        print(f"Run failed: {e}")
+        return 1
+    finally:
+        os.chdir(saved)
+    return 0
+
+
+def cmd_status(args):
+    """`groundhog status` — run overview plus in-progress workspaces."""
+    import time
+
+    if args and args[0] in ("-h", "--help"):
+        print("Usage: groundhog status")
+        return 0
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history, task = run.history, run.task
+    scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
+
+    committed = [a for a in history.list(only_done=False)
+                 if a.status in ("done", "fail")]
+    done = [a for a in committed if a.status == "done"]
+    failed = [a for a in committed if a.status == "fail"]
+    print(f"attempts: {len(committed)} ({len(done)} done, {len(failed)} failed)")
+
+    best = history.best(scorer) if done else None
+    if best is not None:
+        print(f"best:     {_short(best.id)} score={_attempt_score(best, scorer):.4f} "
+              f"{best.name}")
+
+    def _cost(a):
+        try:
+            return float(a.metadata.get("cost", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    families = history.derive_families()
+    print(f"families: {len(families)}")
+    print(f"cost:     ${sum(_cost(a) for a in committed):.4f}")
+
+    if families:
+        from groundhog.utils.direction import (
+            direction_title, read_direction_from_attempt,
+        )
+        print()
+        print(f"{'family':<40} {'n':<4} {'best':<10} best score")
+        for members in families:
+            title = direction_title(read_direction_from_attempt(members[0]) or "")
+            best_member = max(members, key=lambda a: _attempt_score(a, scorer))
+            best_score = _attempt_score(best_member, scorer)
+            score_str = f"{best_score:.4f}" if best_score > -1.0 else "-"
+            print(f"{title:<40} {len(members):<4} "
+                  f"{_short(best_member.id):<10} {score_str}")
+
+    items = history.list_in_progress()
+    print()
+    if not items:
+        print("in-progress: none")
+        return 0
+    now = time.time()
+    print("in-progress:")
+    print(f"{'wsid':<10} {'parent':<10} {'age(s)':<8} {'state':<9} path")
+    for ip in items:
+        age = int(now - ip.started_at)
+        state = "live" if ip.live else "CRASHED"
+        print(f"{_short(ip.workspace_id):<10} {_short(ip.parent):<10} "
+              f"{age:<8} {state:<9} {ip.path}")
+    return 0
+
+
 def tool_group(args):
     """`groundhog tool list` / `groundhog tool run <name> [--attempt ID] [-p k=v ...]`.
 
@@ -1015,6 +1168,8 @@ def main():
         print()
         print("  groundhog attempt <subcommand>    Manual attempt lifecycle (new/list/show/commit/...)")
         print("  groundhog eval <path-or-id>       Score a solution dir, .py file, or attempt")
+        print("  groundhog run [N]                 Run the run dir's optimizer for N iterations")
+        print("  groundhog status                  Run overview + in-progress workspaces")
         print("  groundhog tool list|run           Run any toolkit tool from the terminal")
         print("  groundhog skills install [dir]    Install the session skills into a run dir")
         print()
@@ -1047,6 +1202,10 @@ def main():
         sys.exit(attempt_group(args[1:]))
     elif cmd == "eval":
         sys.exit(cmd_eval(args[1:]))
+    elif cmd == "run":
+        sys.exit(cmd_run(args[1:]))
+    elif cmd == "status":
+        sys.exit(cmd_status(args[1:]))
     elif cmd == "tool":
         sys.exit(tool_group(args[1:]))
     elif cmd == "skills":
