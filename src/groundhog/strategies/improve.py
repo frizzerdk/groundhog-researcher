@@ -235,11 +235,13 @@ Output your changes as SEARCH/REPLACE blocks."""
             f"NEW CODE (score {new_score:.4f}):\n```\n{new_code}\n```\n\n"
             f"The new attempt {'improved' if new_score > prior_score else 'regressed' if new_score < prior_score else 'matched'} "
             f"({prior_score:.4f} ->{new_score:.4f}).\n\n"
-            "Write 1-2 bullet points about what was learned. Focus on what worked or didn't and why. "
-            "Be specific about techniques (e.g. 'increasing augmentation from 5x to 20x hurt accuracy'). "
-            "Keep it short — these notes guide future attempts."
+            "Write 1-2 directive learnings, one line each, in the form:\n"
+            "[tried X] -> [because/observed Y] -> [next time do Z]\n"
+            "Be specific about techniques and numbers "
+            "(e.g. 'raised augmentation 5x->20x -> val acc dropped 0.91->0.87 -> keep augmentation <=10x'). "
+            "One actionable line, not a paragraph. These notes guide future attempts."
         )
-        system_prompt = "You are a concise research assistant. Write brief, actionable observations."
+        system_prompt = "You are a concise research assistant. Write directive, actionable learnings — one line each."
 
         self.logger.log(UserEvent(content=prompt, data={"label": "Learnings"}))
         response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
