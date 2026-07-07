@@ -1105,6 +1105,7 @@ def main():
         print("  groundhog eval <path-or-id>       Score a solution dir, .py file, or attempt")
         print("  groundhog summary [--json]        Run overview: totals, best, families")
         print("  groundhog tool list|run           Run any toolkit tool from the terminal")
+        print("  groundhog bench run|compare       Offline strategy benchmark (deterministic, no API)")
         print("  groundhog skills install [dir]    Install the session skills into a run dir")
         print()
         print("Options:")
@@ -1140,6 +1141,9 @@ def main():
         sys.exit(cmd_summary(args[1:]))
     elif cmd == "tool":
         sys.exit(tool_group(args[1:]))
+    elif cmd == "bench":
+        from groundhog.bench.cli import bench_group
+        sys.exit(bench_group(args[1:]))
     elif cmd == "skills":
         sys.exit(skills_group(args[1:]))
     else:
