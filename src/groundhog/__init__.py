@@ -46,6 +46,7 @@ from groundhog.strategies.plan_approaches import PlanApproaches
 from groundhog.strategies.agent import AgentStrategy
 from groundhog.strategies.fresh_agent import FreshAgentStrategy
 from groundhog.strategies.cross_pollinate_agent import CrossPollinateAgent
+from groundhog.strategies.challenge import Challenge
 from groundhog.strategies.discover import discover_strategies
 from groundhog.agents.claude_code import ClaudeCodeAgentBackend
 from groundhog.agents.gemini_cli import GeminiCliAgentBackend
