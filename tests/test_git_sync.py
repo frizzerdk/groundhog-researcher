@@ -8,6 +8,7 @@ fetch every time so the assertions are deterministic.
 import os
 import shutil
 import subprocess
+import time
 
 import pytest
 
@@ -79,6 +80,74 @@ def test_local_store_never_touches_remote(tmp_path):
     store = GitAttemptHistory(tmp_path / "A")  # no remote
     a = _commit(store)
     assert [x.id for x in store.list()] == [a.id]
+
+
+def test_score_note_syncs_to_other_store(tmp_path):
+    """A set_note on one store is fetched and readable on another."""
+    from groundhog.histories.git import GitAttemptHistory, SyncPolicy
+    remote = str(_bare_remote(tmp_path))
+    policy = SyncPolicy(fetch_ttl_s=0.0)
+    a = GitAttemptHistory(tmp_path / "A", remote=remote, policy=policy)
+    b = GitAttemptHistory(tmp_path / "B", remote=remote, policy=policy)
+
+    a1 = _commit(a, code="from A")
+    a.set_note(a1, "score", "0.875")
+
+    b.list()   # triggers a fetch of both attempt and note refs
+    assert b.get_note(a1.id, "score") == "0.875"
+
+
+def test_root_attempt_reads_as_root_across_stores(tmp_path):
+    """A fresh (root) attempt branches off the ORIGINATING store's base commit,
+    whose sha differs from the reader's base — it must still read parent None."""
+    from groundhog.histories.git import GitAttemptHistory, SyncPolicy
+    remote = str(_bare_remote(tmp_path))
+    policy = SyncPolicy(fetch_ttl_s=0.0)
+    a = GitAttemptHistory(tmp_path / "A", remote=remote, policy=policy)
+    time.sleep(1.1)   # cross a second boundary so the base commits differ
+    b = GitAttemptHistory(tmp_path / "B", remote=remote, policy=policy)
+    assert a._base_sha != b._base_sha   # base commit date is not pinned
+
+    a1 = _commit(a, code="root")   # parent=None -> root
+    assert a1.parent is None
+    b.list()   # fetch the attempt (and its base commit ancestry) into B
+    fetched = b.get(a1.id)
+    assert fetched is not None
+    assert fetched.parent is None
+
+
+def test_backfill_pushes_preexisting_attempts_on_attach(tmp_path):
+    """A store used offline, then given a remote, backfills its refs once."""
+    from groundhog.histories.git import GitAttemptHistory, SyncPolicy
+    remote = str(_bare_remote(tmp_path))
+    policy = SyncPolicy(fetch_ttl_s=0.0)
+
+    a_local = GitAttemptHistory(tmp_path / "A")   # no remote
+    a1 = _commit(a_local, code="one")
+    a2 = _commit(a_local, parent=a1.id, code="two")
+
+    # Re-open the SAME store with a remote: backfill pushes both refs.
+    a_synced = GitAttemptHistory(tmp_path / "A", remote=remote, policy=policy)
+    assert a_synced._backfill_marker().exists()
+
+    b = GitAttemptHistory(tmp_path / "B", remote=remote, policy=policy)
+    assert {a1.id, a2.id} <= {x.id for x in b.list()}
+
+
+def test_first_contact_probe_reports_reachability(tmp_path, capsys):
+    from groundhog.histories.git import GitAttemptHistory, SyncPolicy
+    remote = str(_bare_remote(tmp_path))
+    GitAttemptHistory(tmp_path / "A", remote=remote,
+                      policy=SyncPolicy(fetch_ttl_s=0.0))
+    assert "sync: remote reachable" in capsys.readouterr().err
+
+
+def test_first_contact_probe_warns_when_unreachable(tmp_path, capsys):
+    from groundhog.histories.git import GitAttemptHistory, SyncPolicy
+    bogus = str(tmp_path / "nope.git")   # never created
+    GitAttemptHistory(tmp_path / "A", remote=bogus,
+                      policy=SyncPolicy(timeout_s=5.0))
+    assert "remote unreachable" in capsys.readouterr().err
 
 
 # --- Real-GitHub e2e (env-gated; never runs in CI) ---------------------------

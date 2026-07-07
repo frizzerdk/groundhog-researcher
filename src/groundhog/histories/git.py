@@ -41,6 +41,7 @@ Git config is neutralized and identity/date injected per call, so commit hashes
 never depend on machine configuration; ``core.autocrlf`` is forced off.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -70,6 +71,12 @@ _FS = "\x1f"
 _BINARY_EXTS = {".png", ".gif", ".jpg", ".jpeg", ".bmp", ".ico", ".pdf",
                 ".zip", ".gz", ".tar", ".bin", ".pkl", ".npy", ".npz",
                 ".whl", ".so", ".dll", ".exe", ".pyc"}
+
+# The well-known empty-tree object. A task-root (base) commit is a parentless
+# commit whose tree is empty; roots are detected by that shape, not by sha, so
+# a root synced from another store — whose base sha differs, since the base
+# commit's date is not pinned — still reads as a root (parent None).
+_EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 
 @dataclass
@@ -210,6 +217,7 @@ class GitAttemptHistory(AttemptHistory):
         self._remote = str(remote) if remote else None
         self._policy = policy or SyncPolicy()
         self._last_fetch = 0.0
+        self._base_cache: dict = {}   # sha -> is-base-commit, computed on demand
 
         self._root.mkdir(parents=True, exist_ok=True)
         self._store.mkdir(parents=True, exist_ok=True)
@@ -220,6 +228,11 @@ class GitAttemptHistory(AttemptHistory):
         self._load_origin()
         self._base_sha = self._git_text("rev-parse", "main")
         self._reap_trash()
+        if self._remote:
+            # First contact: report reachability once, then backfill any
+            # attempt refs that predate this remote being attached.
+            self._probe_remote()
+            self._backfill_refs()
 
     # --- store setup ----------------------------------------------------
 
@@ -558,6 +571,7 @@ class GitAttemptHistory(AttemptHistory):
             raise KeyError(f"unknown attempt {sha!r}")
         self._git("notes", f"--ref=refs/notes/groundhog/{key}",
                   "add", "-f", "-m", str(value), sha)
+        self._push_note(key)
 
     def get_note(self, attempt_or_id, key: str) -> Optional[str]:
         if not _NOTE_KEY.match(key or ""):
@@ -643,7 +657,7 @@ class GitAttemptHistory(AttemptHistory):
         parent = parents.split()[0] if parents.strip() else None
         # The base commit is the origin, not an attempt: a child of the base is
         # a "root" attempt with no logical parent.
-        if parent == self._base_sha:
+        if parent is not None and self._is_base_commit(parent):
             parent = None
         created, status = self._parse_trailers(body)
         if not created:
@@ -653,6 +667,28 @@ class GitAttemptHistory(AttemptHistory):
                 created = 0.0
         return GitAttempt(self, id=h.strip(), parent=parent,
                           created_at=created, status=status)
+
+    def _is_base_commit(self, sha: str) -> bool:
+        """True if ``sha`` is a task-root (base) commit — parentless, empty tree.
+
+        Structural, not ``== self._base_sha``: a store synced from a remote
+        branches its roots off the ORIGINATING store's base commit, whose sha
+        differs from ours (the base commit's date is not pinned), so the literal
+        check would show cross-store roots as non-root. Results are cached."""
+        if sha == self._base_sha:
+            return True
+        cached = self._base_cache.get(sha)
+        if cached is not None:
+            return cached
+        # Use _git (not _git_text): str.strip() eats the leading empty-%P
+        # field, since \x1f counts as whitespace to Python.
+        res = self._git("show", "-s", f"--format=%P{_FS}%T", sha, check=False)
+        out = res.stdout.decode("utf-8", "replace")
+        parents, _, tree = out.partition(_FS)
+        is_base = (res.returncode == 0 and not parents.strip()
+                   and tree.strip() == _EMPTY_TREE_SHA)
+        self._base_cache[sha] = is_base
+        return is_base
 
     @staticmethod
     def _parse_trailers(body: str):
@@ -674,10 +710,14 @@ class GitAttemptHistory(AttemptHistory):
         if not (self._remote and self._policy.push_after_commit):
             return
         ref = f"refs/attempts/{self.origin}/{sha}"
+        # Attempt refs are create-only per-origin (never conflict); note refs
+        # share one name across stores, so force-push them (last-writer-wins —
+        # a note is a display-only cache, never read for decisions).
+        specs = [f"{ref}:{ref}"] + self._note_refspecs()
         last_err = None
         for _ in range(max(1, self._policy.push_retries)):
             try:
-                self._git("push", self._remote, f"{ref}:{ref}",
+                self._git("push", self._remote, *specs,
                           timeout=self._policy.timeout_s)
                 return
             except (GitError, subprocess.SubprocessError, OSError) as e:
@@ -687,6 +727,21 @@ class GitAttemptHistory(AttemptHistory):
         # identical to one that does unless somebody says otherwise.
         print(f"WARNING: attempt {sha[:12]} committed locally but could not "
               f"be pushed to {self._remote} ({last_err})", file=sys.stderr)
+
+    def _note_refspecs(self) -> List[str]:
+        out = self._git_text("for-each-ref", "--format=%(refname)",
+                             "refs/notes/groundhog/", check=False)
+        return [f"+{r}:{r}" for r in out.splitlines() if r.strip()]
+
+    def _push_note(self, key: str):
+        if not self._remote:
+            return
+        ref = f"refs/notes/groundhog/{key}"
+        try:
+            self._git("push", self._remote, f"+{ref}:{ref}",
+                      timeout=self._policy.timeout_s)
+        except (GitError, subprocess.SubprocessError, OSError):
+            pass
 
     def _maybe_fetch(self):
         if not (self._remote and self._policy.fetch_before_reads):
@@ -698,7 +753,46 @@ class GitAttemptHistory(AttemptHistory):
         try:
             self._git("fetch", self._remote,
                       "+refs/attempts/*:refs/attempts/*",
+                      "+refs/notes/groundhog/*:refs/notes/groundhog/*",
                       timeout=self._policy.timeout_s)
+        except (GitError, subprocess.SubprocessError, OSError):
+            pass
+
+    def _probe_remote(self):
+        """One first-contact reachability check, reported on stderr. Uses a
+        generous fixed timeout: the first call pays DNS + auth handshake that
+        steady-state ops (on ``policy.timeout_s``) don't."""
+        try:
+            out = self._git_text("ls-remote", self._remote, "refs/attempts/*",
+                                 timeout=30.0)
+            n = sum(1 for line in out.splitlines() if line.strip())
+            print(f"sync: remote reachable, {n} attempt refs", file=sys.stderr)
+        except (GitError, subprocess.SubprocessError, OSError) as e:
+            print(f"WARNING: remote unreachable ({e})", file=sys.stderr)
+
+    def _backfill_marker(self) -> Path:
+        h = hashlib.sha1((self._remote or "").encode("utf-8")).hexdigest()[:16]
+        return self._git_dir / f"groundhog-synced-{h}"
+
+    def _backfill_refs(self):
+        """On attach, push attempt refs that predate this remote (a store used
+        offline, then given a remote). One batched best-effort push; a marker
+        per store+remote keeps it from repeating once it lands."""
+        if not self._policy.push_after_commit:
+            return
+        marker = self._backfill_marker()
+        if marker.exists():
+            return
+        out = self._git_text("for-each-ref", "--format=%(refname)",
+                             f"refs/attempts/{self.origin}/", check=False)
+        refs = [r for r in out.splitlines() if r.strip()]
+        if not refs:
+            marker.write_text("", encoding="utf-8")
+            return
+        try:
+            self._git("push", self._remote, *[f"{r}:{r}" for r in refs],
+                      timeout=self._policy.timeout_s)
+            marker.write_text("", encoding="utf-8")
         except (GitError, subprocess.SubprocessError, OSError):
             pass
 
