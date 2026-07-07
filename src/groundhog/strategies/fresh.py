@@ -182,7 +182,7 @@ Write complete, runnable code in a ```python block."""
         """The standard finish: direction gates -> record -> commit -> score note."""
         from groundhog.utils.finalize import finalize_attempt
         metadata = {
-            "strategy": "fresh_approach",
+            "strategy": self.name,
             "mode": self.cfg.mode,
             "cost": round(self.logger.total_cost(), 6),
         }
@@ -244,6 +244,6 @@ Write complete, runnable code in a ```python block."""
         return {
             "attempt": attempt.id,
             "score": round(score, 4),
-            "strategy": "fresh_approach",
+            "strategy": self.name,
             "mode": self.cfg.mode,
         }

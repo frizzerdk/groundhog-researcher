@@ -103,9 +103,10 @@ class SimpleOptimizer(Optimizer):
             self._register_strategy(s, allow_overwrite=False)
 
     def _register_strategy(self, strategy: Strategy, allow_overwrite: bool = True) -> None:
-        """Add a strategy to the queue-resolution registry under both its
-        CamelCase-lower and snake_case names (e.g. ``FreshApproach`` registers
-        as both ``"freshapproach"`` and ``"fresh_approach"``).
+        """Add a strategy to the queue-resolution registry under its declared
+        ``name`` plus the conventional aliases: CamelCase-lower and snake_case
+        (e.g. ``FreshApproach`` registers as both ``"freshapproach"`` and
+        ``"fresh_approach"``).
 
         With ``allow_overwrite=False`` (used for ``extras``), an existing
         registration wins and the new one is logged as skipped.
@@ -120,6 +121,11 @@ class SimpleOptimizer(Optimizer):
         # resolves under no name would burn on "unknown strategy").
         if snake.endswith("_strategy"):
             names.add(snake[: -len("_strategy")])
+        # The declared identity (Strategy.name — derived or overridden).
+        # Duck-typed callables without one still register by class name.
+        declared = getattr(strategy, "name", None)
+        if isinstance(declared, str) and declared:
+            names.add(declared)
         for name in names:
             if not allow_overwrite and name in self._strategy_registry:
                 # Rotation already owns this name; keep it.

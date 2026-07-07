@@ -70,7 +70,7 @@ class CrossPollinate(Strategy):
         from groundhog.utils.direction import solution_matches_attempt
         from groundhog.utils.finalize import finalize_attempt
         metadata = {
-            "strategy": "cross_pollinate",
+            "strategy": self.name,
             "prior": prior.id,
             "inspiration": inspiration.id,
             "cost": round(self.logger.total_cost(), 6),
@@ -219,5 +219,5 @@ Output SEARCH/REPLACE blocks modifying the base approach."""
             "attempt": attempt.id,
             "prior": prior.id,
             "score": round(score, 4),
-            "strategy": "cross_pollinate",
+            "strategy": self.name,
         }

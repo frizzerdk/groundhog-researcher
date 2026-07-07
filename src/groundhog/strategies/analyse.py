@@ -58,7 +58,7 @@ class Analyse(Strategy):
             self.log.info("no compression produced")
 
         return {
-            "strategy": "analyse",
+            "strategy": self.name,
             "entries_before": entries_before,
             "entries_after": entries_after,
             "cost": round(self.cost, 6),

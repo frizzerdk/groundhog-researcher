@@ -234,7 +234,7 @@ Output your changes as SEARCH/REPLACE blocks."""
     def _finalize(self, toolkit, ws, result, prior):
         """The standard finish: direction gates -> record -> commit -> score note."""
         from groundhog.utils.finalize import finalize_attempt
-        metadata = {"strategy": "improve", "prior": prior.id,
+        metadata = {"strategy": self.name, "prior": prior.id,
                     "cost": round(self.logger.total_cost(), 6)}
         return finalize_attempt(toolkit, ws, result, prior, metadata=metadata)
 
@@ -255,5 +255,5 @@ Output your changes as SEARCH/REPLACE blocks."""
             "attempt": attempt.id,
             "prior": prior.id,
             "score": round(score, 4),
-            "strategy": "improve",
+            "strategy": self.name,
         }

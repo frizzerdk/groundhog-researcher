@@ -109,7 +109,7 @@ class PlanApproaches(Strategy):
 
         if not proposals:
             self.log.info("no directions proposed")
-            return {"strategy": "plan_approaches", "queued": 0, "cost": round(self.cost, 6)}
+            return {"strategy": self.name, "queued": 0, "cost": round(self.cost, 6)}
 
         # Queue one fresh-agent run per proposal.
         queue_path = getattr(toolkit, "path", None)
@@ -121,7 +121,7 @@ class PlanApproaches(Strategy):
             queue_path = base.parent if base is not None else None
         if queue_path is None:
             self.log.info("could not resolve queue path; nothing queued")
-            return {"strategy": "plan_approaches", "queued": 0, "cost": round(self.cost, 6)}
+            return {"strategy": self.name, "queued": 0, "cost": round(self.cost, 6)}
 
         queued = 0
         for proposal in proposals:
@@ -146,7 +146,7 @@ class PlanApproaches(Strategy):
 
         self.log.info(f"queued {queued} fresh-direction runs")
         return {
-            "strategy": "plan_approaches",
+            "strategy": self.name,
             "queued": queued,
             "directions": [p.get("name", "?") for p in proposals],
             "cost": round(self.cost, 6),
