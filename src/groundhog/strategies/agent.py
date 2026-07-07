@@ -223,6 +223,8 @@ Update work/learnings.md with what you learned this session:
 - What worked well? What didn't?
 - What dead ends should future attempts avoid?
 
+Also: what would have made this easier? If anything, raise-insight it.
+
 Do not modify work/solution.py."""
 
 # Per-request explore prompt — agent does everything in one call

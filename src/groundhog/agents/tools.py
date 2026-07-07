@@ -18,6 +18,7 @@ import copy
 import json
 import operator
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -129,7 +130,7 @@ def build_default_agent_tools(toolkit) -> list:
     """
     from groundhog.base.agent import agent_tool
 
-    tools = [agent_tool(check_gates)]
+    tools = [agent_tool(check_gates), agent_tool(raise_insight)]
     for t in tools:
         t.bind_toolkit(toolkit)
     return tools
@@ -205,6 +206,97 @@ def check_gates(toolkit) -> str:
                 "    -> recorded in metadata; the commit itself stays done"
             )
     return "\n".join(lines)
+
+
+INSIGHT_KINDS = ("insight", "tool-request", "blocker", "idea")
+
+
+def raise_insight(toolkit, kind: str = "insight", text: str = "") -> str:
+    """Raise a note out of the sandbox to the humans running this optimization:
+    a general observation (``insight``), a wish for a tool that would have
+    helped (``tool-request``), something that blocked progress (``blocker``),
+    or an idea worth trying later (``idea``). Appends a stamped entry to the
+    run's ``insights.md`` and records it in the attempt log. Use it whenever
+    you hit friction or notice something the framework's authors should know —
+    it changes nothing about the solution.
+    """
+    text = (text or "").strip()
+    if not text:
+        return "raise-insight: nothing recorded (text was empty)."
+    kind = (kind or "").strip().lower() or "insight"
+    if kind not in INSIGHT_KINDS:
+        kind = "insight"  # unknown kinds fold into a plain insight, never rejected
+
+    stamp = datetime.now().isoformat(timespec="seconds")
+    ws_id = _insight_workspace_id(toolkit)
+    phase = _insight_phase(toolkit)
+
+    header = f"## {stamp} | {kind}"
+    if ws_id:
+        header += f" | attempt {ws_id}"
+    if phase:
+        header += f" | phase {phase}"
+    entry = f"{header}\n\n{text}"
+
+    root = Path(getattr(toolkit, "path", ".") or ".")
+    _append_insight(root / "insights.md", entry)
+    _log_insight_event(toolkit, kind, text, ws_id, phase)
+
+    where = f"attempt {ws_id}" if ws_id else "no open attempt"
+    return f"raise-insight recorded ({kind}, {where}) -> insights.md"
+
+
+def _insight_workspace_id(toolkit):
+    handle = getattr(toolkit, "ws", None)
+    if handle is None or not handle.is_set():
+        return None
+    try:
+        return getattr(handle.current, "display_id", None)
+    except Exception:
+        return None
+
+
+def _insight_phase(toolkit):
+    logger = getattr(toolkit, "attempt_logger", None)
+    if logger is None:
+        return None
+    try:
+        events = logger.events()
+    except Exception:
+        return None
+    for event in reversed(events):
+        if getattr(event, "type", None) == "phase":
+            return getattr(event, "phase", None) or None
+    return None
+
+
+def _append_insight(path, entry):
+    """Learnings-style append: entries joined by a --- rule, one file per run."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if existing.strip():
+        path.write_text(
+            existing.rstrip() + "\n\n---\n\n" + entry.strip() + "\n",
+            encoding="utf-8")
+    else:
+        path.write_text(entry.strip() + "\n", encoding="utf-8")
+
+
+def _log_insight_event(toolkit, kind, text, ws_id, phase):
+    logger = getattr(toolkit, "attempt_logger", None)
+    if logger is None or getattr(logger, "path", None) is None:
+        return  # no open attempt — the insights.md entry stands on its own
+    from groundhog.tools.attempt_logger import LogEvent
+    data = {"kind": kind, "text": text}
+    if ws_id:
+        data["attempt"] = ws_id
+    if phase:
+        data["phase"] = phase
+    try:
+        logger.log(LogEvent(type="insight", data=data))
+    except Exception:
+        pass
 
 
 def _resolve_parent(ws, history):
