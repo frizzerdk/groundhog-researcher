@@ -228,6 +228,8 @@ Write each learning as one directive line:
 [tried X] -> [because/observed Y] -> [next time do Z]
 Be specific about techniques and scores. One actionable line each, not paragraphs.
 
+Also: what would have made this easier? If anything, raise-insight it.
+
 Do not modify work/solution.py."""
 
 # Per-request explore prompt — agent does everything in one call
