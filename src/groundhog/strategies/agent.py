@@ -993,7 +993,7 @@ class AgentStrategy(Strategy):
 
     def _build_metadata(self, prior):
         return {
-            "strategy": "agent",
+            "strategy": self.name,
             "prior": prior.id if prior else None,
             "cost": round(self.logger.total_cost(), 6),
         }
@@ -1007,7 +1007,7 @@ class AgentStrategy(Strategy):
             "attempt": attempt.id,
             "prior": prior.id if prior else None,
             "score": round(score, 4),
-            "strategy": "agent",
+            "strategy": self.name,
         }
 
     def _score_result(self, result, toolkit):

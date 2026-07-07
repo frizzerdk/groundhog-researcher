@@ -103,9 +103,10 @@ class SimpleOptimizer(Optimizer):
             self._register_strategy(s, allow_overwrite=False)
 
     def _register_strategy(self, strategy: Strategy, allow_overwrite: bool = True) -> None:
-        """Add a strategy to the queue-resolution registry under both its
-        CamelCase-lower and snake_case names (e.g. ``FreshApproach`` registers
-        as both ``"freshapproach"`` and ``"fresh_approach"``).
+        """Add a strategy to the queue-resolution registry under its declared
+        ``name`` plus the conventional aliases: CamelCase-lower and snake_case
+        (e.g. ``FreshApproach`` registers as both ``"freshapproach"`` and
+        ``"fresh_approach"``).
 
         With ``allow_overwrite=False`` (used for ``extras``), an existing
         registration wins and the new one is logged as skipped.
@@ -120,6 +121,11 @@ class SimpleOptimizer(Optimizer):
         # resolves under no name would burn on "unknown strategy").
         if snake.endswith("_strategy"):
             names.add(snake[: -len("_strategy")])
+        # The declared identity (Strategy.name — derived or overridden).
+        # Duck-typed callables without one still register by class name.
+        declared = getattr(strategy, "name", None)
+        if isinstance(declared, str) and declared:
+            names.add(declared)
         for name in names:
             if not allow_overwrite and name in self._strategy_registry:
                 # Rotation already owns this name; keep it.
@@ -207,16 +213,6 @@ class SimpleOptimizer(Optimizer):
         cost = self._get_attempt_cost(attempt)
         result = attempt.result
         log = getattr(self.toolkit, "attempt_log", None)
-
-        # Cache the latest computed score as a mutable note beside the record
-        # (git: a real git note; folder: notes.json). Scores stay read-side —
-        # this is a low-effort cache, refreshed whenever we score. Best-effort.
-        try:
-            value = f"{self._score_attempt(attempt, scorer):.4f}" \
-                if result.completed else "fail"
-            self.history.set_note(attempt.id, "score", value)
-        except (NotImplementedError, KeyError, ValueError, OSError):
-            pass
 
         if not result.completed:
             errors = result.stages[result.failed_stage].errors

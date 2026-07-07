@@ -205,7 +205,6 @@ class CrossPollinateAgent(AgentStrategy):
 
     def _build_metadata(self, prior):
         meta = super()._build_metadata(prior)
-        meta["strategy"] = "cross_pollinate_agent"
         if getattr(self, "_inspiration", None) is not None:
             meta["inspiration"] = self._inspiration.id
         return meta

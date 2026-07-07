@@ -229,15 +229,15 @@ def test_notes_are_mutable_annotations(history_factory, commit_attempt):
         h.set_note("no-such-attempt", "score", "x")
 
 
-def test_optimizer_caches_score_note_per_attempt(history_factory):
-    """The run loop writes the latest computed score as a note on each new
-    attempt — refreshed whenever scoring runs, never part of the record."""
+def test_standard_finish_caches_score_note_exactly_once(history_factory):
+    """The score note is written by the strategy's standard finish
+    (finalize), exactly once per attempt — the run loop never writes it."""
     from groundhog import SimpleOptimizer, assemble_toolkit
     from groundhog.base.types import (
         Task, Data, Context, Evaluator, EvalStage, StageResult,
     )
-    from groundhog.utils.results import write_result
     from groundhog.base.types import EvaluationResult
+    from groundhog.utils.direction import write_direction
 
     class _Data(Data):
         def get_train(self): return None
@@ -259,12 +259,17 @@ def test_optimizer_caches_score_note_per_attempt(history_factory):
         def __call__(self, toolkit, config=None):
             ws = toolkit.history.workspace()
             (ws.path / "solution.py").write_text("x = 1", encoding="utf-8")
-            write_result(ws.path, EvaluationResult(
+            write_direction(ws.path, "some direction")
+            toolkit.finalize(ws, EvaluationResult(
                 stages={"eval": StageResult(metrics={"score": 0.75})}))
-            ws.commit(success=True)
             return {}
 
     history = history_factory()
+    note_writes = []
+    real_set_note = history.set_note
+    history.set_note = lambda *a, **k: (note_writes.append(a),
+                                        real_set_note(*a, **k))[1]
+
     task = Task(data=_Data(), context=_Ctx(), evaluator=_Eval(), name="t")
     opt = SimpleOptimizer(assemble_toolkit(task, history=history),
                           strategy=_Strat(), seed_strategy=None)
@@ -273,3 +278,4 @@ def test_optimizer_caches_score_note_per_attempt(history_factory):
     attempts = history.list()
     assert len(attempts) == 1
     assert history.get_note(attempts[0].id, "score") == "0.7500"
+    assert len(note_writes) == 1

@@ -25,9 +25,22 @@ inspect Config fields to discover what's configurable.
 Config flows: class defaults → constructor → call-time override.
 """
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Dict
+
+
+class _DerivedName:
+    """Computed default for ``Strategy.name``: snake_case of the class name
+    with a trailing "_strategy" stripped (AgentStrategy -> "agent"). A
+    subclass overrides by plain assignment (``name = "custom"``)."""
+
+    def __get__(self, obj, owner):
+        snake = re.sub(r"(?<!^)(?=[A-Z])", "_", owner.__name__).lower()
+        if snake.endswith("_strategy"):
+            snake = snake[: -len("_strategy")]
+        return snake
 
 
 def param(default, description: str, **kwargs):
@@ -74,10 +87,16 @@ class Strategy(ABC):
 
     Config resolution: class defaults → constructor config → call-time config.
 
+    ``name`` is the strategy's stable identity — attempt attribution
+    (metadata["strategy"]), queue resolution, discovery, and the CLI all use
+    it. Defaults to the snake_case class name with a trailing "_strategy"
+    stripped; override by assignment.
+
     Use composed method pattern: __call__ reads like a story, details in steps.
     """
 
     Config = StrategyConfig
+    name = _DerivedName()
 
     def __init__(self, config=None, **kwargs):
         """Create strategy with optional config override.
