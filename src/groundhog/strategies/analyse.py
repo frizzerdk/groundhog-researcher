@@ -1,13 +1,22 @@
-"""Analyse strategy — compress and reformat learnings.
+"""Analyse strategy — compress learnings and refresh the run report.
 
 Vault: Strategy — Types of Action.md (Analyse)
 
-Reads history + current learnings, asks LLM to compress: remove duplicates,
-identify patterns, note what's been tried vs untried. Replaces learnings
-with the compressed version. Does NOT generate code or create an attempt.
+Reads history + current learnings, asks the LLM to compress them (remove
+duplicates, group findings, flag what's untried), and refreshes a
+"state of the run" report — a periodic hand-off document (narrative header
++ data sections) that a campaign orchestrator reads between waves.
+
+Analyse never generates code and never creates an attempt: the report is a
+VIEW of the tree (overwritten in place), not a record. Schedule it by
+weight in the optimizer's rotation — nothing else changes:
+
+    strategies=[(Analyse(), 1), (Improve(), 9)]   # report every ~10 attempts
 """
 
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 from groundhog.base.strategy import Strategy, StrategyConfig, param
 
@@ -16,13 +25,18 @@ from groundhog.base.strategy import Strategy, StrategyConfig, param
 class AnalyseConfig(StrategyConfig):
     """Configuration for the Analyse strategy."""
     max_attempts: int = param(20, "How many recent attempts to summarize")
+    write_report: bool = param(True, "Refresh the state-of-the-run report file")
+    report_path: str = param("reports/state.md",
+                             "Report location, relative to the run root")
+    report_last_k: int = param(10, "Attempts shown in the report's recent table")
+    report_top_learnings: int = param(8, "Learnings shown in the report")
 
 
 class Analyse(Strategy):
-    """Compress and reformat learnings based on recent attempt history.
+    """Compress learnings and refresh the run report from recent history.
 
     Composed method pattern:
-        init ->gather context ->ask LLM to compress ->replace learnings
+        init -> gather context -> compress learnings -> write report
     """
 
     Config = AnalyseConfig
@@ -37,32 +51,33 @@ class Analyse(Strategy):
         current_learnings = toolkit.learnings.get()
         entries_before = toolkit.learnings.count()
 
-        if entries_before == 0:
-            return {"skipped": "no learnings to analyse"}
-
-        # Gather recent attempt summaries
         attempts_summary = self._summarize_attempts(toolkit)
 
-        # Ask LLM to compress
-        self.log.inline("compressing... ")
-        compressed = self._compress(toolkit, current_learnings, attempts_summary)
-        self.log.tock()
+        entries_after = entries_before
+        if entries_before > 0:
+            self.log.inline("compressing... ")
+            compressed = self._compress(toolkit, current_learnings, attempts_summary)
+            self.log.tock()
+            if compressed:
+                toolkit.learnings._path.write_text(compressed.strip() + "\n", encoding="utf-8")
+                entries_after = toolkit.learnings.count()
+                self.log.info(f"learnings: {entries_before} -> {entries_after} entries")
+            else:
+                self.log.info("no compression produced")
 
-        if compressed:
-            # Replace learnings entirely
-            toolkit.learnings._path.write_text(compressed.strip() + "\n", encoding="utf-8")
-            entries_after = toolkit.learnings.count()
-            self.log.info(f"learnings: {entries_before} ->{entries_after} entries")
-        else:
-            entries_after = entries_before
-            self.log.info("no compression produced")
-
-        return {
+        result = {
             "strategy": self.name,
             "entries_before": entries_before,
             "entries_after": entries_after,
-            "cost": round(self.cost, 6),
         }
+
+        if self.cfg.write_report:
+            report_path = self._write_report(toolkit)
+            self.log.info(f"report: {report_path}")
+            result["report"] = str(report_path)
+
+        result["cost"] = round(self.cost, 6)
+        return result
 
     # --- Init ---
 
@@ -75,11 +90,30 @@ class Analyse(Strategy):
 
     # --- Context gathering ---
 
+    def _scorer(self, toolkit):
+        stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=self.through)
+        return stages[-1].score
+
+    def _score_of(self, attempt, scorer):
+        """Last-stage score for an attempt, or None when unscoreable."""
+        try:
+            result = attempt.result
+        except (OSError, ValueError):
+            return None
+        if not result.completed:
+            return None
+        stages = list(result.stages.values())
+        if not stages:
+            return None
+        try:
+            return scorer(stages[-1])
+        except Exception:
+            return None
+
     def _summarize_attempts(self, toolkit):
         attempts = toolkit.history.list()
         recent = attempts[-self.cfg.max_attempts:]
-        stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=self.through)
-        scorer = stages[-1].score
+        scorer = self._scorer(toolkit)
 
         lines = []
         for a in recent:
@@ -121,3 +155,140 @@ Output only the compressed learnings, nothing else."""
         self.cost += response.cost
 
         return response.text
+
+    # --- Report ---
+    # Aggregations below are vendored so this branch stands alone; they
+    # converge with the read layer in utils/queries.py (attempt_table /
+    # families) on origin/feat/read-layer-queries — swap to those once merged.
+
+    def _write_report(self, toolkit):
+        scorer = self._scorer(toolkit)
+        attempts = toolkit.history.list(only_done=False)
+
+        summary = self._report_summary(attempts, scorer)
+        families = self._report_families(attempts, scorer)
+        narrative = self._narrate(toolkit, summary, families)
+
+        body = self._render_report(toolkit, narrative, summary, families, attempts, scorer)
+
+        path = self._resolve_report_path(toolkit)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def _resolve_report_path(self, toolkit):
+        root = getattr(toolkit, 'path', None)
+        if root is None:
+            base = getattr(toolkit.history, 'base_path', None)
+            root = Path(base).parent if base is not None else Path.cwd()
+        rel = Path(self.cfg.report_path)
+        return rel if rel.is_absolute() else Path(root) / rel
+
+    def _report_summary(self, attempts, scorer):
+        scores = []
+        completed = failed = 0
+        for a in attempts:
+            s = self._score_of(a, scorer)
+            if s is None:
+                failed += 1
+            else:
+                completed += 1
+                scores.append((a.id, s))
+        best = max(scores, key=lambda t: t[1]) if scores else None
+        latest = scores[-1] if scores else None
+        return {
+            "total": len(attempts),
+            "completed": completed,
+            "failed": failed,
+            "best": best,
+            "latest": latest,
+        }
+
+    def _report_families(self, attempts, scorer):
+        from groundhog.utils.direction import (
+            direction_title, normalize_direction, read_direction_from_attempt,
+        )
+        groups = {}
+        for a in attempts:
+            text = read_direction_from_attempt(a)
+            key = normalize_direction(text) if text else None
+            groups.setdefault(key, {"text": text, "members": []})["members"].append(a)
+
+        out = []
+        for group in groups.values():
+            best = None
+            for a in group["members"]:
+                s = self._score_of(a, scorer)
+                if s is not None and (best is None or s > best):
+                    best = s
+            out.append({
+                "name": direction_title(group["text"] or "") or "(no direction)",
+                "members": len(group["members"]),
+                "best": best,
+            })
+        return out
+
+    def _narrate(self, toolkit, summary, families):
+        best = f"{summary['best'][1]:.4f} (#{summary['best'][0]})" if summary["best"] else "none"
+        latest = f"{summary['latest'][1]:.4f} (#{summary['latest'][0]})" if summary["latest"] else "none"
+        fam_rows = []
+        for f in families:
+            best_s = f"{f['best']:.4f}" if f["best"] is not None else "none"
+            fam_rows.append(f"- {f['name']}: {f['members']} attempts, best {best_s}")
+        fam_lines = "\n".join(fam_rows) or "- (none yet)"
+
+        prompt = f"""You are writing the header of a "state of the run" report for an
+ongoing optimization campaign. Someone picking up the run reads this to
+orient before the next wave of work.
+
+## Numbers
+- Attempts: {summary['total']} ({summary['completed']} scored, {summary['failed']} failed)
+- Best score: {best}
+- Latest score: {latest}
+
+## Families (approaches tried)
+{fam_lines}
+
+Write 5-10 lines of prose covering: the trajectory so far, what's working,
+what's stuck or underexplored, and the recommended next moves. Be specific
+and concrete. Output only the narrative, no heading."""
+
+        system_prompt = "You are a research lead writing a concise state-of-the-run briefing."
+        response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
+        self.cost += response.cost
+        return response.text.strip()
+
+    def _render_report(self, toolkit, narrative, summary, families, attempts, scorer):
+        lines = ["# State of the run", "", narrative, "", "## Summary", ""]
+
+        best = summary["best"]
+        latest = summary["latest"]
+        lines.append(f"- Attempts: {summary['total']} "
+                     f"({summary['completed']} scored, {summary['failed']} failed)")
+        lines.append(f"- Best score: {best[1]:.4f} (#{best[0]})" if best else "- Best score: none")
+        lines.append(f"- Latest score: {latest[1]:.4f} (#{latest[0]})" if latest else "- Latest score: none")
+        lines.append(f"- Families: {len(families)}")
+        lines.append("")
+
+        lines += ["## Families", "", "| Family | Attempts | Best score |", "| --- | --- | --- |"]
+        for f in families:
+            best_s = f"{f['best']:.4f}" if f["best"] is not None else "-"
+            lines.append(f"| {f['name']} | {f['members']} | {best_s} |")
+        lines.append("")
+
+        k = self.cfg.report_last_k
+        lines += [f"## Last {k} attempts", "", "| # | Parent | Strategy | Score |",
+                  "| --- | --- | --- | --- |"]
+        for a in attempts[-k:]:
+            s = self._score_of(a, scorer)
+            score_s = f"{s:.4f}" if s is not None else "FAILED"
+            strategy = a.metadata.get("strategy", "?")
+            lines.append(f"| {a.id} | {a.parent} | {strategy} | {score_s} |")
+        lines.append("")
+
+        learnings = toolkit.learnings.get(last=self.cfg.report_top_learnings).strip()
+        lines += ["## Top learnings", "", learnings or "_(none yet)_", ""]
+
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines.append(f"_generated by analyse at {stamp}_")
+        return "\n".join(lines) + "\n"
