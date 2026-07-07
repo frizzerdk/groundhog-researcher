@@ -1273,6 +1273,118 @@ def _strategy_run(args):
     return 0
 
 
+def learnings_group(args):
+    """`groundhog learnings rebuild|list` — the learnings ledger + lens.
+
+    The attempts are the ledger (per-attempt learnings records); the
+    run-root learnings.md is a derived digest. ``rebuild`` regenerates it
+    from the ledger; ``list`` reads the ledger directly.
+    """
+    usage = (
+        "Usage: groundhog learnings <subcommand>\n"
+        "\n"
+        "  rebuild [--llm] [--max N]    Rebuild the run-root digest from the\n"
+        "                               per-attempt ledger (--llm: merge with\n"
+        "                               the default-tier LLM; default cap 50)\n"
+        "  list [--attempt ID]          List per-attempt learnings records\n"
+    )
+    if not args or args[0] in ("-h", "--help"):
+        print(usage)
+        return 0
+    sub, rest = args[0], args[1:]
+    handlers = {
+        "rebuild": _learnings_rebuild,
+        "list": _learnings_list,
+    }
+    handler = handlers.get(sub)
+    if handler is None:
+        print(f"Unknown learnings subcommand: {sub}")
+        print(usage)
+        return 1
+    return handler(rest)
+
+
+def _learnings_rebuild(args):
+    use_llm, args = _flag(args, "--llm")
+    max_str, args = _opt(args, "--max")
+    try:
+        max_entries = int(max_str) if max_str is not None else 50
+    except ValueError:
+        print(f"--max expects an integer, got {max_str!r}")
+        return 1
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    toolkit = run.toolkit
+
+    llm = None
+    if use_llm:
+        if not hasattr(toolkit, "llm"):
+            print("No LLM backends on this toolkit; run without --llm for "
+                  "the deterministic rebuild.")
+            return 1
+        llm = toolkit.llm.get("default")
+
+    # MarkdownLearnings keeps its file path on _path; other backends fall
+    # back to the run-root convention.
+    path = getattr(getattr(toolkit, "learnings", None), "_path", None)
+    if path is None:
+        path = Path(getattr(toolkit, "path", Path.cwd())) / "learnings.md"
+
+    from groundhog.utils.learnings_digest import SEPARATOR, rebuild_digest
+    try:
+        text = rebuild_digest(run.history, path, max_entries=max_entries, llm=llm)
+    except Exception as e:  # noqa: BLE001 — CLI surface, print and exit
+        print(f"Rebuild failed: {e}")
+        return 1
+    body = text.split("\n\n", 1)[1] if "\n\n" in text else ""
+    n = len([e for e in body.split(SEPARATOR) if e.strip()])
+    print(f"Rebuilt digest: {n} entries -> {path}")
+    return 0
+
+
+def _learnings_list(args):
+    attempt_id, args = _opt(args, "--attempt")
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history = run.history
+
+    from groundhog.utils.learnings_digest import attempt_learnings
+
+    if attempt_id is not None:
+        attempt = history.get(attempt_id)
+        if attempt is None:
+            print(f"No such attempt: {attempt_id}")
+            return 1
+        entries = attempt_learnings(attempt)
+        if not entries:
+            print(f"No learnings recorded in attempt {attempt_id}.")
+            return 0
+        for i, entry in enumerate(entries):
+            if i:
+                print("---")
+            print(entry)
+        return 0
+
+    attempts = [a for a in history.list(only_done=False)
+                if a.status in ("done", "fail")]
+    attempts.sort(key=lambda a: a.created_at, reverse=True)
+    found = False
+    for a in attempts:
+        entries = attempt_learnings(a)
+        if not entries:
+            continue
+        found = True
+        first_line = entries[0].strip().splitlines()[0]
+        plural = "entries" if len(entries) != 1 else "entry"
+        print(f"{_short(a.id):<10} {len(entries)} {plural:<8} {first_line}")
+    if not found:
+        print("No per-attempt learnings recorded yet.")
+    return 0
+
+
 def main():
     args = sys.argv[1:]
 
@@ -1299,6 +1411,7 @@ def main():
         print("  groundhog strategy list|show|run  Discover and run strategies from the terminal")
         print("  groundhog tool list|run           Run any toolkit tool from the terminal")
         print("  groundhog bench run|compare       Offline strategy benchmark (deterministic, no API)")
+        print("  groundhog learnings rebuild|list  Rebuild the derived learnings digest / list the ledger")
         print("  groundhog skills install [dir]    Install the session skills into a run dir")
         print()
         print("Options:")
@@ -1339,6 +1452,8 @@ def main():
     elif cmd == "bench":
         from groundhog.bench.cli import bench_group
         sys.exit(bench_group(args[1:]))
+    elif cmd == "learnings":
+        sys.exit(learnings_group(args[1:]))
     elif cmd == "skills":
         sys.exit(skills_group(args[1:]))
     else:
