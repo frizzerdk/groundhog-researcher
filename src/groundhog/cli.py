@@ -993,6 +993,95 @@ def tool_group(args):
     return 1
 
 
+def queue_group(args):
+    """`groundhog queue add/list/clear` — the file-based strategy override.
+
+    Thin CLI over tools/queue.py: the optimizer pops ``queue.json`` before
+    each rotation step. Config values stay strings here — the queue item is
+    resolved by the optimizer when it is consumed.
+    """
+    usage = (
+        "Usage:\n"
+        "  groundhog queue add <strategy> [--set k=v ...]   Queue a strategy override\n"
+        "  groundhog queue list                             Show pending items\n"
+        "  groundhog queue clear                            Drop all pending items\n"
+    )
+    if not args or args[0] in ("-h", "--help"):
+        print(usage)
+        return 0
+    sub, rest = args[0], args[1:]
+    if sub not in ("add", "list", "clear"):
+        print(f"Unknown queue subcommand: {sub!r}")
+        print(usage)
+        return 1
+
+    import json
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    queue_root = Path(getattr(run.toolkit, "path", None) or run.run_dir)
+    queue_file = queue_root / "queue.json"
+
+    def read_items():
+        if not queue_file.exists():
+            return []
+        try:
+            items = json.loads(queue_file.read_text(encoding="utf-8"))
+        except ValueError:
+            return []
+        return items if isinstance(items, list) else []
+
+    if sub == "add":
+        config = {}
+        positional = []
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--set":
+                if i + 1 >= len(rest) or "=" not in rest[i + 1]:
+                    print("Usage: groundhog queue add <strategy> [--set k=v ...]")
+                    return 1
+                k, v = rest[i + 1].split("=", 1)
+                config[k] = v
+                i += 2
+            else:
+                positional.append(rest[i])
+                i += 1
+        if len(positional) != 1 or positional[0].startswith("--"):
+            print("Usage: groundhog queue add <strategy> [--set k=v ...]")
+            return 1
+        strategy = positional[0]
+        from groundhog.tools.queue import add as queue_add
+        queue_add(queue_root, strategy, config, source="user")
+        position = len(read_items())
+        config_str = f" config={config}" if config else ""
+        print(f"Queued {strategy} at position {position}{config_str}")
+        return 0
+
+    if sub == "list":
+        items = read_items()
+        if not items:
+            print("Queue is empty.")
+            return 0
+        print(f"{'pos':<5} {'strategy':<24} {'source':<10} config")
+        for pos, item in enumerate(items, start=1):
+            config = item.get("config") or {}
+            config_str = " ".join(f"{k}={v}" for k, v in config.items()) or "-"
+            print(f"{pos:<5} {item.get('strategy', '?'):<24} "
+                  f"{item.get('source', '?'):<10} {config_str}")
+        return 0
+
+    # clear
+    items = read_items()
+    if not items:
+        print("Queue is empty.")
+        return 0
+    # Preserve the file as [] (never unlink) — the read_next convention.
+    queue_file.write_text("[]", encoding="utf-8")
+    print(f"Cleared {len(items)} queued item{'s' if len(items) != 1 else ''}.")
+    return 0
+
+
 def main():
     args = sys.argv[1:]
 
@@ -1016,6 +1105,7 @@ def main():
         print("  groundhog attempt <subcommand>    Manual attempt lifecycle (new/list/show/commit/...)")
         print("  groundhog eval <path-or-id>       Score a solution dir, .py file, or attempt")
         print("  groundhog tool list|run           Run any toolkit tool from the terminal")
+        print("  groundhog queue add|list|clear    Queue strategy overrides for the optimizer")
         print("  groundhog skills install [dir]    Install the session skills into a run dir")
         print()
         print("Options:")
@@ -1049,6 +1139,8 @@ def main():
         sys.exit(cmd_eval(args[1:]))
     elif cmd == "tool":
         sys.exit(tool_group(args[1:]))
+    elif cmd == "queue":
+        sys.exit(queue_group(args[1:]))
     elif cmd == "skills":
         sys.exit(skills_group(args[1:]))
     else:
