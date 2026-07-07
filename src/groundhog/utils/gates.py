@@ -14,9 +14,10 @@ Severities:
            never blocked): a fresh attempt with no core_direction.md,
            or one duplicating an existing family.
     flag — recorded in metadata, the attempt stays done: solution
-           byte-identical to the parent (non-promotable), or an
-           inherited direction that was modified mid-session (it is
-           restored at finish).
+           byte-identical to the parent (non-promotable), an inherited
+           direction whose FIRST LINE was changed mid-session (the
+           family-identity line, restored at finish), or an inherited
+           direction whose BODY was refined (kept and recorded).
 
 These are legitimacy gates only. Performance acceptance is deliberately
 read-side (scorer + selection); a run that wants a performance gate
@@ -31,7 +32,8 @@ from typing import Iterable, Optional
 
 from groundhog.utils.direction import (
     direction_exists,
-    inherited_direction_changed_from,
+    inherited_direction_body_changed_from,
+    inherited_direction_first_line_changed_from,
     read_direction,
     solution_matches_attempt,
 )
@@ -40,6 +42,7 @@ from groundhog.utils.direction import (
 DIRECTION_MISSING = "direction-missing"
 DIRECTION_DUPLICATE = "direction-duplicate"
 DIRECTION_MODIFIED = "direction-modified"
+DIRECTION_BODY_REFINED = "direction-body-refined"
 SOLUTION_IDENTICAL = "solution-identical"
 
 # Messages are load-bearing: the strategy writes them into
@@ -48,8 +51,11 @@ _MESSAGES = {
     DIRECTION_MISSING: "fresh attempt did not create core_direction.md",
     DIRECTION_DUPLICATE: "fresh attempt duplicated an existing core direction",
     DIRECTION_MODIFIED: (
-        "inherited core_direction.md was modified; the parent's direction "
-        "is restored at finish"
+        "inherited core_direction.md first line was modified; the parent's "
+        "first line is restored at finish"
+    ),
+    DIRECTION_BODY_REFINED: (
+        "inherited core_direction.md body was refined; kept and recorded"
     ),
     SOLUTION_IDENTICAL: "solution.py is byte-identical to parent",
 }
@@ -99,8 +105,10 @@ def evaluate_gates(
         ):
             violations.append(_violation(DIRECTION_DUPLICATE, "fail"))
     else:
-        if inherited_direction_changed_from(ws_dir, parent):
+        if inherited_direction_first_line_changed_from(ws_dir, parent):
             violations.append(_violation(DIRECTION_MODIFIED, "flag"))
+        if inherited_direction_body_changed_from(ws_dir, parent):
+            violations.append(_violation(DIRECTION_BODY_REFINED, "flag"))
 
     if solution_matches_attempt(ws_dir, parent):
         violations.append(_violation(SOLUTION_IDENTICAL, "flag"))
