@@ -755,8 +755,8 @@ def _attempt_commit(args):
             # metadata apply to every commit. Composed from the same public
             # pieces the standard finish uses (result.json stays eval-only).
             from groundhog.utils.direction import (
-                inherit_direction_from_attempt,
                 promote_workspace_direction,
+                restore_inherited_first_line,
                 workspace_name,
             )
             from groundhog.utils.gates import evaluate_gates
@@ -779,11 +779,13 @@ def _attempt_commit(args):
                     success = False
                 elif v.gate == "direction-modified":
                     metadata["direction_restored"] = True
+                elif v.gate == "direction-body-refined":
+                    metadata["direction_body_refined"] = True
                 elif v.gate == "solution-identical":
                     metadata["non_promotable"] = True
                     metadata["non_promotable_reason"] = v.message
             if prior is not None:
-                inherit_direction_from_attempt(prior, ws.path)
+                restore_inherited_first_line(ws.path, prior)
             write_metadata(ws.path, metadata)
             if not ws.name:
                 derived = workspace_name(ws.path)
@@ -813,8 +815,11 @@ def _print_gate_outcome(metadata):
         print(f"Gate: {metadata.get('non_promotable_reason', 'non-promotable')} "
               f"-> flagged non-promotable (commit stays done)")
     if metadata.get("direction_restored"):
-        print("Gate: inherited core_direction.md was modified -> parent's "
-              "direction restored")
+        print("Gate: inherited core_direction.md first line was modified -> "
+              "parent's first line restored")
+    if metadata.get("direction_body_refined"):
+        print("Gate: inherited core_direction.md body refined -> kept and "
+              "recorded")
 
 
 def _attempt_abort(args):

@@ -12,6 +12,7 @@ from groundhog.base.types import EvaluationResult, StageResult
 from groundhog.histories.folder import FolderAttemptHistory
 from groundhog.utils.direction import write_direction
 from groundhog.utils.gates import (
+    DIRECTION_BODY_REFINED,
     DIRECTION_DUPLICATE,
     DIRECTION_MISSING,
     DIRECTION_MODIFIED,
@@ -125,6 +126,41 @@ def test_inherited_modified_direction_flags():
         violations = evaluate_gates(Path(tmp), parent)
         assert [v.gate for v in violations] == [DIRECTION_MODIFIED]
         assert violations[0].severity == "flag"
+
+
+def test_inherited_body_only_refinement_flags_body_refined():
+    # Same first line (approach name), refined body: a permitted
+    # refinement — flagged informational, never the modified/restore gate.
+    with tempfile.TemporaryDirectory() as tmp:
+        parent = _fake_parent(direction="rollout\n\ngreedy lookahead")
+        write_direction(tmp, "rollout\n\ngreedy lookahead with deeper search")
+        (Path(tmp) / "solution.py").write_text("print(2)", encoding="utf-8")
+        violations = evaluate_gates(Path(tmp), parent)
+        assert [v.gate for v in violations] == [DIRECTION_BODY_REFINED]
+        assert violations[0].severity == "flag"
+
+
+def test_inherited_first_line_edit_flags_modified_only():
+    # First line changed, body identical: only the family-identity gate.
+    with tempfile.TemporaryDirectory() as tmp:
+        parent = _fake_parent(direction="rollout\n\ngreedy lookahead")
+        write_direction(tmp, "beam search\n\ngreedy lookahead")
+        (Path(tmp) / "solution.py").write_text("print(2)", encoding="utf-8")
+        violations = evaluate_gates(Path(tmp), parent)
+        assert [v.gate for v in violations] == [DIRECTION_MODIFIED]
+        assert violations[0].severity == "flag"
+
+
+def test_inherited_first_line_and_body_edit_flags_both():
+    with tempfile.TemporaryDirectory() as tmp:
+        parent = _fake_parent(direction="rollout\n\ngreedy lookahead")
+        write_direction(tmp, "beam search\n\ngreedy lookahead, wider")
+        (Path(tmp) / "solution.py").write_text("print(2)", encoding="utf-8")
+        violations = evaluate_gates(Path(tmp), parent)
+        assert [v.gate for v in violations] == [
+            DIRECTION_MODIFIED,
+            DIRECTION_BODY_REFINED,
+        ]
 
 
 def test_inherited_unchanged_direction_passes():

@@ -156,6 +156,73 @@ def test_inherited_modified_direction_is_restored_and_flagged():
         assert read_direction(child_ws.path).strip() == "rollout"
 
 
+def _inherited_child(tk, parent_direction, child_direction, child_code="print(2)"):
+    parent_ws = tk.history.workspace()
+    (parent_ws.path / "solution.py").write_text("print(1)", encoding="utf-8")
+    write_direction(parent_ws.path, parent_direction)
+    parent = finalize_attempt(tk, parent_ws, _ok_result(), None)
+
+    child_ws = tk.history.workspace(parent=parent.id)
+    (child_ws.path / "solution.py").write_text(child_code, encoding="utf-8")
+    write_direction(child_ws.path, child_direction)
+    return parent, child_ws
+
+
+def test_body_only_refinement_is_kept_and_noted():
+    with tempfile.TemporaryDirectory() as tmp:
+        tk = _toolkit(tmp)
+        parent, child_ws = _inherited_child(
+            tk,
+            "rollout\n\nGreedy lookahead.",
+            "rollout\n\nGreedy lookahead with deeper search.",
+        )
+        attempt = finalize_attempt(tk, child_ws, _ok_result(), parent)
+
+        assert attempt.status == "done"
+        assert attempt.metadata.get("direction_body_refined") is True
+        assert attempt.metadata.get("direction_restored") is None
+        # Body kept verbatim, first line intact — nothing reverted.
+        kept = read_direction(child_ws.path)
+        assert kept.splitlines()[0].strip() == "rollout"
+        assert "deeper search" in kept
+
+
+def test_first_line_edit_restores_line_and_keeps_body():
+    with tempfile.TemporaryDirectory() as tmp:
+        tk = _toolkit(tmp)
+        parent, child_ws = _inherited_child(
+            tk,
+            "rollout\n\nGreedy lookahead.",
+            "beam search\n\nGreedy lookahead.",
+        )
+        attempt = finalize_attempt(tk, child_ws, _ok_result(), parent)
+
+        assert attempt.status == "done"
+        assert attempt.metadata.get("direction_restored") is True
+        assert attempt.metadata.get("direction_body_refined") is None
+        kept = read_direction(child_ws.path)
+        assert kept.splitlines()[0].strip() == "rollout"
+        assert "Greedy lookahead." in kept
+
+
+def test_first_line_and_body_edit_restores_line_keeps_body():
+    with tempfile.TemporaryDirectory() as tmp:
+        tk = _toolkit(tmp)
+        parent, child_ws = _inherited_child(
+            tk,
+            "rollout\n\nGreedy lookahead.",
+            "beam search\n\nGreedy lookahead, wider.",
+        )
+        attempt = finalize_attempt(tk, child_ws, _ok_result(), parent)
+
+        assert attempt.status == "done"
+        assert attempt.metadata.get("direction_restored") is True
+        assert attempt.metadata.get("direction_body_refined") is True
+        kept = read_direction(child_ws.path)
+        assert kept.splitlines()[0].strip() == "rollout"
+        assert "wider" in kept
+
+
 def test_identical_solution_flags_non_promotable_but_commits_done():
     with tempfile.TemporaryDirectory() as tmp:
         tk = _toolkit(tmp)

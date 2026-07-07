@@ -18,7 +18,8 @@ Standard responses to gate violations (see utils/gates.py):
     fail  → recorded, never blocked: metadata["gate_failure"] is set and
             the result is marked failed, so the attempt commits as a
             failed entry the family map remembers and selection skips.
-    flag  → metadata only: direction_restored / non_promotable.
+    flag  → metadata only: direction_restored / direction_body_refined /
+            non_promotable.
 """
 
 from __future__ import annotations
@@ -26,12 +27,13 @@ from __future__ import annotations
 from typing import Optional
 
 from groundhog.utils.direction import (
-    inherit_direction_from_attempt,
     mark_result_failed,
     promote_workspace_direction,
+    restore_inherited_first_line,
     workspace_name,
 )
 from groundhog.utils.gates import (
+    DIRECTION_BODY_REFINED,
     DIRECTION_MODIFIED,
     SOLUTION_IDENTICAL,
     evaluate_gates,
@@ -92,14 +94,17 @@ def finalize_attempt(
             mark_result_failed(result, "core_direction", v.message)
         elif v.gate == DIRECTION_MODIFIED:
             metadata["direction_restored"] = True
+        elif v.gate == DIRECTION_BODY_REFINED:
+            metadata["direction_body_refined"] = True
         elif v.gate == SOLUTION_IDENTICAL:
             metadata["non_promotable"] = True
             metadata["non_promotable_reason"] = v.message
 
-    # Mutation second (inherited only): restore the parent's direction
-    # unconditionally — the soft-gate that keeps families from forking.
+    # Mutation second (inherited only): restore the parent's first line
+    # (the immutable family-identity line) while keeping any body
+    # refinement — the soft-gate that keeps families from forking.
     if prior is not None:
-        inherit_direction_from_attempt(prior, ws.path)
+        restore_inherited_first_line(ws.path, prior)
 
     from groundhog.utils.results import write_result
     write_result(ws.path, result, metadata=metadata)

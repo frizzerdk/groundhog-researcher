@@ -64,7 +64,10 @@ at every level.
   from the parent. Its FIRST LINE is the approach name itself (no
   heading, no label) and doubles as the attempt's display name and
   folder slug — keep that line intact. Refine the body only while the
-  work remains the same approach.
+  work remains the same approach. The commit gate enforces exactly this:
+  a changed first line is restored to the parent's and flagged
+  (`direction_restored`), while body refinements are kept and recorded
+  (`direction_body_refined`).
 - **A pivot is not an improve.** If the changes amount to a new
   approach, that is the approach-pivot checkpoint: pause and surface
   it (pair/checkpoint) or safe-stop and report (auto). New directions
