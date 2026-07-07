@@ -208,16 +208,6 @@ class SimpleOptimizer(Optimizer):
         result = attempt.result
         log = getattr(self.toolkit, "attempt_log", None)
 
-        # Cache the latest computed score as a mutable note beside the record
-        # (git: a real git note; folder: notes.json). Scores stay read-side —
-        # this is a low-effort cache, refreshed whenever we score. Best-effort.
-        try:
-            value = f"{self._score_attempt(attempt, scorer):.4f}" \
-                if result.completed else "fail"
-            self.history.set_note(attempt.id, "score", value)
-        except (NotImplementedError, KeyError, ValueError, OSError):
-            pass
-
         if not result.completed:
             errors = result.stages[result.failed_stage].errors
             if log is not None:

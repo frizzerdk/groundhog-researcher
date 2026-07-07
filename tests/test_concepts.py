@@ -1549,6 +1549,10 @@ def test_derive_families_legacy_approach_md_groups_with_core_direction():
 
 
 def test_fresh_approach_duplicate_direction_gate_fails_result():
+    """FreshApproach's finish runs the standard gates: a fresh attempt whose
+    direction duplicates an existing family commits as failed."""
+    from groundhog.backends.mock import MockBackend
+    from groundhog.base.backend import BackendRegistry
     from groundhog.strategies.fresh import FreshApproach
     from groundhog.utils.direction import write_direction
 
@@ -1562,18 +1566,20 @@ def test_fresh_approach_duplicate_direction_gate_fails_result():
         write_result(existing.path, result)
         existing.commit(success=True)
 
-        ws = history.workspace()
-        (ws.path / "solution.py").write_text("v2")
-        write_direction(ws.path, "rollout")
-        fresh_result = EvaluationResult(stages={"eval": StageResult(metrics={"score": 1.0})})
-        metadata = {}
-        toolkit = Toolkit(history=history)
+        task = FixtureTask()
+        toolkit = Toolkit(task=task, history=history)
+        # First call generates code, second the (duplicate) direction.
+        toolkit.llm = BackendRegistry(default=MockBackend([
+            f"```python\n{make_code(42.0)}\n```", "rollout",
+        ]))
 
-        FreshApproach()._apply_fresh_direction_gate(toolkit, ws, fresh_result, metadata)
+        FreshApproach()(toolkit)
 
-        assert fresh_result.completed is False
-        assert fresh_result.failed_stage == "core_direction"
-        assert "duplicated" in metadata["gate_failure"]
+        attempt = history.list(only_done=False)[-1]
+        assert attempt.status == "fail"
+        assert attempt.result.completed is False
+        assert attempt.result.failed_stage == "core_direction"
+        assert "duplicated" in attempt.metadata["gate_failure"]
 
 
 def test_plan_approaches_queues_fresh_runs():
@@ -1752,19 +1758,34 @@ def test_agent_strategy_flags_duplicate_solution_non_promotable():
 
 
 def test_improve_strategy_flags_duplicate_solution():
-    """Improve._is_duplicate_solution mirrors AgentStrategy."""
+    """Improve's finish flags a byte-identical child non-promotable (the
+    standard SOLUTION_IDENTICAL gate), and the attempt still commits done."""
+    from groundhog.backends.mock import MockBackend
+    from groundhog.base.backend import BackendRegistry
     from groundhog.strategies.improve import Improve
 
     with tempfile.TemporaryDirectory() as tmp:
-        ws_path = Path(tmp) / "ws"
-        prior_path = Path(tmp) / "prior"
-        ws_path.mkdir()
-        prior_path.mkdir()
-        (ws_path / "solution.py").write_text("same", encoding="utf-8")
-        (prior_path / "solution.py").write_text("same", encoding="utf-8")
-        ws = type("WS", (), {"path": ws_path})()
-        prior = type("P", (), {"path": prior_path, "code": "same"})()
-        assert Improve._is_duplicate_solution(ws, prior) is True
+        history = FolderAttemptHistory(Path(tmp))
+        task = FixtureTask()
+
+        prior_ws = history.workspace()
+        (prior_ws.path / "solution.py").write_text(make_code(50.0))
+        write_result(prior_ws.path, task.evaluate(make_code(50.0)))
+        prior = prior_ws.commit(success=True)
+
+        toolkit = Toolkit(task=task, history=history)
+        # No code block in the response: Improve keeps the parent's solution.
+        toolkit.llm = BackendRegistry(default=MockBackend(["no changes"]))
+
+        Improve()(toolkit)
+
+        attempt = history.list()[-1]
+        assert attempt.parent == prior.id
+        assert attempt.status == "done"
+        assert attempt.metadata.get("non_promotable") is True
+        assert attempt.metadata["non_promotable_reason"] == (
+            "solution.py is byte-identical to parent"
+        )
 
 
 def test_cross_pollinate_agent_selects_different_family():

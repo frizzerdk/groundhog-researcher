@@ -28,7 +28,7 @@ class CrossPollinate(Strategy):
     """Improve one solution by drawing ideas from a different approach.
 
     Composed method pattern:
-        init → select parent + inspiration → workspace → generate → evaluate → commit
+        init → select parent + inspiration → workspace → generate → evaluate → finalize
     """
 
     Config = CrossPollinateConfig
@@ -50,31 +50,7 @@ class CrossPollinate(Strategy):
         self.log.inline("evaluating... ")
         result = self._evaluate_with_retries(toolkit, ws)
         self.log.tock()
-        # Soft-gate: re-copy parent's core direction so the borrowed ideas
-        # don't drift the family identity. Backend-agnostic (works on git).
-        from groundhog.utils.direction import (
-            inherit_direction_from_attempt,
-            inherited_direction_changed_from,
-        )
-        direction_changed = inherited_direction_changed_from(ws.path, prior)
-        inherit_direction_from_attempt(prior, ws.path)
-        metadata = {
-            "strategy": "cross_pollinate",
-            "prior": prior.id,
-            "inspiration": inspiration.id,
-            "cost": round(self.logger.total_cost(), 6),
-        }
-        if direction_changed:
-            metadata["direction_restored"] = True
-        # Flag if we landed on byte-identical code to either source.
-        if self._is_duplicate_solution(ws, prior) or self._is_duplicate_solution(ws, inspiration):
-            metadata["non_promotable"] = True
-            metadata["non_promotable_reason"] = "solution.py is byte-identical to parent or inspiration"
-        from groundhog.utils.results import write_result
-        write_result(ws.path, result, metadata=metadata)
-        from groundhog.utils.direction import workspace_name
-        ws.name = workspace_name(ws.path)
-        attempt = ws.commit(success=result.completed)
+        attempt = self._finalize(toolkit, ws, result, prior, inspiration)
         return self._build_log(attempt, prior, result, toolkit)
 
     # --- Init ---
@@ -86,11 +62,23 @@ class CrossPollinate(Strategy):
         self.through = getattr(toolkit, 'through', None)
         self.log = toolkit.log if hasattr(toolkit, 'log') else StrategyLog()
 
-    @staticmethod
-    def _is_duplicate_solution(ws, other) -> bool:
-        """True iff ws/solution.py equals the other attempt's code (backend-agnostic)."""
+    # --- Finalization ---
+
+    def _finalize(self, toolkit, ws, result, prior, inspiration):
+        """The standard finish, plus the inspiration-duplicate flag the
+        parent-only gate can't see."""
         from groundhog.utils.direction import solution_matches_attempt
-        return solution_matches_attempt(ws.path, other)
+        from groundhog.utils.finalize import finalize_attempt
+        metadata = {
+            "strategy": "cross_pollinate",
+            "prior": prior.id,
+            "inspiration": inspiration.id,
+            "cost": round(self.logger.total_cost(), 6),
+        }
+        if solution_matches_attempt(ws.path, inspiration):
+            metadata["non_promotable"] = True
+            metadata["non_promotable_reason"] = "solution.py is byte-identical to inspiration"
+        return finalize_attempt(toolkit, ws, result, prior, metadata=metadata)
 
     # --- Selection ---
 

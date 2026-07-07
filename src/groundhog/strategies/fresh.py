@@ -30,7 +30,7 @@ class FreshApproach(Strategy):
     """Generate code from scratch. No prior needed.
 
     Composed method pattern:
-        init → workspace → prepare → generate full code → evaluate → commit
+        init → workspace → prepare → generate full code → evaluate → finalize
     """
 
     Config = FreshApproachConfig
@@ -52,17 +52,7 @@ class FreshApproach(Strategy):
         self.log.inline("evaluating... ")
         result = self._evaluate_with_retries(toolkit, ws)
         self.log.tock()
-        metadata = {
-            "strategy": "fresh_approach",
-            "mode": self.cfg.mode,
-            "cost": round(self.logger.total_cost(), 6),
-        }
-        self._apply_fresh_direction_gate(toolkit, ws, result, metadata)
-        from groundhog.utils.results import write_result
-        write_result(ws.path, result, metadata=metadata)
-        from groundhog.utils.direction import workspace_name
-        ws.name = workspace_name(ws.path)
-        attempt = ws.commit(success=result.completed)
+        attempt = self._finalize(toolkit, ws, result)
         return self._build_log(attempt, result, toolkit)
 
     # --- Init ---
@@ -186,31 +176,17 @@ Write complete, runnable code in a ```python block."""
         from groundhog.utils.direction import write_direction
         write_direction(ws.path, response.text)
 
-    def _apply_fresh_direction_gate(self, toolkit, ws, result, metadata):
-        """Fresh directions must exist and must not duplicate history."""
-        from groundhog.utils.direction import (
-            direction_exists,
-            mark_result_failed,
-            read_direction,
-        )
+    # --- Finalization ---
 
-        direction = read_direction(ws.path)
-        if not direction:
-            reason = "fresh attempt did not create core_direction.md"
-            metadata["gate_failure"] = reason
-            mark_result_failed(result, "core_direction", reason)
-            return
-
-        history = getattr(toolkit, "history", None)
-        if direction_exists(
-            history,
-            direction,
-            exclude=[ws.display_id],
-            only_done=False,
-        ):
-            reason = "fresh attempt duplicated an existing core direction"
-            metadata["gate_failure"] = reason
-            mark_result_failed(result, "core_direction", reason)
+    def _finalize(self, toolkit, ws, result):
+        """The standard finish: direction gates -> record -> commit -> score note."""
+        from groundhog.utils.finalize import finalize_attempt
+        metadata = {
+            "strategy": "fresh_approach",
+            "mode": self.cfg.mode,
+            "cost": round(self.logger.total_cost(), 6),
+        }
+        return finalize_attempt(toolkit, ws, result, None, metadata=metadata)
 
     # --- Evaluation with retries ---
 

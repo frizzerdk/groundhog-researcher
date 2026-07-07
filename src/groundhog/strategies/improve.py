@@ -28,7 +28,7 @@ class Improve(Strategy):
     """Refine existing code via LLM-generated diffs.
 
     Composed method pattern:
-        init ->select prior ->workspace ->prepare ->generate ->evaluate+retry ->commit
+        init ->select prior ->workspace ->prepare ->generate ->evaluate+retry ->finalize
     """
 
     Config = ImproveConfig
@@ -53,26 +53,7 @@ class Improve(Strategy):
         self.log.inline("learnings... ")
         self._record_learnings(toolkit, ws, prior, result)
         self.log.tock()
-        # Soft-gate: re-copy parent's core direction so a stray rewrite during
-        # the LLM session can't fork the family. Backend-agnostic (works on git).
-        from groundhog.utils.direction import (
-            inherit_direction_from_attempt,
-            inherited_direction_changed_from,
-        )
-        direction_changed = inherited_direction_changed_from(ws.path, prior)
-        inherit_direction_from_attempt(prior, ws.path)
-        metadata = {"strategy": "improve", "prior": prior.id,
-                    "cost": round(self.logger.total_cost(), 6)}
-        if direction_changed:
-            metadata["direction_restored"] = True
-        if self._is_duplicate_solution(ws, prior):
-            metadata["non_promotable"] = True
-            metadata["non_promotable_reason"] = "solution.py is byte-identical to parent"
-        from groundhog.utils.results import write_result
-        write_result(ws.path, result, metadata=metadata)
-        from groundhog.utils.direction import workspace_name
-        ws.name = workspace_name(ws.path)
-        attempt = ws.commit(success=result.completed)
+        attempt = self._finalize(toolkit, ws, result, prior)
         return self._build_log(attempt, prior, result, toolkit)
 
     # --- Init ---
@@ -248,11 +229,14 @@ Output your changes as SEARCH/REPLACE blocks."""
 
         toolkit.learnings.add(response.text)
 
-    @staticmethod
-    def _is_duplicate_solution(ws, prior) -> bool:
-        """True iff committed solution.py equals the parent's (backend-agnostic)."""
-        from groundhog.utils.direction import solution_matches_attempt
-        return solution_matches_attempt(ws.path, prior)
+    # --- Finalization ---
+
+    def _finalize(self, toolkit, ws, result, prior):
+        """The standard finish: direction gates -> record -> commit -> score note."""
+        from groundhog.utils.finalize import finalize_attempt
+        metadata = {"strategy": "improve", "prior": prior.id,
+                    "cost": round(self.logger.total_cost(), 6)}
+        return finalize_attempt(toolkit, ws, result, prior, metadata=metadata)
 
     def _score_result(self, result, toolkit):
         stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=self.through)
