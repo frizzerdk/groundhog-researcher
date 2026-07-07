@@ -475,8 +475,8 @@ def attempt_group(args):
         "  new [--fresh] [--parent ID] [--no-seed] [--name NAME]\n"
         "                                Open a workspace (--fresh: parentless,\n"
         "                                founds a new family; default parent = best)\n"
-        "  list [--all]                                  List attempts (--all incl. failed)\n"
-        "  show <id> [--file F]                          Show an attempt (or one file)\n"
+        "  list [--all] [--json]                         List attempts (--all incl. failed)\n"
+        "  show <id> [--file F] [--json]                 Show an attempt (or one file)\n"
         "  in-progress                                   List open workspaces\n"
         "  resume <wsid>                                 Re-acquire an open workspace\n"
         "  commit <wsid> [--fail] [--eval] [--through S] Finalize a workspace\n"
@@ -583,11 +583,19 @@ def _attempt_new(args):
 
 def _attempt_list(args):
     show_all, args = _flag(args, "--all")
+    as_json, args = _flag(args, "--json")
     run = _resolve_run()
     if run is None:
         return 1
     history, task = run.history, run.task
     scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
+
+    if as_json:
+        import json
+        from groundhog.utils import queries
+        rows = queries.attempt_table(history, scorer, only_done=not show_all)
+        print(json.dumps(rows, indent=2, default=str))
+        return 0
 
     attempts = history.list(only_done=not show_all)
     if not attempts:
@@ -608,8 +616,9 @@ def _attempt_list(args):
 
 def _attempt_show(args):
     file_arg, args = _opt(args, "--file")
+    as_json, args = _flag(args, "--json")
     if not args:
-        print("Usage: groundhog attempt show <id> [--file F]")
+        print("Usage: groundhog attempt show <id> [--file F] [--json]")
         return 1
     attempt_id = args[0]
 
@@ -622,6 +631,14 @@ def _attempt_show(args):
     if attempt is None:
         print(f"No such attempt: {attempt_id}")
         return 1
+
+    if as_json and file_arg is None:
+        import json
+        from groundhog.utils import queries
+        scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
+        detail = queries.attempt_detail(history, attempt_id, scorer)
+        print(json.dumps(detail, indent=2, default=str))
+        return 0
 
     if file_arg is not None:
         content = attempt.read_file(file_arg)
@@ -949,6 +966,48 @@ def cmd_eval(args):
     return 0 if result.completed else 2
 
 
+def cmd_summary(args):
+    """`groundhog summary [--json]` — run overview from the read layer
+    (utils/queries): totals, best, cost, and the family table."""
+    as_json, args = _flag(args, "--json")
+    if args and args[0] in ("-h", "--help"):
+        print("Usage: groundhog summary [--json]")
+        return 0
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history, task = run.history, run.task
+    scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
+
+    from groundhog.utils import queries
+    summary = queries.run_summary(history, scorer)
+    fams = queries.families(history, scorer)
+
+    if as_json:
+        import json
+        print(json.dumps({"summary": summary, "families": fams},
+                         indent=2, default=str))
+        return 0
+
+    print(f"attempts: {summary['n_attempts']} "
+          f"({summary['n_done']} done, {summary['n_failed']} failed)")
+    best = summary["best"]
+    if best is not None:
+        print(f"best:     {_short(best['id'])} score={best['score']:.4f} "
+              f"{best['name']}")
+    print(f"families: {summary['n_families']}")
+    print(f"cost:     ${summary['total_cost']:.4f}")
+    if fams:
+        print()
+        print(f"{'family':<40} {'n':<4} {'best':<10} best score")
+        for f in fams:
+            score_str = f"{f['best_score']:.4f}" if f["best_score"] is not None else "-"
+            print(f"{f['family_name']:<40} {len(f['members']):<4} "
+                  f"{_short(f['best_id']):<10} {score_str}")
+    return 0
+
+
 def tool_group(args):
     """`groundhog tool list` / `groundhog tool run <name> [--attempt ID] [-p k=v ...]`.
 
@@ -1044,6 +1103,7 @@ def main():
         print()
         print("  groundhog attempt <subcommand>    Manual attempt lifecycle (new/list/show/commit/...)")
         print("  groundhog eval <path-or-id>       Score a solution dir, .py file, or attempt")
+        print("  groundhog summary [--json]        Run overview: totals, best, families")
         print("  groundhog tool list|run           Run any toolkit tool from the terminal")
         print("  groundhog skills install [dir]    Install the session skills into a run dir")
         print()
@@ -1076,6 +1136,8 @@ def main():
         sys.exit(attempt_group(args[1:]))
     elif cmd == "eval":
         sys.exit(cmd_eval(args[1:]))
+    elif cmd == "summary":
+        sys.exit(cmd_summary(args[1:]))
     elif cmd == "tool":
         sys.exit(tool_group(args[1:]))
     elif cmd == "skills":

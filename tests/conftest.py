@@ -57,7 +57,7 @@ def commit_attempt():
 
     def _commit(history, *, parent=None, code="def solve(): return 1",
                 direction=None, metrics=None, completed=True, success=True,
-                name=None):
+                name=None, metadata=None):
         ws = history.workspace(parent=parent)
         (ws.path / "solution.py").write_text(code, encoding="utf-8")
         if direction is not None:
@@ -66,7 +66,7 @@ def commit_attempt():
             stages={"eval": StageResult(metrics=metrics or {"score": 1.0})},
             completed=completed,
         )
-        write_result(ws.path, result)
+        write_result(ws.path, result, metadata=metadata)
         if name is not None:
             ws.name = name
         return ws.commit(success=success)
