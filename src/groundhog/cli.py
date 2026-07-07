@@ -464,8 +464,11 @@ def attempt_group(args):
         "  new [--fresh] [--parent ID] [--no-seed] [--name NAME]\n"
         "                                Open a workspace (--fresh: parentless,\n"
         "                                founds a new family; default parent = best)\n"
-        "  list [--all]                                  List attempts (--all incl. failed)\n"
+        "  list [--all] [--tag TAG]                      List attempts (--all incl. failed)\n"
         "  show <id> [--file F]                          Show an attempt (or one file)\n"
+        "  note <id> <key> [<value>]                     Get (no value) or set a mutable note\n"
+        "  tag <id> <tag>                                Add a tag (stored as note key 'tags')\n"
+        "  untag <id> <tag>                              Remove a tag\n"
         "  in-progress                                   List open workspaces\n"
         "  resume <wsid>                                 Re-acquire an open workspace\n"
         "  commit <wsid> [--fail] [--eval] [--through S] Finalize a workspace\n"
@@ -484,6 +487,9 @@ def attempt_group(args):
         "new": _attempt_new,
         "list": _attempt_list,
         "show": _attempt_show,
+        "note": _attempt_note,
+        "tag": _attempt_tag,
+        "untag": _attempt_untag,
         "in-progress": _attempt_in_progress,
         "resume": _attempt_resume,
         "commit": _attempt_commit,
@@ -572,6 +578,7 @@ def _attempt_new(args):
 
 def _attempt_list(args):
     show_all, args = _flag(args, "--all")
+    tag, args = _opt(args, "--tag")
     run = _resolve_run()
     if run is None:
         return 1
@@ -579,8 +586,10 @@ def _attempt_list(args):
     scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
 
     attempts = history.list(only_done=not show_all)
+    if tag is not None:
+        attempts = [a for a in attempts if tag in _read_tags(history, a)]
     if not attempts:
-        print("No attempts yet.")
+        print("No attempts yet." if tag is None else f"No attempts tagged {tag!r}.")
         return 0
 
     print(f"{'id':<10} {'parent':<10} {'status':<12} {'score':<9} name")
@@ -840,6 +849,99 @@ def _attempt_best(args):
     print(f"id:    {best.id}")
     print(f"score: {_attempt_score(best, scorer):.4f}")
     print(f"name:  {best.name}")
+    return 0
+
+
+def _read_tags(history, attempt_or_id):
+    """Tags = the 'tags' note, comma-joined. Empty list when unset."""
+    raw = history.get_note(attempt_or_id, "tags")
+    if not raw:
+        return []
+    return [t for t in (part.strip() for part in raw.split(",")) if t]
+
+
+def _attempt_note(args):
+    if len(args) not in (2, 3):
+        print("Usage: groundhog attempt note <id> <key> [<value>]")
+        return 1
+    attempt_id, key = args[0], args[1]
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history = run.history
+
+    attempt = history.get(attempt_id)
+    if attempt is None:
+        print(f"No such attempt: {attempt_id}")
+        return 1
+
+    if len(args) == 2:
+        value = history.get_note(attempt, key)
+        if value is None:
+            print(f"(no note {key!r} on attempt {attempt_id})")
+            return 1
+        print(value)
+        return 0
+
+    try:
+        history.set_note(attempt, key, args[2])
+    except (ValueError, KeyError) as e:
+        print(f"Could not set note: {e}")
+        return 1
+    print(f"note[{key}] = {args[2]}")
+    return 0
+
+
+def _valid_tag(tag):
+    return bool(tag) and "," not in tag and not any(c.isspace() for c in tag)
+
+
+def _attempt_tag(args):
+    if len(args) != 2:
+        print("Usage: groundhog attempt tag <id> <tag>")
+        return 1
+    attempt_id, tag = args
+    if not _valid_tag(tag):
+        print(f"Invalid tag {tag!r} (no commas or whitespace)")
+        return 1
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history = run.history
+    attempt = history.get(attempt_id)
+    if attempt is None:
+        print(f"No such attempt: {attempt_id}")
+        return 1
+    tags = _read_tags(history, attempt)
+    if tag in tags:
+        print(f"Attempt {attempt_id} already tagged {tag!r}")
+        return 0
+    tags.append(tag)
+    history.set_note(attempt, "tags", ",".join(tags))
+    print(f"tags: {', '.join(tags)}")
+    return 0
+
+
+def _attempt_untag(args):
+    if len(args) != 2:
+        print("Usage: groundhog attempt untag <id> <tag>")
+        return 1
+    attempt_id, tag = args
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history = run.history
+    attempt = history.get(attempt_id)
+    if attempt is None:
+        print(f"No such attempt: {attempt_id}")
+        return 1
+    tags = _read_tags(history, attempt)
+    if tag not in tags:
+        print(f"Attempt {attempt_id} is not tagged {tag!r}")
+        return 1
+    tags.remove(tag)
+    history.set_note(attempt, "tags", ",".join(tags))
+    print(f"tags: {', '.join(tags) if tags else '(none)'}")
     return 0
 
 
