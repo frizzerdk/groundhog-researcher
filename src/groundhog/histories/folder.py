@@ -11,7 +11,7 @@ Directory structure:
                 TASK_CONTEXT.md
             002_1/          ← second attempt (parent=1)
                 ...
-        learnings.md        ← accumulated learnings (managed separately)
+        learnings.md        ← derived learnings digest (ledger lives in attempts)
 """
 
 import json

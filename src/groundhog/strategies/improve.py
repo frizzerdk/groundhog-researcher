@@ -227,6 +227,11 @@ Output your changes as SEARCH/REPLACE blocks."""
         self.logger.log(AssistantEvent(content=response.text, role=response.model,
                                        cost=response.cost, usage=response.usage, data={"label": "Learnings"}))
 
+        # The attempt is the ledger: record the entry in the workspace (it
+        # commits with the record). The run-root file is a derived digest,
+        # still appended to for compatibility.
+        from groundhog.utils.learnings_digest import record_attempt_learning
+        record_attempt_learning(ws.path, response.text)
         toolkit.learnings.add(response.text)
 
     # --- Finalization ---
