@@ -41,7 +41,7 @@ TEMPLATES = {
 }
 
 
-def init(template_name, target_dir=None, script_only=False):
+def init(template_name, target_dir=None, script_only=False, use_git=False):
     template = TEMPLATES[template_name]
     target = Path(target_dir) if target_dir else Path("my_task")
 
@@ -85,6 +85,16 @@ def init(template_name, target_dir=None, script_only=False):
     # Copy template files (after uv init so task.py overwrites the default)
     for dest_name, src_name in template["files"].items():
         shutil.copy2(TEMPLATES_DIR / src_name, target / dest_name)
+
+    if use_git:
+        from groundhog.tools.migrate import wire_git_history
+        if wire_git_history(target / "task.py"):
+            print("Attempt store: GitAttemptHistory (see the remote= comment "
+                  "in task.py to sync it)")
+        else:
+            print("WARNING: could not wire GitAttemptHistory into task.py - "
+                  "pass history=GitAttemptHistory(run_dir) to assemble_toolkit "
+                  "yourself")
 
     if template.get("env"):
         (target / ".env").write_text("# Add API keys here (optional - auto_registry finds CLI tools automatically)\n# ANTHROPIC_API_KEY=\n# OPENAI_API_KEY=\n# GEMINI_API_KEY=\n", encoding="utf-8")
@@ -237,6 +247,53 @@ def new_component(args):
 
     print(f"Created {component} template: {target}")
     print("  Edit the file and customize the logic.")
+    return 0
+
+
+def cmd_migrate_store(args):
+    """`groundhog migrate-store <dest> [--dry-run] [--full-work]` — copy this
+    folder-backend run to <dest> with its store replayed through
+    GitAttemptHistory. The source run is never touched."""
+    if not args or args[0] in ("-h", "--help"):
+        print("Usage: groundhog migrate-store <dest> [--dry-run] [--full-work]")
+        print()
+        print("Copies the run (excluding .venv/attempts/caches) and rebuilds the")
+        print("attempt store as a git store: committed attempts are replayed in id")
+        print("order preserving parents, status, and score notes; the folder id is")
+        print("kept as migrated_from_folder_id metadata; task.py is patched to")
+        print("build GitAttemptHistory. Refuses while workspaces are in progress.")
+        print("--full-work also copies each attempt's work/ dir (can be huge).")
+        return 0 if args else 1
+
+    dry_run = "--dry-run" in args
+    full_work = "--full-work" in args
+    rest = [a for a in args if a not in ("--dry-run", "--full-work")]
+    if len(rest) != 1 or rest[0].startswith("--"):
+        print("Usage: groundhog migrate-store <dest> [--dry-run] [--full-work]")
+        return 1
+
+    from groundhog import rundir
+    from groundhog.tools.migrate import MigrationError, migrate_store
+
+    try:
+        src = rundir.find_task_py().parent
+    except FileNotFoundError as e:
+        print(str(e))
+        return 1
+
+    try:
+        migrate_store(src, Path(rest[0]), full_work=full_work, dry_run=dry_run)
+    except MigrationError as e:
+        print(str(e))
+        return 1
+    except Exception as e:  # noqa: BLE001 — surface a clean error, src is safe
+        print(f"Migration failed: {e}")
+        return 1
+    if not dry_run:
+        print()
+        print("done. Next steps in the copy:")
+        print(f"  cd {rest[0]} && uv sync")
+        print("  uv run groundhog attempt list   # verify count + scores match")
     return 0
 
 
@@ -1018,8 +1075,11 @@ def main():
         print("  groundhog tool list|run           Run any toolkit tool from the terminal")
         print("  groundhog skills install [dir]    Install the session skills into a run dir")
         print()
+        print("  groundhog migrate-store <dest>    Copy this run with a git-backed attempt store")
+        print()
         print("Options:")
         print("  --script    Script-only mode (no uv project, uses inline deps)")
+        print("  --git       Scaffold with the git attempt store (GitAttemptHistory)")
         print()
         print("Then:")
         print("  cd my_task")
@@ -1030,11 +1090,13 @@ def main():
     # Parse --script flag
     script_only = "--script" in args
     args = [a for a in args if a != "--script"]
+    use_git = "--git" in args
+    args = [a for a in args if a != "--git"]
 
     cmd = args[0] if args else "init"
     if cmd in TEMPLATES:
         target = args[1] if len(args) > 1 else None
-        sys.exit(init(cmd, target, script_only=script_only))
+        sys.exit(init(cmd, target, script_only=script_only, use_git=use_git))
     elif cmd == "new":
         sys.exit(new_component(args[1:]))
     elif cmd == "backends":
@@ -1043,6 +1105,8 @@ def main():
         sys.exit(set_prefer(args[1:]))
     elif cmd == "prefer-tier":
         sys.exit(set_prefer_tier(args[1:]))
+    elif cmd == "migrate-store":
+        sys.exit(cmd_migrate_store(args[1:]))
     elif cmd == "attempt":
         sys.exit(attempt_group(args[1:]))
     elif cmd == "eval":
