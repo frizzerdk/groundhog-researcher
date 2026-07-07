@@ -112,11 +112,16 @@ PHASE_TOOLS = {
 LEARNINGS_SEED = """\
 # Learnings
 
-Notes from this attempt. Keep high signal-to-noise.
-Only add entries that would save time or prevent repeated mistakes.
+Notes from this attempt. Keep high signal-to-noise — only entries that would
+save time or prevent repeated mistakes (confirmed dead-ends, key thresholds,
+techniques with measurable gains). Skip speculation and anything obvious from the code.
 
-Good: confirmed dead-ends, key thresholds, techniques with measurable gains.
-Bad: speculative ideas, verbose explanations, anything obvious from the code.
+Write each learning as one directive line:
+[tried X] -> [because/observed Y] -> [next time do Z]
+
+Examples:
+- tried batch norm before every conv -> val acc dropped 0.90->0.86 (overfit) -> keep BN only after the first block
+- tried lr 1e-2 -> loss diverged to NaN by epoch 2 -> start at 1e-3 with warmup
 
 Prior attempts' notes are NOT auto-copied here. If you want context from
 earlier work, use the get-priors / list-prior / get-prior-file tools to
@@ -218,10 +223,10 @@ Fix the issue in work/solution.py and run `{eval_command}` to verify.
 {sandbox_rules}"""
 
 REFLECT_PROMPT = """\
-Update work/learnings.md with what you learned this session:
-- What approaches did you try and what scores did they get?
-- What worked well? What didn't?
-- What dead ends should future attempts avoid?
+Update work/learnings.md with what you learned this session.
+Write each learning as one directive line:
+[tried X] -> [because/observed Y] -> [next time do Z]
+Be specific about techniques and scores. One actionable line each, not paragraphs.
 
 Do not modify work/solution.py."""
 
