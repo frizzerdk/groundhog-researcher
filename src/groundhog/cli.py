@@ -386,6 +386,47 @@ def set_prefer_tier(args):
     return 0
 
 
+def cmd_report(args):
+    """`groundhog report [--out PATH]` — write a run-state markdown report.
+
+    Data-only by default; when the run's toolkit carries an LLM, one cheap
+    default-tier pass adds a short narrative on top. ``--out -`` prints to
+    stdout instead of writing a file.
+    """
+    out_arg, args = _opt(args, "--out")
+    if args and args[0] in ("-h", "--help"):
+        print("Usage: groundhog report [--out reports/state.md]")
+        print("       groundhog report --out -      (print to stdout)")
+        return 0
+    if args:
+        print("Usage: groundhog report [--out reports/state.md]")
+        return 1
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    scorer = _scorer_for(run.task, through=getattr(run.toolkit, "through", None))
+
+    from groundhog.tools import report as report_mod
+    data = report_mod.gather(run.history, scorer)
+    narrative = None
+    llm = getattr(run.toolkit, "llm", None)
+    if llm is not None:
+        narrative = report_mod.narrative(llm, data)
+    text = report_mod.render_markdown(run.task.name, data, narrative)
+
+    if out_arg == "-":
+        print(text)
+        return 0
+    out_path = Path(out_arg) if out_arg else (run.run_dir / "reports" / "state.md")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(text, encoding="utf-8")
+    print(f"Wrote {out_path}")
+    if llm is not None and narrative is None:
+        print("(LLM narrative unavailable - wrote the data-only report)")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # attempt / eval commands — manual attempt lifecycle + scoring (LLM-free).
 #
@@ -1780,6 +1821,7 @@ def main():
         print("  groundhog learnings rebuild|list  Rebuild the derived learnings digest / list the ledger")
         print("  groundhog queue add|list|clear    Queue strategy overrides for the optimizer")
         print("  groundhog skills install [dir]    Install the session skills into a run dir")
+        print("  groundhog report [--out PATH]     Write a run-state markdown report")
         print()
         print("Options:")
         print("  --script    Script-only mode (no uv project, uses inline deps)")
@@ -1829,6 +1871,8 @@ def main():
         sys.exit(queue_group(args[1:]))
     elif cmd == "skills":
         sys.exit(skills_group(args[1:]))
+    elif cmd == "report":
+        sys.exit(cmd_report(args[1:]))
     else:
         print(f"Unknown command: {cmd}")
         print("Try: groundhog --help")
