@@ -11,9 +11,11 @@ from dataclasses import dataclass
 
 from groundhog.base.strategy import Strategy, StrategyConfig, param
 from groundhog.tools.attempt_logger import (
-    AssistantEvent, MarkdownAttemptLogger, SystemEvent, UserEvent, eval_event,
+    AssistantEvent, LogEvent, MarkdownAttemptLogger, SystemEvent, UserEvent, eval_event,
 )
-from groundhog.utils.codegen import extract_code, build_prompt
+from groundhog.utils.codegen import (
+    GenerationFailed, build_prompt, extract_code, generate_text,
+)
 
 
 @dataclass
@@ -43,18 +45,24 @@ class Improve(Strategy):
         self.log.start(f"--- Improve | prior=#{prior.id} ({prior_score:.3f}) | retries={self.cfg.max_retries} | learnings={learnings_count}")
         ws = self._start_workspace(toolkit, prior)
         self.logger.attempt_start(ws.path)
-        self._prepare_workspace(toolkit, ws, prior)
-        self.log.inline("generating... ")
-        self._do_work(toolkit, ws, prior)
-        self.log.tock()
-        self.log.inline("evaluating... ")
-        result = self._evaluate_with_retries(toolkit, ws, prior)
-        self.log.tock()
-        self.log.inline("learnings... ")
-        self._record_learnings(toolkit, ws, prior, result)
-        self.log.tock()
-        attempt = self._finalize(toolkit, ws, result, prior)
-        return self._build_log(attempt, prior, result, toolkit)
+        try:
+            self._prepare_workspace(toolkit, ws, prior)
+            self.log.inline("generating... ")
+            self._do_work(toolkit, ws, prior)
+            self.log.tock()
+            self.log.inline("evaluating... ")
+            result = self._evaluate_with_retries(toolkit, ws, prior)
+            self.log.tock()
+            self.log.inline("learnings... ")
+            self._record_learnings(toolkit, ws, prior, result)
+            self.log.tock()
+            attempt = self._finalize(toolkit, ws, result, prior)
+            return self._build_log(attempt, prior, result, toolkit)
+        except GenerationFailed as e:
+            self.log.inline("generation failed... ")
+            attempt = self._finalize_failed(toolkit, ws, prior, str(e))
+            return {"attempt": attempt.id, "prior": prior.id,
+                    "failed": str(e), "strategy": self.name}
 
     # --- Init ---
 
@@ -150,7 +158,8 @@ Output your changes as SEARCH/REPLACE blocks."""
         self.logger.log(UserEvent(content=prompt))
         self.logger.log(SystemEvent(content=system_prompt))
 
-        response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
+        response = generate_text(toolkit.llm.get("default"), prompt, system_prompt,
+                                 retries=self.cfg.max_retries)
         self.logger.log(AssistantEvent(content=response.text, role=response.model,
                                        cost=response.cost, usage=response.usage))
 
@@ -192,7 +201,10 @@ Output your changes as SEARCH/REPLACE blocks."""
         self.logger.log(UserEvent(content=prompt, data={"label": f"Retry {retry_num}"}))
         self.logger.log(SystemEvent(content=system_prompt))
 
-        response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
+        try:
+            response = generate_text(toolkit.llm.get("default"), prompt, system_prompt)
+        except GenerationFailed:
+            return  # leave the broken code; the eval loop records the failure
         self.logger.log(AssistantEvent(content=response.text, role=response.model,
                                        cost=response.cost, usage=response.usage, data={"label": f"Retry {retry_num}"}))
 
@@ -225,7 +237,10 @@ Output your changes as SEARCH/REPLACE blocks."""
         system_prompt = "You are a concise research assistant. Write directive, actionable learnings — one line each."
 
         self.logger.log(UserEvent(content=prompt, data={"label": "Learnings"}))
-        response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
+        try:
+            response = generate_text(toolkit.llm.get("default"), prompt, system_prompt)
+        except GenerationFailed:
+            return  # a missing learning must not sink an already-evaluated attempt
         self.logger.log(AssistantEvent(content=response.text, role=response.model,
                                        cost=response.cost, usage=response.usage, data={"label": "Learnings"}))
 
@@ -244,6 +259,15 @@ Output your changes as SEARCH/REPLACE blocks."""
         metadata = {"strategy": self.name, "prior": prior.id,
                     "cost": round(self.logger.total_cost(), 6)}
         return finalize_attempt(toolkit, ws, result, prior, metadata=metadata)
+
+    def _finalize_failed(self, toolkit, ws, prior, reason):
+        """Generation died — record the attempt as a failure, never orphan it."""
+        from groundhog.utils.finalize import finalize_failed
+        self.logger.log(LogEvent(type="error", data={"error": reason}))
+        metadata = {"strategy": self.name, "prior": prior.id if prior else None,
+                    "cost": round(self.logger.total_cost(), 6),
+                    "generation_failed": reason}
+        return finalize_failed(toolkit, ws, reason, prior, metadata=metadata)
 
     def _score_result(self, result, toolkit):
         stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=self.through)
