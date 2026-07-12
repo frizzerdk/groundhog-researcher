@@ -122,6 +122,33 @@ def finalize_attempt(
     return attempt
 
 
+def finalize_failed(
+    toolkit,
+    ws,
+    reason,
+    prior=None,
+    *,
+    metadata: Optional[dict] = None,
+    stage: str = "generate",
+):
+    """Record a strategy that could not produce a candidate as a FAILURE.
+
+    When generation dies (empty content, backend error, timeout) the work so
+    far — the workspace, the cost already spent — must not be discarded into
+    an orphaned directory. This builds a minimal failed EvaluationResult (so
+    the family map remembers the failure and selection skips it) and runs the
+    standard finish, committing a real failed record instead of aborting.
+    """
+    from groundhog.base.types import EvaluationResult, StageResult
+
+    result = EvaluationResult(
+        stages={stage: StageResult(errors={stage: str(reason)})},
+        completed=False,
+        failed_stage=stage,
+    )
+    return finalize_attempt(toolkit, ws, result, prior, metadata=metadata)
+
+
 def _cache_score_note(toolkit, history, attempt, result) -> None:
     """Best-effort: never let a cache write fail a finished attempt."""
     if history is None or not hasattr(history, "set_note"):

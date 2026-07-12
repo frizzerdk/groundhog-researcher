@@ -174,7 +174,7 @@ Output only the compressed learnings, nothing else."""
         response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
         self.cost += response.cost
 
-        return response.text
+        return response.text or ""
 
     # --- Report ---
     # Aggregations below intentionally stay local: their shapes differ from
@@ -277,7 +277,7 @@ and concrete. Output only the narrative, no heading."""
         system_prompt = "You are a research lead writing a concise state-of-the-run briefing."
         response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
         self.cost += response.cost
-        return response.text.strip()
+        return (response.text or "").strip()
 
     def _render_report(self, toolkit, narrative, summary, families, attempts, scorer):
         lines = ["# State of the run", "", narrative, "", "## Summary", ""]

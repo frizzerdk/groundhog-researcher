@@ -17,10 +17,12 @@ class OpenAICompatibleBackend(LLMBackend):
     """Generic backend for any OpenAI-compatible API. No SDK dependency."""
 
     def __init__(self, model: str, base_url: str = "https://api.openai.com/v1",
-                 api_key: str = None, api_key_env: str = "OPENAI_API_KEY"):
+                 api_key: str = None, api_key_env: str = "OPENAI_API_KEY",
+                 timeout_s: float = 120):
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key or os.environ.get(api_key_env, "")
+        self.timeout_s = timeout_s
 
     def generate(self, prompt: Prompt, system_prompt: str = "") -> LLMResponse:
         url = f"{self.base_url}/chat/completions"
@@ -49,13 +51,24 @@ class OpenAICompatibleBackend(LLMBackend):
         req = urllib.request.Request(url, data=data, headers=headers)
 
         try:
-            with _urlopen_with_warnings(req, label=f"{self.model}") as resp:
+            with _urlopen_with_warnings(req, label=f"{self.model}",
+                                        timeout=self.timeout_s) as resp:
                 result = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             error_body = e.read().decode() if e.fp else ""
             raise RuntimeError(f"API error {e.code} from {self.base_url}: {error_body}") from e
 
-        text = result["choices"][0]["message"]["content"]
+        choice = result["choices"][0]
+        text = choice.get("message", {}).get("content")
+        # A reasoning model that spends its whole completion budget on hidden
+        # reasoning returns content: null with finish_reason "length" (observed:
+        # minimax-m3 exhausting 65536 tokens). Surface it as a clear error the
+        # strategy can record/retry, never a None that crashes downstream regexes.
+        if not text:
+            finish = choice.get("finish_reason", "unknown")
+            raise RuntimeError(
+                f"{self.model} returned empty content (finish_reason={finish})")
+
         usage = result.get("usage", {})
         cost = self._compute_cost(usage)
 

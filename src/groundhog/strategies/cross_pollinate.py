@@ -10,9 +10,11 @@ from dataclasses import dataclass
 
 from groundhog.base.strategy import Strategy, StrategyConfig, param
 from groundhog.tools.attempt_logger import (
-    AssistantEvent, MarkdownAttemptLogger, SystemEvent, UserEvent, eval_event,
+    AssistantEvent, LogEvent, MarkdownAttemptLogger, SystemEvent, UserEvent, eval_event,
 )
-from groundhog.utils.codegen import extract_code, build_prompt
+from groundhog.utils.codegen import (
+    GenerationFailed, build_prompt, extract_code, generate_text,
+)
 from groundhog.utils.selection import get_trunk_leaders
 
 
@@ -43,15 +45,21 @@ class CrossPollinate(Strategy):
         self.log.start(f"--- CrossPollinate | parent=#{prior.id} ({prior_score:.3f}) | inspiration=#{inspiration.id} ({insp_score:.3f})")
         ws = self._start_workspace(toolkit, prior)
         self.logger.attempt_start(ws.path)
-        self._prepare_workspace(toolkit, ws, prior)
-        self.log.inline("generating... ")
-        self._do_work(toolkit, ws, prior, inspiration)
-        self.log.tock()
-        self.log.inline("evaluating... ")
-        result = self._evaluate_with_retries(toolkit, ws)
-        self.log.tock()
-        attempt = self._finalize(toolkit, ws, result, prior, inspiration)
-        return self._build_log(attempt, prior, result, toolkit)
+        try:
+            self._prepare_workspace(toolkit, ws, prior)
+            self.log.inline("generating... ")
+            self._do_work(toolkit, ws, prior, inspiration)
+            self.log.tock()
+            self.log.inline("evaluating... ")
+            result = self._evaluate_with_retries(toolkit, ws)
+            self.log.tock()
+            attempt = self._finalize(toolkit, ws, result, prior, inspiration)
+            return self._build_log(attempt, prior, result, toolkit)
+        except GenerationFailed as e:
+            self.log.inline("generation failed... ")
+            attempt = self._finalize_failed(toolkit, ws, prior, str(e))
+            return {"attempt": attempt.id, "prior": prior.id,
+                    "failed": str(e), "strategy": self.name}
 
     # --- Init ---
 
@@ -79,6 +87,15 @@ class CrossPollinate(Strategy):
             metadata["non_promotable"] = True
             metadata["non_promotable_reason"] = "solution.py is byte-identical to inspiration"
         return finalize_attempt(toolkit, ws, result, prior, metadata=metadata)
+
+    def _finalize_failed(self, toolkit, ws, prior, reason):
+        """Generation died — record the attempt as a failure, never orphan it."""
+        from groundhog.utils.finalize import finalize_failed
+        self.logger.log(LogEvent(type="error", data={"error": reason}))
+        metadata = {"strategy": self.name, "prior": prior.id if prior else None,
+                    "cost": round(self.logger.total_cost(), 6),
+                    "generation_failed": reason}
+        return finalize_failed(toolkit, ws, reason, prior, metadata=metadata)
 
     # --- Selection ---
 
@@ -151,7 +168,8 @@ Output SEARCH/REPLACE blocks modifying the base approach."""
         self.logger.log(UserEvent(content=prompt))
         self.logger.log(SystemEvent(content=system_prompt))
 
-        response = toolkit.llm.get("high").generate(prompt=prompt, system_prompt=system_prompt)
+        response = generate_text(toolkit.llm.get("high"), prompt, system_prompt,
+                                 retries=self.cfg.max_retries)
         self.logger.log(AssistantEvent(content=response.text, role=response.model,
                                        cost=response.cost, usage=response.usage))
 
@@ -195,7 +213,10 @@ Output SEARCH/REPLACE blocks modifying the base approach."""
         self.logger.log(UserEvent(content=prompt, data={"label": f"Retry {retry_num}"}))
         self.logger.log(SystemEvent(content=system_prompt))
 
-        response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
+        try:
+            response = generate_text(toolkit.llm.get("default"), prompt, system_prompt)
+        except GenerationFailed:
+            return  # leave the broken code; the eval loop records the failure
         self.logger.log(AssistantEvent(content=response.text, role=response.model,
                                        cost=response.cost, usage=response.usage, data={"label": f"Retry {retry_num}"}))
 

@@ -11,9 +11,11 @@ from dataclasses import dataclass
 
 from groundhog.base.strategy import Strategy, StrategyConfig, param
 from groundhog.tools.attempt_logger import (
-    AssistantEvent, MarkdownAttemptLogger, SystemEvent, UserEvent, eval_event,
+    AssistantEvent, LogEvent, MarkdownAttemptLogger, SystemEvent, UserEvent, eval_event,
 )
-from groundhog.utils.codegen import extract_code, build_prompt
+from groundhog.utils.codegen import (
+    GenerationFailed, build_prompt, extract_code, generate_text,
+)
 from groundhog.utils.selection import get_trunk_leaders
 
 
@@ -42,18 +44,24 @@ class FreshApproach(Strategy):
         self.log.start(f"--- FreshApproach ({self.cfg.mode})")
         ws = self._start_workspace(toolkit)
         self.logger.attempt_start(ws.path)
-        self._prepare_workspace(toolkit, ws)
-        self.log.inline("generating... ")
-        self._do_work(toolkit, ws)
-        self.log.tock()
-        self.log.inline("approach... ")
-        self._generate_direction(toolkit, ws)
-        self.log.tock()
-        self.log.inline("evaluating... ")
-        result = self._evaluate_with_retries(toolkit, ws)
-        self.log.tock()
-        attempt = self._finalize(toolkit, ws, result)
-        return self._build_log(attempt, result, toolkit)
+        try:
+            self._prepare_workspace(toolkit, ws)
+            self.log.inline("generating... ")
+            self._do_work(toolkit, ws)
+            self.log.tock()
+            self.log.inline("approach... ")
+            self._generate_direction(toolkit, ws)
+            self.log.tock()
+            self.log.inline("evaluating... ")
+            result = self._evaluate_with_retries(toolkit, ws)
+            self.log.tock()
+            attempt = self._finalize(toolkit, ws, result)
+            return self._build_log(attempt, result, toolkit)
+        except GenerationFailed as e:
+            self.log.inline("generation failed... ")
+            attempt = self._finalize_failed(toolkit, ws, str(e))
+            return {"attempt": attempt.id, "failed": str(e),
+                    "strategy": self.name, "mode": self.cfg.mode}
 
     # --- Init ---
 
@@ -93,7 +101,8 @@ class FreshApproach(Strategy):
         self.logger.log(UserEvent(content=prompt))
         self.logger.log(SystemEvent(content=system_prompt))
 
-        response = toolkit.llm.get("high").generate(prompt=prompt, system_prompt=system_prompt)
+        response = generate_text(toolkit.llm.get("high"), prompt, system_prompt,
+                                 retries=self.cfg.max_retries)
         self.logger.log(AssistantEvent(content=response.text, role=response.model,
                                        cost=response.cost, usage=response.usage))
 
@@ -134,7 +143,8 @@ Write complete, runnable code in a ```python block."""
         self.logger.log(UserEvent(content=prompt))
         self.logger.log(SystemEvent(content=system_prompt))
 
-        response = toolkit.llm.get("high").generate(prompt=prompt, system_prompt=system_prompt)
+        response = generate_text(toolkit.llm.get("high"), prompt, system_prompt,
+                                 retries=self.cfg.max_retries)
         self.logger.log(AssistantEvent(content=response.text, role=response.model,
                                        cost=response.cost, usage=response.usage))
 
@@ -164,13 +174,14 @@ Write complete, runnable code in a ```python block."""
             "backbone that defines the family.\n\n"
             f"```python\n{code}\n```"
         )
-        response = toolkit.llm.get("default").generate(
-            prompt=prompt,
-            system_prompt=(
-                "Write the core direction as 1-2 lines. No preamble, no "
-                "code, no markdown headers."
-            ),
+        system_prompt = (
+            "Write the core direction as 1-2 lines. No preamble, no "
+            "code, no markdown headers."
         )
+        try:
+            response = generate_text(toolkit.llm.get("default"), prompt, system_prompt)
+        except GenerationFailed:
+            return  # code exists; a missing direction is caught by the gates, not a crash
         self.logger.log(AssistantEvent(content=response.text, role=response.model,
                                        cost=response.cost, usage=response.usage, data={"label": "Direction"}))
         from groundhog.utils.direction import write_direction
@@ -187,6 +198,18 @@ Write complete, runnable code in a ```python block."""
             "cost": round(self.logger.total_cost(), 6),
         }
         return finalize_attempt(toolkit, ws, result, None, metadata=metadata)
+
+    def _finalize_failed(self, toolkit, ws, reason):
+        """Generation died — record the attempt as a failure, never orphan it."""
+        from groundhog.utils.finalize import finalize_failed
+        self.logger.log(LogEvent(type="error", data={"error": reason}))
+        metadata = {
+            "strategy": self.name,
+            "mode": self.cfg.mode,
+            "cost": round(self.logger.total_cost(), 6),
+            "generation_failed": reason,
+        }
+        return finalize_failed(toolkit, ws, reason, None, metadata=metadata)
 
     # --- Evaluation with retries ---
 
@@ -221,7 +244,10 @@ Write complete, runnable code in a ```python block."""
         self.logger.log(UserEvent(content=prompt, data={"label": f"Retry {retry_num}"}))
         self.logger.log(SystemEvent(content=system_prompt))
 
-        response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
+        try:
+            response = generate_text(toolkit.llm.get("default"), prompt, system_prompt)
+        except GenerationFailed:
+            return  # leave the broken code; the eval loop records the failure
         self.logger.log(AssistantEvent(content=response.text, role=response.model,
                                        cost=response.cost, usage=response.usage, data={"label": f"Retry {retry_num}"}))
 
