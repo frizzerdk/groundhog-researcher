@@ -1,10 +1,8 @@
 """Run-state report — a markdown snapshot of the attempt store.
 
 Read-side only: everything is derived from the history + scorer at render
-time, nothing is persisted (the score NOTE cache is not consulted). The
-aggregations below are vendored minimal versions of the read layer on
-feat/read-layer-queries (utils/queries.py); the defensive import prefers
-that module when present, so the two converge at merge.
+time via the read layer (utils/queries), nothing is persisted (the score
+NOTE cache is not consulted).
 """
 
 from __future__ import annotations
@@ -12,22 +10,14 @@ from __future__ import annotations
 import json
 from typing import List, Optional
 
-try:
-    from groundhog.utils import queries as _queries
-except ImportError:
-    _queries = None
+from groundhog.utils import queries as _queries
 
 
 def gather(history, scorer) -> dict:
     """All the data the report renders, as plain dicts/lists."""
-    if _queries is not None:
-        rows = _queries.attempt_table(history, scorer)
-        fams = _queries.families(history, scorer)
-        summary = _queries.run_summary(history, scorer)
-    else:
-        rows = _attempt_rows(history, scorer)
-        fams = _families(history, rows)
-        summary = _summary(rows, fams)
+    rows = _queries.attempt_table(history, scorer)
+    fams = _queries.families(history, scorer)
+    summary = _queries.run_summary(history, scorer)
     return {
         "summary": summary,
         "families": fams,
@@ -153,84 +143,6 @@ def narrative(llm, data: dict) -> Optional[str]:
         return None
 
 
-# --- vendored read-layer aggregations (see module docstring) ---------------
-
-
-def _attempt_rows(history, scorer) -> List[dict]:
-    rows = []
-    for a in sorted(history.list(only_done=False),
-                    key=lambda a: (a.created_at, a.id)):
-        if a.status not in ("done", "fail"):
-            continue
-        metadata = _metadata_of(a)
-        rows.append({
-            "id": a.id,
-            "parent": a.parent,
-            "status": a.status,
-            "score": _score_of(a, scorer),
-            "name": a.name,
-            "created_at": a.created_at,
-            "strategy": metadata.get("strategy"),
-            "cost": _as_float(metadata.get("cost")),
-        })
-    return rows
-
-
-def _families(history, rows) -> List[dict]:
-    from groundhog.utils.direction import (
-        direction_title,
-        normalize_direction,
-        read_direction_from_attempt,
-    )
-
-    by_id = {r["id"]: r for r in rows}
-    groups: dict = {}
-    for members in history.derive_families():
-        text = read_direction_from_attempt(members[0])
-        key = normalize_direction(text) if text else None
-        groups[key] = {"text": text, "members": members}
-
-    out = []
-    for group in groups.values():
-        members = group["members"]
-        best_id, best_score = None, None
-        for a in members:
-            row = by_id.get(a.id)
-            s = row["score"] if row else None
-            if s is not None and (best_score is None or s > best_score):
-                best_id, best_score = a.id, s
-        out.append({
-            "family_name": direction_title(group["text"] or ""),
-            "root_id": members[0].id,
-            "members": [a.id for a in members],
-            "best_id": best_id,
-            "best_score": best_score,
-        })
-    return out
-
-
-def _summary(rows, fams) -> dict:
-    scored = [r for r in rows if r["score"] is not None]
-    trajectory = []
-    best_so_far = None
-    for r in scored:
-        best_so_far = (r["score"] if best_so_far is None
-                       else max(best_so_far, r["score"]))
-        trajectory.append((r["created_at"], best_so_far))
-    best = max(scored, key=lambda r: r["score"]) if scored else None
-    costs = [r["cost"] for r in rows if r["cost"] is not None]
-    return {
-        "n_attempts": len(rows),
-        "n_done": sum(1 for r in rows if r["status"] == "done"),
-        "n_failed": sum(1 for r in rows if r["status"] == "fail"),
-        "best": ({"id": best["id"], "score": best["score"], "name": best["name"]}
-                 if best else None),
-        "n_families": len(fams),
-        "total_cost": round(sum(costs), 6),
-        "score_trajectory": trajectory,
-    }
-
-
 def _open_questions(history, rows, recent: int = 10) -> List[str]:
     """Attempts a human should look at: recent failures and flagged commits."""
     out = []
@@ -257,28 +169,6 @@ def _metadata_of(attempt) -> dict:
         return attempt.metadata or {}
     except Exception:  # noqa: BLE001
         return {}
-
-
-def _score_of(attempt, scorer) -> Optional[float]:
-    if scorer is None:
-        return None
-    try:
-        result = attempt.result
-    except Exception:  # noqa: BLE001
-        return None
-    if not result.completed or not result.stages:
-        return None
-    try:
-        return float(scorer(list(result.stages.values())[-1]))
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _as_float(value) -> Optional[float]:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _short(value, n=8):

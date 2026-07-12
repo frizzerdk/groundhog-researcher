@@ -157,9 +157,9 @@ Output only the compressed learnings, nothing else."""
         return response.text
 
     # --- Report ---
-    # Aggregations below are vendored so this branch stands alone; they
-    # converge with the read layer in utils/queries.py (attempt_table /
-    # families) on origin/feat/read-layer-queries — swap to those once merged.
+    # Aggregations below intentionally stay local: their shapes differ from
+    # the read layer in utils/queries.py (score-based failed counts, tuple
+    # best/latest) and the report renderer/narrator depend on them.
 
     def _write_report(self, toolkit):
         scorer = self._scorer(toolkit)
