@@ -74,9 +74,11 @@ def attempt_table(history: AttemptHistory, scorer: Optional[Scorer] = None,
     ``strategy`` and ``cost`` come from the attempt's metadata; ``score``
     is the scorer applied to the last recorded stage (``None`` when
     unscoreable). ``only_done=False`` includes failed attempts — nothing
-    is discarded, and a family map without its failures misleads.
+    is discarded, and a family map without its failures misleads. Open
+    (in-progress) workspaces are never rows: only committed attempts are
+    facts of the run.
     """
-    return [_row(a, scorer) for a in _sorted(history.list(only_done=only_done))]
+    return [_row(a, scorer) for a in _committed(history, only_done)]
 
 
 def families(history: AttemptHistory, scorer: Optional[Scorer] = None,
@@ -96,7 +98,7 @@ def families(history: AttemptHistory, scorer: Optional[Scorer] = None,
     )
 
     groups: dict = {}
-    for a in _sorted(history.list(only_done=only_done)):
+    for a in _committed(history, only_done):
         text = read_direction_from_attempt(a)
         key = normalize_direction(text) if text else None
         groups.setdefault(key, {"text": text, "members": []})["members"].append(a)
@@ -219,7 +221,11 @@ def attempt_detail(history: AttemptHistory, attempt_id: str,
     return detail
 
 
-def _sorted(attempts: List[Attempt]) -> List[Attempt]:
+def _committed(history: AttemptHistory, only_done: bool) -> List[Attempt]:
+    # The folder backend's list(only_done=False) includes open workspaces;
+    # a summary that counts them reports phantoms mid-run.
+    attempts = [a for a in history.list(only_done=only_done)
+                if a.status in ("done", "fail")]
     return sorted(attempts, key=lambda a: (a.created_at, a.id))
 
 
