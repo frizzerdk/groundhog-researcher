@@ -100,6 +100,48 @@ class MockStrategy:
                 self.gauge["active"] -= 1
 
 
+def test_agent_strategy_refused_with_concurrency(tmp_path):
+    """Agent strategies bind the root toolkit's workspace handle through
+    their build-time tools — parallel dispatch silently degrades. Refuse
+    loudly at construction (remediation parallel)."""
+    import pytest
+
+    from groundhog.strategies.agent import AgentStrategy
+
+    tk = assemble_toolkit(StressTask(), history=FolderAttemptHistory(tmp_path),
+                          path=tmp_path, seed=42)
+    with pytest.raises(ValueError, match="concurrency"):
+        SimpleOptimizer(tk, strategy=AgentStrategy(), seed_strategy=None,
+                        concurrency=2)
+    with pytest.raises(ValueError, match="AgentStrategy"):
+        SimpleOptimizer(tk, strategy=MockStrategy(), seed_strategy=None,
+                        extras=[AgentStrategy()], concurrency=2)
+    # Serial stays allowed.
+    SimpleOptimizer(tk, strategy=AgentStrategy(), seed_strategy=None)
+
+
+class LearningMockStrategy(MockStrategy):
+    """MockStrategy that also appends one learnings entry per call."""
+
+    def __call__(self, toolkit, config=None):
+        toolkit.learnings.add(f"note {uuid.uuid4().hex}")
+        return super().__call__(toolkit, config)
+
+
+def test_parallel_learnings_writes_are_not_lost(tmp_path):
+    """learnings.add is read-modify-write on one file; unlocked concurrent
+    appends lose entries. Workers get a lock-guarded learnings proxy."""
+    n = 16
+    strategy = LearningMockStrategy()
+    tk = assemble_toolkit(StressTask(), history=FolderAttemptHistory(tmp_path),
+                          path=tmp_path, seed=42)
+    opt = SimpleOptimizer(tk, strategy=strategy, seed_strategy=None,
+                          concurrency=4)
+    opt.run(n=n)
+
+    assert tk.learnings.count() == n, "concurrent learnings.add lost entries"
+
+
 def test_concurrency_defaults_to_serial(tmp_path):
     tk = assemble_toolkit(StressTask(), history=FolderAttemptHistory(tmp_path),
                           path=tmp_path, seed=42)

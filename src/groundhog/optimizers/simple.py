@@ -75,6 +75,28 @@ class _LockedHistory:
         return getattr(self._history, name)
 
 
+class _LockedLearnings:
+    """Learnings proxy serializing writes on the run's attempt lock.
+
+    The markdown backend's ``add``/``edit`` are read-modify-write on one
+    file — two workers appending at once lose entries. Reads pass through."""
+
+    def __init__(self, learnings, lock):
+        self._learnings = learnings
+        self._lock = lock
+
+    def add(self, text):
+        with self._lock:
+            return self._learnings.add(text)
+
+    def edit(self, search, replace):
+        with self._lock:
+            return self._learnings.edit(search, replace)
+
+    def __getattr__(self, name):
+        return getattr(self._learnings, name)
+
+
 class _LineAtomicLog(StrategyLog):
     """Per-worker StrategyLog: inline fragments buffer until the line is
     complete, then print atomically — concurrent workers interleave at line
@@ -156,9 +178,14 @@ class SimpleOptimizer(Optimizer):
       text, and per-attempt event streams still land in each attempt's
       ``attemptlog.jsonl``/``.md``.
     - Strategy instances are shallow-copied per dispatch (their per-call
-      instance state is not thread-safe). Agent strategies whose build-time
-      tools closed over the ROOT toolkit's workspace handle are not
-      parallel-safe yet.
+      instance state is not thread-safe). Agent strategies are REFUSED at
+      construction with N > 1: the default agent tools bind the root
+      toolkit's workspace handle, so parallel agent attempts would
+      silently read each other's workspaces.
+    - Up to N ``task.evaluate`` calls run at once, each on its own
+      workspace. The task's evaluator must tolerate N-way concurrency:
+      shared datasets, GPU memory, fixed-name temp files, or module
+      globals in the evaluation path will collide across workers.
     """
 
     def __init__(self, toolkit: Toolkit,
@@ -237,6 +264,24 @@ class SimpleOptimizer(Optimizer):
             self._register_strategy(s)
         for s in (extras or []):
             self._register_strategy(s, allow_overwrite=False)
+
+        self._print_lock = threading.Lock()
+
+        if self.concurrency > 1:
+            from groundhog.strategies.agent import AgentStrategy
+            offenders = sorted({
+                s.__class__.__name__
+                for s in [*self._schedule, *(extras or [])]
+                if isinstance(s, AgentStrategy)
+            })
+            if offenders:
+                raise ValueError(
+                    f"concurrency={self.concurrency} with agent strategies "
+                    f"({', '.join(offenders)}) is not supported: the default "
+                    f"agent tools bind the root toolkit's workspace handle, "
+                    f"so parallel agent attempts silently read each other's "
+                    f"workspaces. Run agent strategies with concurrency=1."
+                )
 
     def _register_strategy(self, strategy: Strategy, allow_overwrite: bool = True) -> None:
         """Add a strategy to the queue-resolution registry under its declared
@@ -555,9 +600,12 @@ class SimpleOptimizer(Optimizer):
             strategy = self._strategy_registry.get(strategy_name)
             if strategy:
                 queue_label = f"{strategy_name} from {queue_item.get('source', '?')}"
-                self.toolkit.log.info(f"[queue] {queue_label}")
+                with self._print_lock:
+                    self.toolkit.log.info(f"[queue] {queue_label}")
                 return strategy, queue_item.get("config"), queue_label
-            self.toolkit.log.info(f"[queue] unknown strategy: {strategy_name}, skipping")
+            with self._print_lock:
+                self.toolkit.log.info(
+                    f"[queue] unknown strategy: {strategy_name}, skipping")
         return next(rotation), None, ""
 
     def _run_serial(self, n, scorer, best_score, total_cost):
@@ -614,7 +662,7 @@ class SimpleOptimizer(Optimizer):
         re-entrant lock serializes the racy sections: prior selection,
         workspace allocation, commit/finalize, score notes."""
         lock = threading.RLock()
-        print_lock = threading.Lock()
+        print_lock = self._print_lock
         self.toolkit._ws_lock = lock
         rotation = cycle(self._schedule)
         seen = {a.id for a in self.history.list()}
@@ -638,7 +686,8 @@ class SimpleOptimizer(Optimizer):
         def account():
             # Under the attempt lock: an accounting scan must never interleave
             # with a commit (a git ref mid-update or a folder dir mid-rename
-            # reads back as a torn, stage-less result).
+            # reads back as a torn, stage-less result). Printing takes the
+            # print lock so summary lines don't shear through worker output.
             nonlocal best_score, total_cost
             with lock:
                 for attempt in self.history.list():
@@ -647,7 +696,8 @@ class SimpleOptimizer(Optimizer):
                     seen.add(attempt.id)
                     cost = self._get_attempt_cost(attempt)
                     total_cost += cost
-                    self._log_attempt(attempt, scorer, best_score, total_cost)
+                    with print_lock:
+                        self._log_attempt(attempt, scorer, best_score, total_cost)
                     score = self._score_attempt(attempt, scorer)
                     if best_score is None or score > best_score:
                         best_score = score
@@ -710,6 +760,8 @@ class SimpleOptimizer(Optimizer):
         d["history"] = history
         d["ws"] = WorkspaceHandle(history)
         d["workspace"] = d["ws"]
+        if getattr(root, "learnings", None) is not None:
+            d["learnings"] = _LockedLearnings(root.learnings, lock)
         d["log"] = _LineAtomicLog(print_lock)
         # No console: the shared live box cannot render concurrent attempts.
         # Event streams still land in each attempt's attemptlog.jsonl/.md.
