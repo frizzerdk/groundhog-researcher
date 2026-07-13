@@ -3,8 +3,9 @@
 The source run is never touched. The destination is a copy of the run
 (excluding the venv, caches, and the old ``attempts/``) whose store is
 rebuilt by replaying every committed attempt through GitAttemptHistory's
-own API (workspace -> write files -> commit -> score note), preserving
-parent lineage, status, score notes, and the folder id as
+own API (workspace -> copy files -> commit -> notes), preserving parent
+lineage, status, creation time (the source dir mtime becomes the commit's
+author date), every ``notes.json`` key, and the folder id as
 ``migrated_from_folder_id`` metadata. In-progress workspaces have no git
 equivalent to replay into, so migration refuses until they are committed
 or aborted in the source.
@@ -17,17 +18,16 @@ it to a fresh scaffold; migration applies it to the copied run.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 from typing import List
 
 COPY_EXCLUDE = {".venv", "attempts", "__pycache__", ".pytest_cache"}
 
-# Lean by default: work/ dirs hold scratch and large artifacts. notes.json
-# stays behind — the git backend's notes are git notes, re-set at replay.
-ESSENTIALS = ["solution.py", "core_direction.md", "metadata.json",
-              "result.json", "attemptlog.jsonl", "attemptlog.md",
-              "TASK_CONTEXT.md", "agent_steps.jsonl", "agent_summary.jsonl"]
+# Lean by default: work/ holds scratch and large artifacts (opt in with
+# full_work); notes.json is re-set through the git backend's own notes.
+REPLAY_EXCLUDE = {"work", "notes.json"}
 
 # The injected lines land inside build_toolkit(); `import pathlib as ...`
 # (not `from pathlib import Path`) so a Path already used earlier in that
@@ -43,23 +43,29 @@ _GIT_WIRING = (
 
 def wire_git_history(task_py: Path) -> bool:
     """Patch a task.py's ``assemble_toolkit(task, ...)`` call to pass a
-    GitAttemptHistory. Returns False when no patchable call was found;
-    True when patched or already git-aware (idempotent)."""
+    GitAttemptHistory. Returns False when no patchable call was found, when
+    the call already passes its own ``history=`` (never produce a duplicate
+    kwarg), or when the patch would not compile; True when patched or when
+    the call site already carries our wiring (idempotent)."""
     task_py = Path(task_py)
     text = task_py.read_text(encoding="utf-8")
-    if "GitAttemptHistory" in text:
-        return True
     lines = text.splitlines(keepends=True)
     for i, line in enumerate(lines):
         stripped = line.lstrip()
         if stripped.startswith("#") or "assemble_toolkit(task" not in line:
             continue
+        if re.search(r"\bhistory\s*=", line):
+            return "assemble_toolkit(task, history=history" in line
         indent = line[:len(line) - len(stripped)]
         prelude = "".join(indent + w + "\n" for w in _GIT_WIRING.splitlines())
         patched = line.replace("assemble_toolkit(task",
                                "assemble_toolkit(task, history=history", 1)
-        lines[i] = prelude + patched
-        task_py.write_text("".join(lines), encoding="utf-8")
+        new_text = "".join(lines[:i] + [prelude + patched] + lines[i + 1:])
+        try:
+            compile(new_text, str(task_py), "exec")
+        except SyntaxError:
+            return False
+        task_py.write_text(new_text, encoding="utf-8")
         return True
     return False
 
@@ -98,10 +104,20 @@ def plan_migration(src: Path) -> List[dict]:
             "success": a.status == "done",
             "path": a.path,
             "name": a.metadata.get("name", ""),
-            "score_note": history.get_note(a, "score"),
+            "created_at": a.created_at,
+            "notes": _read_notes(a.path),
         })
     entries.sort(key=lambda e: int(e["id"]))
     return entries
+
+
+def _read_notes(attempt_path: Path) -> dict:
+    try:
+        raw = json.loads((Path(attempt_path) / "notes.json")
+                         .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
 
 
 def copy_run(src: Path, dest: Path) -> None:
@@ -125,39 +141,53 @@ def replay(entries: List[dict], dest: Path, *, full_work: bool = False,
 
     history = GitAttemptHistory(dest)
     id_map: dict = {}
-    for e in entries:
-        parent_sha = id_map.get(e["parent"])
-        if e["parent"] is not None and parent_sha is None:
-            out(f"  WARNING {e['id']}: parent {e['parent']} was not migrated; "
-                f"committing as root")
-        ws = history.workspace(parent=parent_sha)
-        for name in ESSENTIALS:
-            src_f = e["path"] / name
-            if src_f.exists():
-                shutil.copy2(src_f, ws.path / name)
-        if full_work and (e["path"] / "work").exists():
-            shutil.copytree(e["path"] / "work", ws.path / "work",
-                            dirs_exist_ok=True)
-
-        meta_f = ws.path / "metadata.json"
-        meta = {}
-        if meta_f.exists():
-            try:
-                meta = json.loads(meta_f.read_text(encoding="utf-8"))
-            except ValueError:
-                meta = {}
-        meta["migrated_from_folder_id"] = int(e["id"])
-        meta_f.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-        ws.name = e["name"] or _direction_first_line(ws.path)
-        attempt = ws.commit(success=e["success"])
-        id_map[e["id"]] = attempt.id
-        if e["score_note"] is not None:
-            history.set_note(attempt, "score", str(e["score_note"]))
-        out(f"  {e['id']:>3} -> {attempt.id[:10]}  "
-            f"({'done' if e['success'] else 'fail'}"
-            f"{', score noted' if e['score_note'] is not None else ''})")
+    try:
+        for e in entries:
+            id_map[e["id"]] = _replay_one(history, e, id_map,
+                                          full_work=full_work, out=out)
+    except BaseException:
+        out(f"ERROR: replay stopped mid-way - {dest} holds a PARTIAL store "
+            f"and must be deleted before retrying")
+        raise
     return id_map
+
+
+def _replay_one(history, e: dict, id_map: dict, *, full_work: bool, out) -> str:
+    parent_sha = id_map.get(e["parent"])
+    if e["parent"] is not None and parent_sha is None:
+        out(f"  WARNING {e['id']}: parent {e['parent']} was not migrated; "
+            f"committing as root")
+    ws = history.workspace(parent=parent_sha)
+    for item in Path(e["path"]).iterdir():
+        if item.name in REPLAY_EXCLUDE:
+            continue
+        if item.is_dir():
+            shutil.copytree(item, ws.path / item.name, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, ws.path / item.name)
+    if full_work and (e["path"] / "work").exists():
+        shutil.copytree(e["path"] / "work", ws.path / "work",
+                        dirs_exist_ok=True)
+
+    meta_f = ws.path / "metadata.json"
+    meta = {}
+    if meta_f.exists():
+        try:
+            meta = json.loads(meta_f.read_text(encoding="utf-8"))
+        except ValueError:
+            meta = {}
+    meta["migrated_from_folder_id"] = int(e["id"])
+    meta_f.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    ws.name = e["name"] or _direction_first_line(ws.path)
+    ws.created_at = e["created_at"]
+    attempt = ws.commit(success=e["success"])
+    for key, value in e["notes"].items():
+        history.set_note(attempt, key, value)
+    noted = f", notes: {', '.join(sorted(e['notes']))}" if e["notes"] else ""
+    out(f"  {e['id']:>3} -> {attempt.id[:10]}  "
+        f"({'done' if e['success'] else 'fail'}{noted})")
+    return attempt.id
 
 
 def _direction_first_line(path: Path) -> str:
@@ -187,7 +217,7 @@ def migrate_store(src: Path, dest: Path, *, full_work: bool = False,
     out(f"found {len(entries)} committed attempts "
         f"({sum(1 for e in entries if e['success'])} done, "
         f"{sum(1 for e in entries if not e['success'])} fail), "
-        f"{sum(1 for e in entries if e['score_note'] is not None)} score notes")
+        f"{sum(1 for e in entries if 'score' in e['notes'])} score notes")
     if dry_run:
         out("dry run - nothing written")
         return

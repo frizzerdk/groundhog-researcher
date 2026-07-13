@@ -334,7 +334,9 @@ class GitAttemptHistory(AttemptHistory):
     def _commit_workspace(self, ws: GitWorkspace, success: bool) -> GitAttempt:
         status = "done" if success else "fail"
 
-        ts = time.time()
+        # A replayed attempt (migration) carries its original creation time
+        # as ws.created_at; live commits stamp now.
+        ts = getattr(ws, "created_at", None) or time.time()
         if ts <= self._last_created:
             ts = self._last_created + 1e-6
         self._last_created = ts

@@ -54,6 +54,48 @@ def test_wire_git_history_unpatchable(tmp_path):
     assert wire_git_history(task_py) is False
 
 
+def test_wire_git_history_refuses_foreign_history_kwarg(tmp_path):
+    """A call already passing its own history= must never gain a duplicate
+    kwarg — the WARNING ('wire manually') path is taken instead."""
+    task_py = tmp_path / "task.py"
+    body = ("def build_toolkit():\n"
+            "    from groundhog import assemble_toolkit\n"
+            "    return assemble_toolkit(task, history=my_history)\n")
+    task_py.write_text(body, encoding="utf-8")
+    assert wire_git_history(task_py) is False
+    assert task_py.read_text(encoding="utf-8") == body
+
+
+def test_wire_git_history_idempotency_reads_the_call_site(tmp_path):
+    """'GitAttemptHistory' in a comment must not fake already-wired — only
+    the call site itself decides."""
+    task_py = tmp_path / "task.py"
+    task_py.write_text(
+        "# One day, switch to GitAttemptHistory.\n"
+        "def build_toolkit():\n"
+        "    from groundhog import assemble_toolkit\n"
+        "    return assemble_toolkit(task)\n",
+        encoding="utf-8")
+    assert wire_git_history(task_py) is True
+    text = task_py.read_text(encoding="utf-8")
+    assert "assemble_toolkit(task, history=history" in text
+    compile(text, str(task_py), "exec")
+
+
+def test_wire_git_history_discards_a_patch_that_does_not_compile(tmp_path):
+    """When the injected prelude would land mid-expression, the patch is
+    discarded (file untouched) and the WARNING path is taken."""
+    task_py = tmp_path / "task.py"
+    body = ("def build_toolkit():\n"
+            "    from groundhog import assemble_toolkit\n"
+            "    return (\n"
+            "        assemble_toolkit(task,\n"
+            "                         path=None))\n")
+    task_py.write_text(body, encoding="utf-8")
+    assert wire_git_history(task_py) is False
+    assert task_py.read_text(encoding="utf-8") == body
+
+
 # --- init --git ---------------------------------------------------------------
 
 @needs_git
@@ -172,6 +214,53 @@ def test_migrate_store_replays_the_tree(tmp_path, capsys):
 
     # Source untouched.
     assert len(src_history.list(only_done=False)) == 3
+
+
+@needs_git
+def test_migrate_preserves_notes_root_files_and_creation_time(tmp_path, capsys):
+    run_dir = _populated_run(tmp_path, capsys)
+    src_history = rundir.load_run(run_dir=run_dir).history
+    src_attempt = src_history.get("1")
+    src_history.set_note("1", "tags", "baseline,keeper")
+    (src_attempt.path / "extra_artifact.txt").write_text("kept",
+                                                         encoding="utf-8")
+    work = src_attempt.path / "work"
+    work.mkdir(exist_ok=True)
+    (work / "scratch.txt").write_text("scratch", encoding="utf-8")
+
+    dest = tmp_path / "migrated"
+    with _in_dir(run_dir):
+        rc = cmd_migrate_store([str(dest)])
+    assert rc == 0, capsys.readouterr().out
+
+    loaded = rundir.load_run(run_dir=dest)
+    by_folder_id = {a.metadata["migrated_from_folder_id"]: a
+                    for a in loaded.history.list(only_done=False)}
+    m = by_folder_id[1]
+    # ALL note keys travel, not just score.
+    assert loaded.history.get_note(m, "tags") == "baseline,keeper"
+    assert loaded.history.get_note(m, "score") == src_history.get_note("1", "score")
+    # All attempt-root files travel except work/ and notes.json.
+    files = m.list_files()
+    assert "extra_artifact.txt" in files
+    assert "notes.json" not in files
+    assert not any(f.startswith("work/") for f in files)
+    # The source dir mtime rides the commit as its author date.
+    src_created = src_history.get("1").created_at
+    assert abs(m.created_at - src_created) < 2.0
+
+
+@needs_git
+def test_replay_failure_reports_partial_dest(tmp_path, capsys):
+    from groundhog.tools.migrate import plan_migration, replay
+    run_dir = _populated_run(tmp_path, capsys)
+    entries = plan_migration(run_dir)
+    entries[1]["path"] = run_dir / "attempts" / "does-not-exist"
+    dest = tmp_path / "partial"
+    out_lines = []
+    with pytest.raises(OSError):
+        replay(entries, dest, out=out_lines.append)
+    assert any("PARTIAL" in line and "deleted" in line for line in out_lines)
 
 
 @needs_git
