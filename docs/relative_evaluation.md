@@ -34,9 +34,13 @@ every prior candidate in the immutable attempt history, so the pool is *free* �
 it is `toolkit.history`, filtered to a reference set.
 
 Because groundhog **never persists scores** (they are always recomputed
-read-side), relative scoring fits the grain of the framework: change the pool or
-switch win-rate → Elo and the entire history re-ranks with no re-runs of the
-expensive part, exactly as swapping a stage `scorer` does for absolute tasks.
+read-side), relative scoring fits the grain of the framework — with one honest
+caveat about what "re-rank for free" means. Swapping the stage `scorer`
+reinterprets metrics the evaluator **already recorded** (e.g. reading a stored
+Elo instead of a stored win-rate) with no re-runs, exactly as for absolute
+tasks. Changing the *pool* — or switching to a rating the evaluator never
+measured — changes what must be measured: that takes a re-evaluation of the
+candidates (cheap when a game is cheap, but a re-run, not a re-read).
 
 ## How an Evaluator reaches `toolkit.history`
 
@@ -71,11 +75,15 @@ class TournamentEvaluator(Evaluator):
                                     "per_opponent": r["per_opponent"]})
 ```
 
-The candidate being evaluated is **not yet in history** (it is still an
-uncommitted workspace), so it never plays itself — the pool is exactly the
-committed opponents. On the very first attempt the pool is empty; seed it with a
-fixed set of built-in baselines so the first candidate still has something to
-beat (see [Mitigations](#pitfalls-and-mitigations)).
+During optimization the candidate being evaluated is **not yet in history**
+(it is still an uncommitted workspace), so the pool is exactly the committed
+opponents. That guarantee ends the moment you *re-evaluate* something that is
+already in the pool — a committed attempt via `groundhog eval <id>`, or a
+baseline file — so the evaluator must still exclude self explicitly (the
+worked example skips any rival with byte-identical code). On the very first
+attempt the pool is empty; seed it with a fixed set of built-in baselines so
+the first candidate still has something to beat (see
+[Mitigations](#pitfalls-and-mitigations)).
 
 The stage `scorer` then reads `win_rate` (or the Elo rating) out of the metrics,
 just like any other stage — no special casing in the optimizer.
@@ -145,8 +153,11 @@ If the reference pool is frozen forever, candidates overfit to beating a stale
 set and stop improving in any real sense.
 - **Mitigation:** **periodic re-anchor** — every N attempts, refresh the
   reference pool from the current trunk leaders (`history.derive_trunks(scorer)`)
-  while keeping a few permanent baselines for continuity. Re-anchoring re-scores
-  history for free (scores aren't persisted); it never invalidates stored data.
+  while keeping a few permanent baselines for continuity. Re-anchoring never
+  invalidates stored data (raw metrics stay put), but win-rates against the
+  *new* pool are new measurements: candidates you want ranked under the new
+  anchor must be re-evaluated — a re-play of the cheap tournament stage, not
+  of candidate generation.
 
 ### 4. Seed / seat variance
 One game is mostly noise: first-move advantage, a lucky RNG seed, or an

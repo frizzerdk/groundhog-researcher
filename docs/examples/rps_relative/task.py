@@ -71,16 +71,19 @@ class RPSContext(Context):
                 "beat the field.")
 
 
+def _read_code(code_or_path):
+    """The candidate's source, from a code string or a (workspace) path."""
+    if isinstance(code_or_path, (str, bytes)) and "\n" in str(code_or_path):
+        return str(code_or_path)
+    p = Path(code_or_path)
+    return (p / "solution.py").read_text(encoding="utf-8") if p.is_dir() \
+        else p.read_text(encoding="utf-8")
+
+
 def _load_move(code_or_path):
     """Return the move() callable from a code string or a workspace path."""
-    if isinstance(code_or_path, (str, bytes)) and "\n" in str(code_or_path):
-        code = code_or_path
-    else:
-        p = Path(code_or_path)
-        code = (p / "solution.py").read_text(encoding="utf-8") if p.is_dir() \
-            else p.read_text(encoding="utf-8")
     ns = {}
-    exec(code, ns)
+    exec(_read_code(code_or_path), ns)
     return ns["move"]
 
 
@@ -114,20 +117,27 @@ class TournamentEvaluator(Evaluator):
     """Relative Evaluator: score = win-rate over the reference pool.
 
     `pool` is injected by build_toolkit() (`= tk.history`). The reference pool
-    is the fixed baseline files plus every committed prior candidate; the
-    candidate under evaluation is not in history yet, so it never plays itself.
+    is the fixed baseline files plus every committed prior candidate. The
+    candidate never plays itself: during optimization it isn't in history yet,
+    and when a committed attempt (or a baseline file) is re-evaluated, any
+    rival with byte-identical code is excluded from its pool.
     """
 
     pool = None  # set to toolkit.history in build_toolkit(); None until wired
 
-    def _reference(self):
-        """(label, move_fn) opponents: fixed baselines + committed candidates."""
-        opps = [(f"baseline:{p.stem}", _load_move(p))
-                for p in sorted(BASELINES.glob("*.py"))]
+    def _reference(self, exclude_code=None):
+        """(label, move_fn) opponents: fixed baselines + committed candidates,
+        minus any rival whose code equals the candidate's (self-exclusion)."""
+        opps = []
+        for p in sorted(BASELINES.glob("*.py")):
+            code = p.read_text(encoding="utf-8")
+            if code == exclude_code:
+                continue
+            opps.append((f"baseline:{p.stem}", _load_move(code)))
         if self.pool is not None:
             for a in self.pool.list():                 # committed attempts only
                 code = a.read_file("solution.py")
-                if code:
+                if code and code != exclude_code:
                     try:
                         opps.append((a.id, _load_move(code)))
                     except Exception:                  # a broken rival is skipped
@@ -136,7 +146,8 @@ class TournamentEvaluator(Evaluator):
 
     def evaluate(self, code_or_path, data):
         try:
-            cand = _load_move(code_or_path)
+            cand_code = _read_code(code_or_path)
+            cand = _load_move(cand_code)
         except Exception as e:  # noqa: BLE001 — task contract: errors -> StageResult
             return StageResult(errors={"load": str(e)})
 
@@ -150,8 +161,9 @@ class TournamentEvaluator(Evaluator):
             b = 1.0 - _play_match(opp_fn, candidate_fn, rounds)
             return (a + b) / 2.0
 
-        r = round_robin(cand, self._reference(), play_fn=play,
-                        games_per_pair=games, key=lambda o: o[0])
+        r = round_robin(cand, self._reference(exclude_code=cand_code),
+                        play_fn=play, games_per_pair=games,
+                        key=lambda o: o[0])
         return StageResult(metrics={
             "win_rate": r["win_rate"],
             "games": r["games"],
@@ -183,13 +195,16 @@ def build_toolkit() -> Toolkit:
 
 if __name__ == "__main__":
     # Score each baseline *as if* it were a candidate, against the whole pool
-    # (its rivals are the other baselines). No optimizer, no API calls — this
-    # just demonstrates the Evaluator and the non-transitivity of RPS.
+    # (its rivals are the OTHER baselines — self is excluded). No optimizer,
+    # no API calls — this just demonstrates the Evaluator and the
+    # non-transitivity of RPS.
     for f in sorted(BASELINES.glob("*.py")):
         res = task.evaluate(f)
         m = res.stages["tournament"].metrics
         per = " ".join(f"{k.split(':')[-1]}={v:.2f}"
                        for k, v in m["per_opponent"].items())
-        print(f"{f.stem:12s} win_rate={m['win_rate']:.3f}  [{per}]")
-    print("\nNo single baseline dominates — that's non-transitivity. A win-rate "
-          "over the whole pool, not one champion, is the stable signal.")
+        print(f"{f.stem:15s} win_rate={m['win_rate']:.3f}  [{per}]")
+    print("\nthe constant baselines form a non-transitive cycle (paper beats "
+          "rock beats scissors beats paper): pairwise wins cannot rank them. "
+          "A win-rate over the whole pool, not any one head-to-head, is the "
+          "stable signal.")

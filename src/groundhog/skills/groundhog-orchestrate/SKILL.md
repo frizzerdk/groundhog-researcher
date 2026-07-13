@@ -112,8 +112,13 @@ say so in the report; abort is allowed, *silent* abort is not.
 
 A big round (many workers, long runs, or more than one orchestrator)
 breaks in ways a K=3 round never shows. These seven rules are the
-scars of a large real campaign; `docs/fleet_conventions.md` carries the
-full rationale. Hold to them and silent loss stops happening.
+scars of a large real campaign -- each prevents a silent-loss incident
+that actually happened; the one idea behind them is *fan work out
+widely, but funnel every store mutation through a single throat*. The
+full per-rule rationale lives in the repository (it is not shipped in
+the installed package): `docs/fleet_conventions.md` at
+https://github.com/frizzerdk/groundhog-researcher. Hold to the rules
+and silent loss stops happening.
 
 1. **Single-writer lifecycle.** Exactly ONE process runs `attempt new`
    / `commit` / `abort`. Parallel workers never touch the lifecycle —
@@ -151,7 +156,11 @@ full rationale. Hold to them and silent loss stops happening.
 7. **Concurrent orchestrators coordinate via a claims file.** When more
    than one orchestrator runs at once, they share a claims file
    recording who owns which dirs and workspaces, and each keeps
-   one-open-workspace-at-a-time. No claim, no touch.
+   one-open-workspace-at-a-time. No claim, no touch. (This does not
+   contradict this skill's pre-open-K step: the K workspaces of one
+   fan-out round all belong to the single orchestrator that opened
+   them -- one writer per claimed region. The one-at-a-time bound is
+   for workspaces opened *outside* your claimed fan-out.)
 
 **Namespacing.** Parallel workers that generate code MUST give their
 modules unique stems (prefix by wsid, angle, or worker id). Two workers

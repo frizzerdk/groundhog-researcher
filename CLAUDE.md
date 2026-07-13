@@ -28,6 +28,7 @@ groundhog prefer <backend>                # preference written to ~/.groundhog/c
 groundhog attempt <sub>                   # manual attempt lifecycle -- new (--fresh), list,
                                           #   show, commit (gated, --strategy), abort, ...
 groundhog eval <path-or-id>               # score a solution dir, .py file, or attempt
+groundhog strategy list|show|run          # discover strategies, inspect config, run one
 groundhog tool list|run                   # run toolkit tools (check-gates is a default)
 groundhog skills install [dir]            # copy the packaged session skills into a run dir
 

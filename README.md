@@ -66,6 +66,8 @@ groundhog attempt <subcommand>    Manual attempt lifecycle: new (--fresh founds 
                                   --strategy labels the producer) / abort /
                                   resume / reap / in-progress / best
 groundhog eval <path-or-id>       Score a solution dir, .py file, or attempt
+groundhog strategy list|show|run  Discover strategies (built-in + the run dir's),
+                                  inspect their config knobs, run one N times
 groundhog tool list|run           Run any toolkit tool from the terminal
                                   (check-gates ships as a framework default)
 groundhog skills install [dir]    Install the Claude Code session skills into a
