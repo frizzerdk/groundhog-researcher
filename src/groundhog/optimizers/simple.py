@@ -623,9 +623,10 @@ class SimpleOptimizer(Optimizer):
         at the schedule start, nothing else. Read-advance-write holds the
         cross-process file lock (utils.fileio.locked) and the write is
         atomic, matching the shared-state lock discipline. Queue-served
-        iterations never advance the cursor. A toolkit without a run path
-        falls back to the in-memory cycle."""
-        if getattr(self.toolkit, "path", None) is None:
+        iterations never advance the cursor. A one-slot schedule has no
+        rotation to continue and a toolkit without a run path has nowhere
+        to persist — both fall back to the in-memory cycle."""
+        if len(self._schedule) < 2 or getattr(self.toolkit, "path", None) is None:
             return next(rotation)
         from groundhog.utils.fileio import atomic_write_text, locked
         state_path = self.path / self.ROTATION_STATE_FILENAME
