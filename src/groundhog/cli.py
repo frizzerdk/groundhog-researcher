@@ -690,6 +690,10 @@ def _attempt_list(args):
     show_all, args = _flag(args, "--all")
     as_json, args = _flag(args, "--json")
     tag, args = _opt(args, "--tag")
+    if tag is None and "--tag" in args:
+        # A dangling --tag must not silently list everything.
+        print("Usage: groundhog attempt list [--all] [--tag TAG] [--json]")
+        return 1
     run = _resolve_run()
     if run is None:
         return 1
@@ -700,6 +704,8 @@ def _attempt_list(args):
         import json
         from groundhog.utils import queries
         rows = queries.attempt_table(history, scorer, only_done=not show_all)
+        if tag is not None:
+            rows = [r for r in rows if tag in _read_tags(history, r["id"])]
         print(json.dumps(rows, indent=2, default=str))
         return 0
 
@@ -765,6 +771,9 @@ def _attempt_show(args):
     cached = history.get_note(attempt.id, "score")
     if cached is not None:
         print(f"note[score]: {cached}   (mutable cache — canonical score is read-side)")
+    tags = _read_tags(history, attempt)
+    if tags:
+        print(f"tags:    {', '.join(tags)}")
     print(f"metadata: {attempt.metadata}")
     print()
     print("stages:")
@@ -1011,12 +1020,29 @@ def _attempt_best(args):
     return 0
 
 
+def _note_errors():
+    """What a note read/write can raise across backends — the CLI reports
+    these as messages, never tracebacks (GitError covers a broken repo,
+    OSError a broken sidecar)."""
+    from groundhog.histories.git import GitError
+    return (GitError, OSError, ValueError, KeyError)
+
+
 def _read_tags(history, attempt_or_id):
-    """Tags = the 'tags' note, comma-joined. Empty list when unset."""
-    raw = history.get_note(attempt_or_id, "tags")
-    if not raw:
-        return []
-    return [t for t in (part.strip() for part in raw.split(",")) if t]
+    """Tags, sorted. One note key per tag: ``tag-<name>`` = "1" (a "0" is an
+    untag tombstone). The legacy comma-joined "tags" note is still read; a
+    tombstone hides a legacy tag too."""
+    present = {}
+    legacy = history.get_note(attempt_or_id, "tags")
+    if legacy:
+        for part in legacy.split(","):
+            part = part.strip()
+            if part:
+                present[part] = True
+    for key, value in (history.list_notes(attempt_or_id) or {}).items():
+        if key.startswith("tag-") and len(key) > len("tag-"):
+            present[key[len("tag-"):]] = value == "1"
+    return sorted(tag for tag, on in present.items() if on)
 
 
 def _attempt_note(args):
@@ -1035,7 +1061,11 @@ def _attempt_note(args):
         return 1
 
     if len(args) == 2:
-        value = history.get_note(attempt, key)
+        try:
+            value = history.get_note(attempt, key)
+        except _note_errors() as e:
+            print(f"Could not read note: {e}")
+            return 1
         if value is None:
             print(f"(no note {key!r} on attempt {attempt_id})")
             return 1
@@ -1044,7 +1074,7 @@ def _attempt_note(args):
 
     try:
         history.set_note(attempt, key, args[2])
-    except (ValueError, KeyError) as e:
+    except _note_errors() as e:
         print(f"Could not set note: {e}")
         return 1
     print(f"note[{key}] = {args[2]}")
@@ -1052,7 +1082,9 @@ def _attempt_note(args):
 
 
 def _valid_tag(tag):
-    return bool(tag) and "," not in tag and not any(c.isspace() for c in tag)
+    """A tag must fit its note key (``tag-<name>``): [a-z0-9_-], short."""
+    import re
+    return bool(re.match(r"^[a-z0-9_-]{1,60}$", tag or ""))
 
 
 def _attempt_tag(args):
@@ -1061,7 +1093,7 @@ def _attempt_tag(args):
         return 1
     attempt_id, tag = args
     if not _valid_tag(tag):
-        print(f"Invalid tag {tag!r} (no commas or whitespace)")
+        print(f"Invalid tag {tag!r} (use lowercase [a-z0-9_-], max 60 chars)")
         return 1
     run = _resolve_run()
     if run is None:
@@ -1071,13 +1103,18 @@ def _attempt_tag(args):
     if attempt is None:
         print(f"No such attempt: {attempt_id}")
         return 1
-    tags = _read_tags(history, attempt)
-    if tag in tags:
-        print(f"Attempt {attempt_id} already tagged {tag!r}")
-        return 0
-    tags.append(tag)
-    history.set_note(attempt, "tags", ",".join(tags))
-    print(f"tags: {', '.join(tags)}")
+    try:
+        tags = _read_tags(history, attempt)
+        if tag in tags:
+            print(f"Attempt {attempt_id} already tagged {tag!r}")
+            return 0
+        # One key per tag — concurrent taggers touch different keys, so a
+        # lost update is impossible by construction.
+        history.set_note(attempt, f"tag-{tag}", "1")
+    except _note_errors() as e:
+        print(f"Could not tag: {e}")
+        return 1
+    print(f"tags: {', '.join(sorted(tags + [tag]))}")
     return 0
 
 
@@ -1086,6 +1123,9 @@ def _attempt_untag(args):
         print("Usage: groundhog attempt untag <id> <tag>")
         return 1
     attempt_id, tag = args
+    if not _valid_tag(tag):
+        print(f"Invalid tag {tag!r} (use lowercase [a-z0-9_-], max 60 chars)")
+        return 1
     run = _resolve_run()
     if run is None:
         return 1
@@ -1094,12 +1134,18 @@ def _attempt_untag(args):
     if attempt is None:
         print(f"No such attempt: {attempt_id}")
         return 1
-    tags = _read_tags(history, attempt)
-    if tag not in tags:
-        print(f"Attempt {attempt_id} is not tagged {tag!r}")
+    try:
+        tags = _read_tags(history, attempt)
+        if tag not in tags:
+            print(f"Attempt {attempt_id} is not tagged {tag!r}")
+            return 1
+        # Tombstone, not deletion: also hides the tag when it came from the
+        # legacy comma-joined note.
+        history.set_note(attempt, f"tag-{tag}", "0")
+    except _note_errors() as e:
+        print(f"Could not untag: {e}")
         return 1
     tags.remove(tag)
-    history.set_note(attempt, "tags", ",".join(tags))
     print(f"tags: {', '.join(tags) if tags else '(none)'}")
     return 0
 

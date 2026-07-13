@@ -1,7 +1,14 @@
 """Tests for attempt annotations: `groundhog attempt note/tag/untag` and the
 `attempt list --tag` filter. Parametrized over both store backends — the CLI
-reaches them through the same history get_note/set_note API.
+reaches them through the same history get_note/set_note/list_notes API.
+
+Tags are stored one note key per tag (``tag-<name>``), so concurrent taggers
+touch different keys and cannot lose each other's writes; the two-writer
+subprocess test proves that for the folder backend's shared notes.json.
 """
+
+import subprocess
+import sys
 
 import pytest
 
@@ -88,28 +95,72 @@ def test_tag_untag_roundtrip(run_dir, capsys):
         assert "keeper" in capsys.readouterr().out
         rc = attempt_group(["tag", aid, "baseline"])
         assert rc == 0
-        assert "keeper, baseline" in capsys.readouterr().out
+        assert "baseline, keeper" in capsys.readouterr().out
 
-        # Stored comma-joined under the "tags" note key.
+        # One note key per tag — no shared comma-joined value to race on.
         history = rundir.load_run(run_dir=run_dir).history
-        assert history.get_note(aid, "tags") == "keeper,baseline"
+        assert history.get_note(aid, "tag-keeper") == "1"
+        assert history.get_note(aid, "tag-baseline") == "1"
+        assert history.get_note(aid, "tags") is None
 
         # Idempotent.
         rc = attempt_group(["tag", aid, "keeper"])
         assert rc == 0
         assert "already tagged" in capsys.readouterr().out
-        history = rundir.load_run(run_dir=run_dir).history
-        assert history.get_note(aid, "tags") == "keeper,baseline"
 
         rc = attempt_group(["untag", aid, "keeper"])
         assert rc == 0
         capsys.readouterr()
         history = rundir.load_run(run_dir=run_dir).history
-        assert history.get_note(aid, "tags") == "baseline"
+        assert history.get_note(aid, "tag-keeper") == "0"  # tombstone
 
         rc = attempt_group(["untag", aid, "keeper"])
         assert rc == 1
         assert "not tagged" in capsys.readouterr().out
+
+
+def test_tags_read_legacy_comma_note(run_dir, capsys):
+    """Read-both-shapes shim: comma-joined "tags" notes written by older
+    versions still show, and a tombstone hides a legacy tag."""
+    with _in_dir(run_dir):
+        aid = _commit_one(run_dir, capsys)
+        history = rundir.load_run(run_dir=run_dir).history
+        history.set_note(aid, "tags", "old-one,old-two")
+
+        attempt_group(["tag", aid, "fresh"])
+        out = capsys.readouterr().out
+        assert "fresh, old-one, old-two" in out
+
+        rc = attempt_group(["list", "--tag", "old-one"])
+        assert rc == 0
+        assert aid[:8] in capsys.readouterr().out
+
+        rc = attempt_group(["untag", aid, "old-two"])
+        assert rc == 0
+        capsys.readouterr()
+        rc = attempt_group(["list", "--tag", "old-two"])
+        assert rc == 0
+        assert "No attempts tagged" in capsys.readouterr().out
+
+
+def test_show_lists_tags(run_dir, capsys):
+    with _in_dir(run_dir):
+        aid = _commit_one(run_dir, capsys)
+        attempt_group(["tag", aid, "keeper"])
+        capsys.readouterr()
+        rc = attempt_group(["show", aid])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "tags:    keeper" in out
+
+
+def test_list_rejects_dangling_tag_option(run_dir, capsys):
+    with _in_dir(run_dir):
+        _commit_one(run_dir, capsys)
+        rc = attempt_group(["list", "--tag"])
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "Usage" in out
 
 
 def test_tag_rejects_bad_tags(run_dir, capsys):
@@ -117,7 +168,46 @@ def test_tag_rejects_bad_tags(run_dir, capsys):
         aid = _commit_one(run_dir, capsys)
         assert attempt_group(["tag", aid, "a,b"]) == 1
         assert attempt_group(["tag", aid, "has space"]) == 1
+        assert attempt_group(["tag", aid, "UPPER"]) == 1
         assert attempt_group(["tag", "nope", "keeper"]) == 1
+
+
+def test_note_backend_failure_is_a_message_not_a_traceback(run_dir, capsys):
+    """A note channel that raises (broken repo/sidecar) surfaces as a clean
+    CLI message with exit 1."""
+    with _in_dir(run_dir):
+        aid = _commit_one(run_dir, capsys)
+        run = rundir.load_run(run_dir=run_dir)
+
+        def boom(*a, **k):
+            raise OSError("notes channel unavailable")
+
+        import groundhog.cli as cli_mod
+        original = cli_mod._resolve_run
+
+        class _BrokenHistory:
+            def get(self, attempt_id):
+                return run.history.get(attempt_id)
+            set_note = boom
+            def get_note(self, *a, **k):
+                raise OSError("notes channel unavailable")
+            def list_notes(self, *a, **k):
+                raise OSError("notes channel unavailable")
+
+        class _Run:
+            history = _BrokenHistory()
+            task = run.task
+            toolkit = run.toolkit
+            run_dir = run.run_dir
+
+        cli_mod._resolve_run = lambda args=None: _Run()
+        try:
+            assert attempt_group(["note", aid, "verdict", "x"]) == 1
+            assert "Could not set note" in capsys.readouterr().out
+            assert attempt_group(["tag", aid, "keeper"]) == 1
+            assert "Could not tag" in capsys.readouterr().out
+        finally:
+            cli_mod._resolve_run = original
 
 
 def test_list_tag_filter(run_dir, capsys):
@@ -167,3 +257,46 @@ def test_list_tag_filter_includes_failed_with_all(run_dir, capsys):
         assert rc == 0
         out = capsys.readouterr().out
         assert aid[:8] in out
+
+
+NOTE_WORKER = """
+import sys
+from pathlib import Path
+from groundhog.histories.folder import FolderAttemptHistory
+
+store, aid, name, n = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+h = FolderAttemptHistory(Path(store))
+for i in range(n):
+    h.set_note(aid, "tag-" + name + "-" + str(i), "1")
+"""
+
+N_KEYS = 30
+
+
+def test_concurrent_taggers_cannot_lose_each_other(tmp_path):
+    """Two processes writing distinct tag keys interleave on one notes.json;
+    set_note's locked read-modify-write must keep every key."""
+    from groundhog.histories.folder import FolderAttemptHistory
+
+    history = FolderAttemptHistory(tmp_path / "store")
+    ws = history.workspace()
+    (ws.path / "solution.py").write_text("def solve(): return 1",
+                                         encoding="utf-8")
+    attempt = ws.commit(success=True)
+
+    script = tmp_path / "worker.py"
+    script.write_text(NOTE_WORKER, encoding="utf-8")
+    procs = [
+        subprocess.Popen(
+            [sys.executable, str(script), str(tmp_path / "store"),
+             attempt.id, name, str(N_KEYS)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for name in ("a", "b")
+    ]
+    for p in procs:
+        _, err = p.communicate(timeout=180)
+        assert p.returncode == 0, err.decode("utf-8", "replace")
+
+    notes = history.list_notes(attempt.id)
+    expected = {f"tag-{w}-{i}" for w in ("a", "b") for i in range(N_KEYS)}
+    assert expected <= set(notes)
