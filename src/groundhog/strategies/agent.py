@@ -23,6 +23,7 @@ from groundhog.tools.attempt_logger import (
     AssistantEvent, LogEvent, MarkdownAttemptLogger,
     ToolCallEvent, UserEvent, eval_event,
 )
+from groundhog.utils.learnings_digest import LEARNINGS_SEED
 
 
 # --- Preflight probe ---
@@ -134,25 +135,6 @@ PHASE_TOOLS = {
 
 
 # --- Prompt templates ---
-
-LEARNINGS_SEED = """\
-# Learnings
-
-Notes from this attempt. Keep high signal-to-noise — only entries that would
-save time or prevent repeated mistakes (confirmed dead-ends, key thresholds,
-techniques with measurable gains). Skip speculation and anything obvious from the code.
-
-Write each learning as one directive line:
-[tried X] -> [because/observed Y] -> [next time do Z]
-
-Examples:
-- tried batch norm before every conv -> val acc dropped 0.90->0.86 (overfit) -> keep BN only after the first block
-- tried lr 1e-2 -> loss diverged to NaN by epoch 2 -> start at 1e-3 with warmup
-
-Prior attempts' notes are NOT auto-copied here. If you want context from
-earlier work, use the get-priors / list-prior / get-prior-file tools to
-read them on demand.
-"""
 
 
 # Human-readable sandbox contract injected into every phase prompt.

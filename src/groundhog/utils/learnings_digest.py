@@ -31,6 +31,28 @@ DIGEST_HEADER = "<!-- derived digest — rebuild with: groundhog learnings rebui
 
 ATTEMPT_LEARNINGS_FILENAME = "learnings.md"
 
+# The scratchpad seed agent strategies write into work/learnings.md. It
+# lives here (not in strategies/) because the ledger readers below must
+# strip it — utils importing strategies inverted the layering.
+LEARNINGS_SEED = """\
+# Learnings
+
+Notes from this attempt. Keep high signal-to-noise — only entries that would
+save time or prevent repeated mistakes (confirmed dead-ends, key thresholds,
+techniques with measurable gains). Skip speculation and anything obvious from the code.
+
+Write each learning as one directive line:
+[tried X] -> [because/observed Y] -> [next time do Z]
+
+Examples:
+- tried batch norm before every conv -> val acc dropped 0.90->0.86 (overfit) -> keep BN only after the first block
+- tried lr 1e-2 -> loss diverged to NaN by epoch 2 -> start at 1e-3 with warmup
+
+Prior attempts' notes are NOT auto-copied here. If you want context from
+earlier work, use the get-priors / list-prior / get-prior-file tools to
+read them on demand.
+"""
+
 DIGEST_SYSTEM_PROMPT = (
     "You maintain a distilled learnings digest for an iterative "
     "optimization run. Return only the digest entries, no preamble."
@@ -103,7 +125,10 @@ def rebuild_digest(history, path: Path | str, max_entries: int = 50, llm=None) -
         body = SEPARATOR.join(_tagged(item) for item in collected[:max_entries])
     else:
         body = _llm_digest(llm, collected, max_entries)
-    text = DIGEST_HEADER + ("\n\n" + body if body else "") + "\n"
+    # Header joins with the standard separator: glued to the first entry
+    # by a mere blank line, the comment rode into every prompt that
+    # embedded the digest's entries.
+    text = DIGEST_HEADER + (SEPARATOR + body if body else "") + "\n"
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text, encoding="utf-8")
@@ -165,7 +190,6 @@ def _llm_digest(llm, collected, max_entries: int) -> str:
 
 
 def _strip_seed(text: str) -> str:
-    from groundhog.strategies.agent import LEARNINGS_SEED
     stripped = text.strip()
     seed = LEARNINGS_SEED.strip()
     if stripped.startswith(seed):

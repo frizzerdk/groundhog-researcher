@@ -113,7 +113,7 @@ def test_attempt_learnings_reads_root_and_work_files():
 
 
 def test_attempt_learnings_strips_agent_seed():
-    from groundhog.strategies.agent import LEARNINGS_SEED
+    from groundhog.utils.learnings_digest import LEARNINGS_SEED
 
     with tempfile.TemporaryDirectory() as tmp:
         history = FolderAttemptHistory(Path(tmp))
@@ -207,6 +207,24 @@ def test_rebuild_digest_groups_by_family_and_keeps_failures():
                              text.index("rollout follow-up")]
         mcts_position = text.index("mcts insight")
         assert not (min(rollout_positions) < mcts_position < max(rollout_positions))
+
+
+def test_rebuild_digest_header_never_glues_into_entries():
+    """The header used to join the first entry with a bare blank line, so
+    every prompt embedding the digest carried the comment (remediation):
+    the header now joins with the standard separator and the reader drops
+    it as file furniture."""
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        _commit(history, learnings=["note a"], direction="rollout")
+
+        text = rebuild_digest(history, Path(tmp) / "learnings.md")
+        assert text.startswith(DIGEST_HEADER + SEPARATOR)
+
+        learnings = MarkdownLearnings(Path(tmp))
+        assert learnings.count() == 1
+        assert DIGEST_HEADER not in learnings.get()
+        assert DIGEST_HEADER not in learnings.get(last=1)
 
 
 def test_markdown_learnings_reads_rebuilt_digest_unchanged():
