@@ -20,6 +20,7 @@ from groundhog.utils.codegen import extract_code, build_prompt
 from groundhog.utils.direction import (
     direction_title, read_direction_from_attempt, write_direction,
 )
+from groundhog.utils.queries import safe_code, safe_result
 
 
 @dataclass
@@ -30,6 +31,12 @@ class ChallengeConfig(StrategyConfig):
     max_retries: int = param(3, "Max retry attempts when evaluation fails")
     learnings_last: int = param(20, "Most recent learnings to include in prompts")
     learnings_random: int = param(10, "Random older learnings to include for diversity")
+    exclude_failures: str = param(
+        "gate_failure,SyntaxError,NameError",
+        "Comma-separated mechanical-failure markers skipped at target "
+        "selection: 'gate_failure' matches gate-rejected attempts, any "
+        "other token matches substrings of the failed stage's errors — "
+        "such failures carry no assumption worth falsifying")
 
 
 @dataclass
@@ -38,6 +45,7 @@ class _Target:
     in-lineage) or "family" (a stale family, challenged fresh via its leader)."""
     kind: str
     attempt: object
+    code: str
     reason: Optional[str]
     direction: Optional[str]
 
@@ -61,22 +69,29 @@ class Challenge(Strategy):
         self.log.start(f"--- Challenge | {target.kind}=#{target.attempt.id}"
                        + (" | reason stated" if target.reason else ""))
         ws = self._start_workspace(toolkit, target)
-        self.logger.attempt_start(ws.path)
-        self.log.inline("diagnosing... ")
-        diagnosis = self._extract_assumption(toolkit, target)
-        self.log.tock()
-        self._prepare_workspace(toolkit, ws, diagnosis)
-        self.log.inline("attacking... ")
-        self._attack(toolkit, ws, target, diagnosis)
-        self.log.tock()
-        self.log.inline("evaluating... ")
-        result = self._evaluate(toolkit, ws)
-        self.log.tock()
-        self.log.inline("learnings... ")
-        self._record_learnings(toolkit, target, diagnosis, result)
-        self.log.tock()
-        attempt = self._finalize(toolkit, ws, result, target, diagnosis)
-        return self._build_log(attempt, target, diagnosis, result, toolkit)
+        # Anything raising past this point (LLM error, logger, user
+        # evaluator crash outside the retry net) must not leak an
+        # in-progress workspace dir.
+        try:
+            self.logger.attempt_start(ws.path)
+            self.log.inline("diagnosing... ")
+            diagnosis = self._extract_assumption(toolkit, target)
+            self.log.tock()
+            self._prepare_workspace(toolkit, ws, diagnosis)
+            self.log.inline("attacking... ")
+            self._attack(toolkit, ws, target, diagnosis)
+            self.log.tock()
+            self.log.inline("evaluating... ")
+            result = self._evaluate(toolkit, ws)
+            self.log.tock()
+            self.log.inline("learnings... ")
+            self._record_learnings(toolkit, target, diagnosis, result)
+            self.log.tock()
+            attempt = self._finalize(toolkit, ws, result, target, diagnosis)
+        except BaseException:
+            ws.abort()
+            raise
+        return self._build_log(attempt, target, diagnosis, result)
 
     # --- Init ---
 
@@ -86,6 +101,8 @@ class Challenge(Strategy):
         self.logger = getattr(toolkit, 'attempt_logger', None) or MarkdownAttemptLogger()
         self.through = getattr(toolkit, 'through', None)
         self.log = toolkit.log if hasattr(toolkit, 'log') else StrategyLog()
+        self._stages = toolkit.task.evaluator.eval_stages(
+            toolkit.task.data, through=self.through)
 
     # --- Target selection ---
 
@@ -107,7 +124,10 @@ class Challenge(Strategy):
         attempt = history.get(self.cfg.target)
         if attempt is None:
             return None
-        return _Target(kind="attempt", attempt=attempt,
+        code = safe_code(attempt)
+        if code is None:
+            return None
+        return _Target(kind="attempt", attempt=attempt, code=code,
                        reason=self._stated_reason(toolkit, attempt),
                        direction=read_direction_from_attempt(attempt))
 
@@ -118,10 +138,33 @@ class Challenge(Strategy):
                 continue
             if (a.metadata or {}).get("strategy") == self.name:
                 continue
-            targets.append(_Target(kind="attempt", attempt=a,
+            if self._mechanical_failure(a):
+                continue
+            code = safe_code(a)
+            if code is None:
+                continue
+            targets.append(_Target(kind="attempt", attempt=a, code=code,
                                    reason=self._stated_reason(toolkit, a),
                                    direction=read_direction_from_attempt(a)))
         return targets
+
+    def _mechanical_failure(self, attempt):
+        """A failure with no assumption to falsify: gate rejections and plain
+        coding errors. Challenging one probes the machinery, not a belief."""
+        tokens = [t.strip() for t in self.cfg.exclude_failures.split(",")
+                  if t.strip()]
+        if not tokens:
+            return False
+        if "gate_failure" in tokens and (attempt.metadata or {}).get("gate_failure"):
+            return True
+        result = safe_result(attempt)
+        if result is None or result.completed or not result.failed_stage:
+            return False
+        stage = result.stages.get(result.failed_stage)
+        if stage is None or not stage.errors:
+            return False
+        errors_text = str(stage.errors)
+        return any(tok in errors_text for tok in tokens if tok != "gate_failure")
 
     def _stale_family_targets(self, toolkit, history, challenged):
         window = self.cfg.staleness_window
@@ -129,14 +172,17 @@ class Challenge(Strategy):
         for family in history.derive_families():
             if len(family) <= window:
                 continue
-            scores = [self._score_result(a.result, toolkit) for a in family]
+            scores = [self._score_result(safe_result(a)) for a in family]
             if max(scores[-window:]) > max(scores[:-window]):
                 continue
             leader = family[scores.index(max(scores))]
             if leader.id in challenged:
                 continue
+            code = safe_code(leader)
+            if code is None:
+                continue
             direction = read_direction_from_attempt(leader)
-            targets.append(_Target(kind="family", attempt=leader,
+            targets.append(_Target(kind="family", attempt=leader, code=code,
                                    reason=self._reason_from_learnings(toolkit, leader, direction),
                                    direction=direction))
         return targets
@@ -145,17 +191,17 @@ class Challenge(Strategy):
         ids = set()
         for a in history.list(only_done=False):
             target = (a.metadata or {}).get("challenge_target") or {}
-            if target.get("attempt"):
+            if target.get("attempt") is not None:
                 ids.add(target["attempt"])
         return ids
 
     def _stated_reason(self, toolkit, attempt):
         meta = attempt.metadata or {}
-        for key in ("blocker", "parked_reason", "reason", "verdict", "gate_failure"):
+        for key in ("blocker", "parked_reason", "reason", "verdict"):
             if meta.get(key):
                 return str(meta[key])
-        result = attempt.result
-        if not result.completed and result.failed_stage:
+        result = safe_result(attempt)
+        if result is not None and not result.completed and result.failed_stage:
             stage = result.stages.get(result.failed_stage)
             if stage is not None and stage.errors:
                 return f"failed at '{result.failed_stage}': {stage.errors}"
@@ -192,7 +238,7 @@ class Challenge(Strategy):
         if target.reason:
             parts.append(f"Stated reason it is blocked/stalled:\n{target.reason}")
         parts.append(f"Recorded results:\n{self._describe_result(target.attempt)}")
-        parts.append(f"## Target code\n```python\n{target.attempt.code}\n```")
+        parts.append(f"## Target code\n```python\n{target.code}\n```")
         if learnings:
             parts.append(f"## Learnings\n{learnings}")
         parts.append(
@@ -220,8 +266,11 @@ class Challenge(Strategy):
     def _parse_diagnosis(text):
         fields = {}
         current = None
+        # Tolerates markdown bolding: **BLOCKER**: and **BLOCKER:** alike.
+        pattern = re.compile(
+            r"^\s*\*{0,2}(BLOCKER|EVIDENCE|PLAN)\*{0,2}\s*:\s*\*{0,2}\s*(.*)$")
         for line in text.splitlines():
-            m = re.match(r"^\s*(BLOCKER|EVIDENCE|PLAN)\s*:\s*(.*)$", line)
+            m = pattern.match(line)
             if m:
                 current = m.group(1).lower()
                 fields[current] = m.group(2).strip()
@@ -235,7 +284,9 @@ class Challenge(Strategy):
         }
 
     def _describe_result(self, attempt):
-        result = attempt.result
+        result = safe_result(attempt)
+        if result is None:
+            return "(no recorded result)"
         lines = []
         if not result.completed:
             lines.append(f"FAILED at stage '{result.failed_stage}'.")
@@ -278,7 +329,7 @@ class Challenge(Strategy):
             parts.append(f"## Evidence for the blocker\n{diagnosis['evidence']}")
         if diagnosis["plan"]:
             parts.append(f"## Falsification plan\n{diagnosis['plan']}")
-        parts.append(f"## Code that hit the blocker\n```python\n{target.attempt.code}\n```")
+        parts.append(f"## Code that hit the blocker\n```python\n{target.code}\n```")
         if learnings:
             parts.append(f"## Learnings\n{learnings}")
         prompt = "\n\n".join(parts)
@@ -306,7 +357,7 @@ class Challenge(Strategy):
             if not (ws.path / "solution.py").exists():
                 (ws.path / "solution.py").write_text("# no code generated", encoding="utf-8")
             result = toolkit.task.evaluate(ws.path, through=self.through)
-            self.logger.log(eval_event(result, self._score_result(result, toolkit)))
+            self.logger.log(eval_event(result, self._score_result(result)))
 
             if result.completed:
                 return result
@@ -347,7 +398,7 @@ class Challenge(Strategy):
             return
 
         if result.completed:
-            outcome = f"completed with score {self._score_result(result, toolkit):.4f}"
+            outcome = f"completed with score {self._score_result(result):.4f}"
         else:
             stage = result.stages.get(result.failed_stage)
             outcome = f"failed at '{result.failed_stage}': {stage.errors if stage else 'unknown'}"
@@ -393,22 +444,21 @@ class Challenge(Strategy):
 
     # --- Scoring ---
 
-    def _score_result(self, result, toolkit):
-        if not result.completed:
+    def _score_result(self, result):
+        if result is None or not result.completed:
             return -1.0
-        stages = toolkit.task.evaluator.eval_stages(toolkit.task.data, through=self.through)
-        final_name = stages[-1].name
-        final_result = result.stages.get(final_name)
-        return stages[-1].score(final_result) if final_result else -1.0
+        final_stage = self._stages[-1]
+        final_result = result.stages.get(final_stage.name)
+        return final_stage.score(final_result) if final_result else -1.0
 
     # --- Logging ---
 
-    def _build_log(self, attempt, target, diagnosis, result, toolkit):
+    def _build_log(self, attempt, target, diagnosis, result):
         return {
             "attempt": attempt.id,
             "target": target.attempt.id,
             "kind": target.kind,
             "assumption": diagnosis["blocker"],
-            "score": round(self._score_result(result, toolkit), 4),
+            "score": round(self._score_result(result), 4),
             "strategy": self.name,
         }
