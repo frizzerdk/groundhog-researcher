@@ -209,6 +209,14 @@ class SemanticIndex:
     def exists(self) -> bool:
         return self.cache_path.exists()
 
+    def _corpus_fingerprint(self) -> int:
+        """Cheap staleness signal: the committed-attempt count. A cache built
+        before new commits must not silently rank them last while claiming
+        semantic order."""
+        if self.history is None:
+            return 0
+        return len(self.history.list(only_done=False))
+
     def rebuild(self) -> int:
         """Re-derive the index from the store. Returns the chunk count."""
         chunks = chunk_corpus(iter_corpus(self.root, self.history))
@@ -216,7 +224,8 @@ class SemanticIndex:
         if hasattr(self.embedder, "fit"):
             self.embedder.fit(texts)
         vectors = self.embedder.embed(texts) if texts else []
-        meta = {"kind": "meta", "embedder": self.embedder.name}
+        meta = {"kind": "meta", "embedder": self.embedder.name,
+                "corpus_n": self._corpus_fingerprint()}
         if hasattr(self.embedder, "state"):
             meta["state"] = self.embedder.state()
         lines = [json.dumps(meta)]
@@ -232,7 +241,9 @@ class SemanticIndex:
         return len(records)
 
     def load(self) -> bool:
-        """Load the cache. False when absent; ValueError on embedder mismatch."""
+        """Load the cache. False when absent or stale (corpus grew/shrank
+        since the rebuild — checkable only when a history is attached);
+        ValueError on embedder mismatch."""
         if not self.exists():
             return False
         records = []
@@ -249,6 +260,9 @@ class SemanticIndex:
         except (OSError, ValueError):
             return False
         if meta is None:
+            return False
+        if self.history is not None \
+                and meta.get("corpus_n") != self._corpus_fingerprint():
             return False
         if meta.get("embedder") != self.embedder.name:
             raise ValueError(

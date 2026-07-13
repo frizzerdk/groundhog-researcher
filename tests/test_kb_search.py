@@ -209,3 +209,60 @@ def test_corrupt_cache_falls_back_to_lexical_order(run):
     out = search_attempts(toolkit, "dropout")
     assert "semantic rank" not in out.splitlines()[0]
     assert "dropout" in out.lower()
+
+
+# === Staleness fingerprint + explicit rebuild ===
+
+def test_stale_index_skips_semantic_rank_until_rebuilt(run):
+    """An index built before new commits must not claim semantic order (it
+    would silently sort post-rebuild attempts last). The corpus fingerprint
+    detects the mismatch; an explicit rebuild re-enables ranking."""
+    toolkit, _, _ = run
+    SemanticIndex(toolkit.path, toolkit.history).rebuild()
+    assert "semantic rank" in search_attempts(toolkit, "dropout").splitlines()[0]
+
+    a3 = _commit(toolkit.history,
+                 direction="Ensemble of small models with bagging")
+    out = search_attempts(toolkit, "dropout")
+    assert "semantic rank" not in out.splitlines()[0]
+
+    tools = {t.name: t for t in build_default_agent_tools(toolkit)}
+    assert "rebuild-kb-index" in tools
+    result = tools["rebuild-kb-index"].execute()
+    assert result.success
+    assert "rebuilt" in result.output
+
+    ranked = search_attempts(toolkit, "bagging")
+    assert "semantic rank" in ranked.splitlines()[0]
+    assert f"attempt_{a3.id}" in ranked
+
+
+def test_custom_toolkit_embedder_is_used_by_search_and_rebuild(run):
+    toolkit, _, _ = run
+
+    class Counting(TfidfEmbedder):
+        name = "counting-v1"
+        calls = []
+
+        def embed(self, texts):
+            Counting.calls.append(len(texts))
+            return super().embed(texts)
+
+    toolkit.embedder = Counting()
+    tools = {t.name: t for t in build_default_agent_tools(toolkit)}
+    assert tools["rebuild-kb-index"].execute().success
+    assert Counting.calls  # rebuild embedded through the custom embedder
+
+    # The shipped search tool loads the custom-embedder cache (the TF-IDF
+    # default would refuse it as a mismatch).
+    out = search_attempts(toolkit, "dropout regularization")
+    assert "semantic rank" in out.splitlines()[0]
+
+
+def test_agent_supplied_regex_is_length_capped(run):
+    toolkit, _, _ = run
+    huge = "(a+)+" * 5000
+    out = search_attempts(toolkit, huge)
+    assert out.startswith("(no hits")  # capped + compiled, no crash
+    long_literal = "dropout" + " " * 600
+    assert search_attempts(toolkit, long_literal) is not None
