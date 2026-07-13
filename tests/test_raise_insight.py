@@ -145,3 +145,29 @@ def test_no_started_log_skips_event_but_appends_file():
             content, re.MULTILINE)
         assert not (ws.path / "attemptlog.jsonl").exists()
         ws.abort()
+
+
+def test_non_utf8_byte_does_not_kill_the_channel():
+    """The append never reads the file back, so one stray non-UTF8 byte
+    (e.g. from a crashed agent) can't permanently break raise-insight."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tk = _tk(tmp)
+        tool = _tool(tk)
+        (tk.path / "insights.md").write_bytes(b"## old entry\n\xff\xfe garbage\n")
+        res = tool.execute(text="still works")
+        assert res.success, res.error
+        raw = (tk.path / "insights.md").read_bytes()
+        assert b"\xff\xfe garbage" in raw  # prior bytes untouched
+        assert b"still works" in raw
+        assert b"---" in raw  # separator present (platform newlines vary)
+
+
+def test_text_is_capped_at_the_tool_boundary():
+    with tempfile.TemporaryDirectory() as tmp:
+        tk = _tk(tmp)
+        tool = _tool(tk)
+        res = tool.execute(text="x" * 100_000)
+        assert res.success, res.error
+        content = _insights(tk)
+        assert len(content) < 10_000
+        assert "[truncated]" in content

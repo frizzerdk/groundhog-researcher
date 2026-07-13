@@ -211,6 +211,7 @@ def check_gates(toolkit) -> str:
 
 
 INSIGHT_KINDS = ("insight", "tool-request", "blocker", "idea")
+_INSIGHT_MAX_CHARS = 4000
 
 
 def raise_insight(toolkit, kind: str = "insight", text: str = "") -> str:
@@ -225,6 +226,8 @@ def raise_insight(toolkit, kind: str = "insight", text: str = "") -> str:
     text = (text or "").strip()
     if not text:
         return "raise-insight: nothing recorded (text was empty)."
+    if len(text) > _INSIGHT_MAX_CHARS:
+        text = text[:_INSIGHT_MAX_CHARS].rstrip() + "\n[truncated]"
     kind = (kind or "").strip().lower() or "insight"
     if kind not in INSIGHT_KINDS:
         kind = "insight"  # unknown kinds fold into a plain insight, never rejected
@@ -273,16 +276,19 @@ def _insight_phase(toolkit):
 
 
 def _append_insight(path, entry):
-    """Learnings-style append: entries joined by a --- rule, one file per run."""
+    """Learnings-style append: entries joined by a --- rule, one file per run.
+
+    A true O(1) append — never reads the existing file, so one stray
+    non-UTF8 byte can't permanently kill the channel, and a crash mid-write
+    can't lose prior entries the way the old whole-file rewrite could.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    if existing.strip():
-        path.write_text(
-            existing.rstrip() + "\n\n---\n\n" + entry.strip() + "\n",
-            encoding="utf-8")
-    else:
-        path.write_text(entry.strip() + "\n", encoding="utf-8")
+    nonempty = path.exists() and path.stat().st_size > 0
+    with open(path, "a", encoding="utf-8") as f:
+        if nonempty:
+            f.write("\n---\n\n")
+        f.write(entry.strip() + "\n")
 
 
 def _log_insight_event(toolkit, kind, text, ws_id, phase):
