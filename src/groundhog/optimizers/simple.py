@@ -1,6 +1,7 @@
 """Simple optimizer: weighted strategy rotation, potential-based prior selection."""
 
 import copy
+import json
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from itertools import cycle
@@ -592,6 +593,8 @@ class SimpleOptimizer(Optimizer):
         best_str = f"Best: {best_score:.4f}" if best_score is not None else "No successful attempts"
         print(f"{best_str}  Total cost: ${total_cost:.4f}")
 
+    ROTATION_STATE_FILENAME = "rotation_state.json"
+
     def _next_dispatch(self, rotation):
         """Pick the next (strategy, config, queue_label) — queue overrides rotation."""
         queue_item = read_queue(self.path)
@@ -606,7 +609,36 @@ class SimpleOptimizer(Optimizer):
             with self._print_lock:
                 self.toolkit.log.info(
                     f"[queue] unknown strategy: {strategy_name}, skipping")
-        return next(rotation), None, ""
+        return self._next_rotation(rotation), None, ""
+
+    def _next_rotation(self, rotation):
+        """Advance the rotation with the schedule position PERSISTED in the
+        run dir (``rotation_state.json``, beside queue.json), so chunked
+        ``groundhog run`` invocations continue the rotation instead of
+        restarting it at slot 0 every time (a real run produced 52/54
+        Improve because the cursor reset per invocation).
+
+        Semantics: the position is stored modulo the schedule length —
+        deleting the file (or changing the schedule) restarts the rotation
+        at the schedule start, nothing else. Read-advance-write holds the
+        cross-process file lock (utils.fileio.locked) and the write is
+        atomic, matching the shared-state lock discipline. Queue-served
+        iterations never advance the cursor. A toolkit without a run path
+        falls back to the in-memory cycle."""
+        if getattr(self.toolkit, "path", None) is None:
+            return next(rotation)
+        from groundhog.utils.fileio import atomic_write_text, locked
+        state_path = self.path / self.ROTATION_STATE_FILENAME
+        with locked(state_path):
+            try:
+                pos = int(json.loads(
+                    state_path.read_text(encoding="utf-8"))["position"])
+            except (OSError, ValueError, KeyError, TypeError):
+                pos = 0
+            strategy = self._schedule[pos % len(self._schedule)]
+            atomic_write_text(state_path, json.dumps(
+                {"position": (pos + 1) % len(self._schedule)}))
+        return strategy
 
     def _run_serial(self, n, scorer, best_score, total_cost):
         rotation = cycle(self._schedule)
