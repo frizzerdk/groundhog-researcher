@@ -124,6 +124,24 @@ def test_run_summary(history_factory, commit_attempt):
     json.dumps(s)
 
 
+def test_reads_exclude_open_workspaces(open_workspace_alongside):
+    """A run mid-flight: the open workspace is not a fact of the run yet, so
+    no read-layer view may count it (the phantom-attempt regression)."""
+    run = open_workspace_alongside
+    committed_ids = {a.id for a in run.committed}
+
+    table = queries.attempt_table(run.history, scorer)
+    assert {r["id"] for r in table} == committed_ids
+    assert all(r["status"] in ("done", "fail") for r in table)
+
+    fams = queries.families(run.history, scorer)
+    assert {m for f in fams for m in f["members"]} == committed_ids
+
+    s = queries.run_summary(run.history, scorer)
+    assert s["n_attempts"] == len(committed_ids)
+    assert s["n_done"] + s["n_failed"] == s["n_attempts"]
+
+
 def test_run_summary_empty(history_factory):
     h = history_factory()
     s = queries.run_summary(h, scorer)

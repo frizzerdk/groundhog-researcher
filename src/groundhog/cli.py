@@ -445,19 +445,22 @@ def set_prefer_tier(args):
 
 
 def cmd_report(args):
-    """`groundhog report [--out PATH]` — write a run-state markdown report.
+    """`groundhog report [--out PATH] [--no-llm]` — write a run-state
+    markdown report.
 
     Data-only by default; when the run's toolkit carries an LLM, one cheap
-    default-tier pass adds a short narrative on top. ``--out -`` prints to
-    stdout instead of writing a file.
+    default-tier pass adds a short narrative on top (``--no-llm`` skips it).
+    ``--out -`` prints to stdout; a relative ``--out`` resolves against the
+    run dir, like the default path.
     """
+    no_llm, args = _flag(args, "--no-llm")
     out_arg, args = _opt(args, "--out")
     if args and args[0] in ("-h", "--help"):
-        print("Usage: groundhog report [--out reports/state.md]")
+        print("Usage: groundhog report [--out reports/state.md] [--no-llm]")
         print("       groundhog report --out -      (print to stdout)")
         return 0
     if args:
-        print("Usage: groundhog report [--out reports/state.md]")
+        print("Usage: groundhog report [--out reports/state.md] [--no-llm]")
         return 1
 
     run = _resolve_run()
@@ -468,7 +471,7 @@ def cmd_report(args):
     from groundhog.tools import report as report_mod
     data = report_mod.gather(run.history, scorer)
     narrative = None
-    llm = getattr(run.toolkit, "llm", None)
+    llm = None if no_llm else getattr(run.toolkit, "llm", None)
     if llm is not None:
         narrative = report_mod.narrative(llm, data)
     text = report_mod.render_markdown(run.task.name, data, narrative)
@@ -476,7 +479,12 @@ def cmd_report(args):
     if out_arg == "-":
         print(text)
         return 0
-    out_path = Path(out_arg) if out_arg else (run.run_dir / "reports" / "state.md")
+    if out_arg:
+        out_path = Path(out_arg)
+        if not out_path.is_absolute():
+            out_path = run.run_dir / out_path
+    else:
+        out_path = run.run_dir / "reports" / "state.md"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(text, encoding="utf-8")
     print(f"Wrote {out_path}")
@@ -616,6 +624,24 @@ def attempt_group(args):
     return handler(rest)
 
 
+def _json_out(obj) -> str:
+    """JSON for machine consumers. A scorer can produce NaN/Inf, which
+    json.dumps would emit as invalid JSON — normalize them to null."""
+    import json
+    import math
+
+    def clean(v):
+        if isinstance(v, float) and not math.isfinite(v):
+            return None
+        if isinstance(v, dict):
+            return {k: clean(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [clean(x) for x in v]
+        return v
+
+    return json.dumps(clean(obj), indent=2, default=str)
+
+
 def _flag(args, name):
     """Pop a boolean flag; return (present, remaining_args)."""
     present = name in args
@@ -691,6 +717,10 @@ def _attempt_list(args):
     show_all, args = _flag(args, "--all")
     as_json, args = _flag(args, "--json")
     tag, args = _opt(args, "--tag")
+    if tag is None and "--tag" in args:
+        # A dangling --tag must not silently list everything.
+        print("Usage: groundhog attempt list [--all] [--tag TAG] [--json]")
+        return 1
     run = _resolve_run()
     if run is None:
         return 1
@@ -698,10 +728,11 @@ def _attempt_list(args):
     scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
 
     if as_json:
-        import json
         from groundhog.utils import queries
         rows = queries.attempt_table(history, scorer, only_done=not show_all)
-        print(json.dumps(rows, indent=2, default=str))
+        if tag is not None:
+            rows = [r for r in rows if tag in _read_tags(history, r["id"])]
+        print(_json_out(rows))
         return 0
 
     attempts = history.list(only_done=not show_all)
@@ -742,11 +773,10 @@ def _attempt_show(args):
         return 1
 
     if as_json and file_arg is None:
-        import json
         from groundhog.utils import queries
         scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
         detail = queries.attempt_detail(history, attempt_id, scorer)
-        print(json.dumps(detail, indent=2, default=str))
+        print(_json_out(detail))
         return 0
 
     if file_arg is not None:
@@ -754,7 +784,12 @@ def _attempt_show(args):
         if content is None:
             print(f"No such file in attempt {attempt_id}: {file_arg}")
             return 1
-        print(content)
+        if as_json:
+            # Both flags honored: the file, wrapped for machine consumers.
+            print(_json_out({"attempt": attempt.id, "file": file_arg,
+                             "content": content}))
+        else:
+            print(content)
         return 0
 
     scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
@@ -766,6 +801,9 @@ def _attempt_show(args):
     cached = history.get_note(attempt.id, "score")
     if cached is not None:
         print(f"note[score]: {cached}   (mutable cache — canonical score is read-side)")
+    tags = _read_tags(history, attempt)
+    if tags:
+        print(f"tags:    {', '.join(tags)}")
     print(f"metadata: {attempt.metadata}")
     print()
     print("stages:")
@@ -1007,12 +1045,29 @@ def _attempt_best(args):
     return 0
 
 
+def _note_errors():
+    """What a note read/write can raise across backends — the CLI reports
+    these as messages, never tracebacks (GitError covers a broken repo,
+    OSError a broken sidecar)."""
+    from groundhog.histories.git import GitError
+    return (GitError, OSError, ValueError, KeyError)
+
+
 def _read_tags(history, attempt_or_id):
-    """Tags = the 'tags' note, comma-joined. Empty list when unset."""
-    raw = history.get_note(attempt_or_id, "tags")
-    if not raw:
-        return []
-    return [t for t in (part.strip() for part in raw.split(",")) if t]
+    """Tags, sorted. One note key per tag: ``tag-<name>`` = "1" (a "0" is an
+    untag tombstone). The legacy comma-joined "tags" note is still read; a
+    tombstone hides a legacy tag too."""
+    present = {}
+    legacy = history.get_note(attempt_or_id, "tags")
+    if legacy:
+        for part in legacy.split(","):
+            part = part.strip()
+            if part:
+                present[part] = True
+    for key, value in (history.list_notes(attempt_or_id) or {}).items():
+        if key.startswith("tag-") and len(key) > len("tag-"):
+            present[key[len("tag-"):]] = value == "1"
+    return sorted(tag for tag, on in present.items() if on)
 
 
 def _attempt_note(args):
@@ -1031,7 +1086,11 @@ def _attempt_note(args):
         return 1
 
     if len(args) == 2:
-        value = history.get_note(attempt, key)
+        try:
+            value = history.get_note(attempt, key)
+        except _note_errors() as e:
+            print(f"Could not read note: {e}")
+            return 1
         if value is None:
             print(f"(no note {key!r} on attempt {attempt_id})")
             return 1
@@ -1040,7 +1099,7 @@ def _attempt_note(args):
 
     try:
         history.set_note(attempt, key, args[2])
-    except (ValueError, KeyError) as e:
+    except _note_errors() as e:
         print(f"Could not set note: {e}")
         return 1
     print(f"note[{key}] = {args[2]}")
@@ -1048,7 +1107,9 @@ def _attempt_note(args):
 
 
 def _valid_tag(tag):
-    return bool(tag) and "," not in tag and not any(c.isspace() for c in tag)
+    """A tag must fit its note key (``tag-<name>``): [a-z0-9_-], short."""
+    import re
+    return bool(re.match(r"^[a-z0-9_-]{1,60}$", tag or ""))
 
 
 def _attempt_tag(args):
@@ -1057,7 +1118,7 @@ def _attempt_tag(args):
         return 1
     attempt_id, tag = args
     if not _valid_tag(tag):
-        print(f"Invalid tag {tag!r} (no commas or whitespace)")
+        print(f"Invalid tag {tag!r} (use lowercase [a-z0-9_-], max 60 chars)")
         return 1
     run = _resolve_run()
     if run is None:
@@ -1067,13 +1128,18 @@ def _attempt_tag(args):
     if attempt is None:
         print(f"No such attempt: {attempt_id}")
         return 1
-    tags = _read_tags(history, attempt)
-    if tag in tags:
-        print(f"Attempt {attempt_id} already tagged {tag!r}")
-        return 0
-    tags.append(tag)
-    history.set_note(attempt, "tags", ",".join(tags))
-    print(f"tags: {', '.join(tags)}")
+    try:
+        tags = _read_tags(history, attempt)
+        if tag in tags:
+            print(f"Attempt {attempt_id} already tagged {tag!r}")
+            return 0
+        # One key per tag — concurrent taggers touch different keys, so a
+        # lost update is impossible by construction.
+        history.set_note(attempt, f"tag-{tag}", "1")
+    except _note_errors() as e:
+        print(f"Could not tag: {e}")
+        return 1
+    print(f"tags: {', '.join(sorted(tags + [tag]))}")
     return 0
 
 
@@ -1082,6 +1148,9 @@ def _attempt_untag(args):
         print("Usage: groundhog attempt untag <id> <tag>")
         return 1
     attempt_id, tag = args
+    if not _valid_tag(tag):
+        print(f"Invalid tag {tag!r} (use lowercase [a-z0-9_-], max 60 chars)")
+        return 1
     run = _resolve_run()
     if run is None:
         return 1
@@ -1090,12 +1159,18 @@ def _attempt_untag(args):
     if attempt is None:
         print(f"No such attempt: {attempt_id}")
         return 1
-    tags = _read_tags(history, attempt)
-    if tag not in tags:
-        print(f"Attempt {attempt_id} is not tagged {tag!r}")
+    try:
+        tags = _read_tags(history, attempt)
+        if tag not in tags:
+            print(f"Attempt {attempt_id} is not tagged {tag!r}")
+            return 1
+        # Tombstone, not deletion: also hides the tag when it came from the
+        # legacy comma-joined note.
+        history.set_note(attempt, f"tag-{tag}", "0")
+    except _note_errors() as e:
+        print(f"Could not untag: {e}")
         return 1
     tags.remove(tag)
-    history.set_note(attempt, "tags", ",".join(tags))
     print(f"tags: {', '.join(tags) if tags else '(none)'}")
     return 0
 
@@ -1144,8 +1219,6 @@ def cmd_eval(args):
         return per_stage.get(name, scorer)(stage)
 
     if as_json:
-        import json
-
         out = {
             "completed": result.completed,
             "failed_stage": result.failed_stage,
@@ -1161,7 +1234,7 @@ def cmd_eval(args):
                 for name, stage in result.stages.items()
             },
         }
-        print(json.dumps(out, indent=2, default=str))
+        print(_json_out(out))
     else:
         for name, stage in result.stages.items():
             print(f"[{name}] score={_stage_score(name, stage):.4f}")
@@ -1196,31 +1269,13 @@ def cmd_summary(args):
     history, task = run.history, run.task
     scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
 
-    from groundhog.utils import queries
-    summary = queries.run_summary(history, scorer)
-    fams = queries.families(history, scorer)
-
     if as_json:
-        import json
-        print(json.dumps({"summary": summary, "families": fams},
-                         indent=2, default=str))
+        from groundhog.utils import queries
+        print(_json_out({"summary": queries.run_summary(history, scorer),
+                         "families": queries.families(history, scorer)}))
         return 0
 
-    print(f"attempts: {summary['n_attempts']} "
-          f"({summary['n_done']} done, {summary['n_failed']} failed)")
-    best = summary["best"]
-    if best is not None:
-        print(f"best:     {_short(best['id'])} score={best['score']:.4f} "
-              f"{best['name']}")
-    print(f"families: {summary['n_families']}")
-    print(f"cost:     ${summary['total_cost']:.4f}")
-    if fams:
-        print()
-        print(f"{'family':<40} {'n':<4} {'best':<10} best score")
-        for f in fams:
-            score_str = f"{f['best_score']:.4f}" if f["best_score"] is not None else "-"
-            print(f"{f['family_name']:<40} {len(f['members']):<4} "
-                  f"{_short(f['best_id']):<10} {score_str}")
+    _print_run_overview(history, scorer)
     return 0
 
 
@@ -1277,6 +1332,9 @@ def cmd_run(args):
     if args and args[0] in ("-h", "--help"):
         print("Usage: groundhog run [N]   Run N optimizer iterations (default 10)")
         return 0
+    if len(args) > 1:
+        print("Usage: groundhog run [N]")
+        return 1
     n = 10
     if args:
         try:
@@ -1284,32 +1342,68 @@ def cmd_run(args):
         except ValueError:
             print(f"N must be an integer, got {args[0]!r}")
             return 1
+        if n < 1:
+            print(f"N must be a positive integer, got {n}")
+            return 1
 
     run = _resolve_run()
     if run is None:
         return 1
-    try:
-        optimizer, chosen = _resolve_optimizer(run)
-    except Exception as e:  # noqa: BLE001 — user code, surface cleanly
-        print(f"Could not resolve an optimizer: {e}")
-        return 1
-    print(f"Optimizer: {chosen}")
 
     import os
+    import traceback
     saved = os.getcwd()
     try:
-        # task.py __main__ runs from the run dir; give the optimizer the
-        # same footing (relative artifact paths, queue.json siblings).
+        # task.py __main__ runs from the run dir; give build_optimizer AND
+        # the optimizer the same footing (relative artifact paths,
+        # queue.json siblings) — user hooks that read the cwd must not see
+        # the invocation directory.
         os.chdir(run.run_dir)
-        optimizer.run(n=n)
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    except Exception as e:  # noqa: BLE001
-        print(f"Run failed: {e}")
-        return 1
+        try:
+            optimizer, chosen = _resolve_optimizer(run)
+        except Exception as e:  # noqa: BLE001 — user code, keep the evidence
+            print(f"Could not resolve an optimizer: {e}")
+            traceback.print_exc()
+            return 1
+        print(f"Optimizer: {chosen}")
+        try:
+            optimizer.run(n=n)
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+            return 130
+        except Exception as e:  # noqa: BLE001 — user code, keep the evidence
+            print(f"Run failed: {e}")
+            traceback.print_exc()
+            return 1
     finally:
         os.chdir(saved)
     return 0
+
+
+def _print_run_overview(history, scorer):
+    """The shared status/summary header: totals, best, families — all from
+    the read layer (utils/queries), which counts committed attempts only."""
+    from groundhog.utils import queries
+
+    summary = queries.run_summary(history, scorer)
+    fams = queries.families(history, scorer)
+
+    print(f"attempts: {summary['n_attempts']} "
+          f"({summary['n_done']} done, {summary['n_failed']} failed)")
+    best = summary["best"]
+    if best is not None:
+        print(f"best:     {_short(best['id'])} score={best['score']:.4f} "
+              f"{best['name']}")
+    print(f"families: {summary['n_families']}")
+    print(f"cost:     ${summary['total_cost']:.4f}")
+    if fams:
+        print()
+        print(f"{'family':<40} {'n':<4} {'best':<10} best score")
+        for f in fams:
+            score_str = (f"{f['best_score']:.4f}"
+                         if f["best_score"] is not None else "-")
+            print(f"{f['family_name']:<40} {len(f['members']):<4} "
+                  f"{_short(f['best_id']):<10} {score_str}")
 
 
 def cmd_status(args):
@@ -1326,40 +1420,7 @@ def cmd_status(args):
     history, task = run.history, run.task
     scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
 
-    committed = [a for a in history.list(only_done=False)
-                 if a.status in ("done", "fail")]
-    done = [a for a in committed if a.status == "done"]
-    failed = [a for a in committed if a.status == "fail"]
-    print(f"attempts: {len(committed)} ({len(done)} done, {len(failed)} failed)")
-
-    best = history.best(scorer) if done else None
-    if best is not None:
-        print(f"best:     {_short(best.id)} score={_attempt_score(best, scorer):.4f} "
-              f"{best.name}")
-
-    def _cost(a):
-        try:
-            return float(a.metadata.get("cost", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    families = history.derive_families()
-    print(f"families: {len(families)}")
-    print(f"cost:     ${sum(_cost(a) for a in committed):.4f}")
-
-    if families:
-        from groundhog.utils.direction import (
-            direction_title, read_direction_from_attempt,
-        )
-        print()
-        print(f"{'family':<40} {'n':<4} {'best':<10} best score")
-        for members in families:
-            title = direction_title(read_direction_from_attempt(members[0]) or "")
-            best_member = max(members, key=lambda a: _attempt_score(a, scorer))
-            best_score = _attempt_score(best_member, scorer)
-            score_str = f"{best_score:.4f}" if best_score > -1.0 else "-"
-            print(f"{title:<40} {len(members):<4} "
-                  f"{_short(best_member.id):<10} {score_str}")
+    _print_run_overview(history, scorer)
 
     items = history.list_in_progress()
     print()
@@ -1863,22 +1924,16 @@ def queue_group(args):
         print(usage)
         return 1
 
-    import json
+    from groundhog.tools.queue import QueueCorrupt
+    from groundhog.tools.queue import add as queue_add
+    from groundhog.tools.queue import clear as queue_clear
+    from groundhog.tools.queue import read_items
 
     run = _resolve_run()
     if run is None:
         return 1
     queue_root = Path(getattr(run.toolkit, "path", None) or run.run_dir)
     queue_file = queue_root / "queue.json"
-
-    def read_items():
-        if not queue_file.exists():
-            return []
-        try:
-            items = json.loads(queue_file.read_text(encoding="utf-8"))
-        except ValueError:
-            return []
-        return items if isinstance(items, list) else []
 
     if sub == "add":
         config = {}
@@ -1899,15 +1954,23 @@ def queue_group(args):
             print("Usage: groundhog queue add <strategy> [--set k=v ...]")
             return 1
         strategy = positional[0]
-        from groundhog.tools.queue import add as queue_add
-        queue_add(queue_root, strategy, config, source="user")
-        position = len(read_items())
+        try:
+            position = queue_add(queue_root, strategy, config, source="user")
+        except QueueCorrupt as e:
+            print(f"Cannot add: {e}")
+            print("Fix the file, or drop it with: groundhog queue clear")
+            return 1
         config_str = f" config={config}" if config else ""
         print(f"Queued {strategy} at position {position}{config_str}")
         return 0
 
     if sub == "list":
-        items = read_items()
+        try:
+            items = read_items(queue_file)
+        except QueueCorrupt as e:
+            print(f"Queue file unreadable: {e}")
+            print("Fix the file, or drop it with: groundhog queue clear")
+            return 1
         if not items:
             print("Queue is empty.")
             return 0
@@ -1920,13 +1983,11 @@ def queue_group(args):
         return 0
 
     # clear
-    items = read_items()
-    if not items:
+    n = queue_clear(queue_root)
+    if not n:
         print("Queue is empty.")
         return 0
-    # Preserve the file as [] (never unlink) — the read_next convention.
-    queue_file.write_text("[]", encoding="utf-8")
-    print(f"Cleared {len(items)} queued item{'s' if len(items) != 1 else ''}.")
+    print(f"Cleared {n} queued item{'s' if n != 1 else ''}.")
     return 0
 
 

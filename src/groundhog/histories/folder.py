@@ -298,24 +298,31 @@ class FolderAttemptHistory(AttemptHistory):
         a = self.get(attempt_or_id) if isinstance(attempt_or_id, str) else attempt_or_id
         if a is None:
             raise KeyError(f"unknown attempt {attempt_or_id!r}")
+        from groundhog.utils.fileio import atomic_write_text, locked
         notes_path = Path(a.path) / "notes.json"
-        try:
-            notes = json.loads(notes_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            notes = {}
-        notes[key] = str(value)
-        notes_path.write_text(json.dumps(notes, indent=2), encoding="utf-8")
+        # Locked read-modify-write: writes to DIFFERENT keys must never lose
+        # each other (the per-tag ``tag-<name>`` keys rely on it).
+        with locked(notes_path):
+            try:
+                notes = json.loads(notes_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                notes = {}
+            notes[key] = str(value)
+            atomic_write_text(notes_path, json.dumps(notes, indent=2))
 
     def get_note(self, attempt_or_id, key: str) -> Optional[str]:
+        v = self.list_notes(attempt_or_id).get(key)
+        return None if v is None else str(v)
+
+    def list_notes(self, attempt_or_id) -> dict:
         a = self.get(attempt_or_id) if isinstance(attempt_or_id, str) else attempt_or_id
         if a is None:
-            return None
+            return {}
         try:
             notes = json.loads((Path(a.path) / "notes.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return None
-        v = notes.get(key)
-        return None if v is None else str(v)
+            return {}
+        return notes if isinstance(notes, dict) else {}
 
     def best(self, scorer: Callable[[StageResult], float]) -> Optional[FolderAttempt]:
         attempts = self.list()

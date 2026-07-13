@@ -606,6 +606,22 @@ class GitAttemptHistory(AttemptHistory):
             return None
         return res.stdout.decode("utf-8", errors="replace").strip()
 
+    def list_notes(self, attempt_or_id) -> dict:
+        prefix = "refs/notes/groundhog/"
+        res = self._git("for-each-ref", "--format=%(refname)", prefix,
+                        check=False)
+        if res.returncode != 0:
+            return {}
+        notes = {}
+        for line in res.stdout.decode("utf-8", errors="replace").splitlines():
+            key = line.strip()[len(prefix):]
+            if not key:
+                continue
+            value = self.get_note(attempt_or_id, key)
+            if value is not None:
+                notes[key] = value
+        return notes
+
     def materialize(self, attempt_or_id) -> Path:
         """Ensure the attempt's worktree folder exists on disk; return it.
 

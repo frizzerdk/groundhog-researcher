@@ -179,3 +179,83 @@ def test_open_questions_cover_gate_failures(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "gate-failed" in out
     assert "core_direction.md" in out
+
+
+def test_open_questions_cover_unscored_done_commits(tmp_path, capsys):
+    """Both shapes of done-but-unscored surface: the no-eval commit (carries
+    metadata) and a done record whose result is missing/unscoreable."""
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        attempt_group(["new", "--fresh", "--no-seed"])
+        out = capsys.readouterr().out
+        wsid = [l for l in out.splitlines()
+                if l.startswith("Opened workspace")][0].split()[-1]
+        loaded = rundir.load_run(run_dir=run_dir)
+        ws_path = [ip.path for ip in loaded.history.list_in_progress()
+                   if ip.workspace_id == wsid][0]
+        (ws_path / "solution.py").write_text("def solve():\n    return 50.0\n",
+                                             encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
+        attempt_group(["commit", wsid])  # no --eval
+        capsys.readouterr()
+
+        rc = cmd_report(["--out", "-"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "committed without a recorded evaluation" in out
+
+
+def test_report_escapes_pipes_in_cells(tmp_path, capsys):
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        _commit(run_dir, capsys, "50.0", "constant | piped family")
+        rc = cmd_report(["--out", "-"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "constant \| piped family" in out
+
+
+def test_report_no_llm_flag_skips_narrative(tmp_path, capsys):
+    run_dir = _write_run_dir(tmp_path)
+    task_py = run_dir / "task.py"
+    task_py.write_text(task_py.read_text(encoding="utf-8") + '''
+
+_original_build_toolkit = build_toolkit
+
+def build_toolkit():
+    tk = _original_build_toolkit()
+
+    class _MustNotBeAsked:
+        def get(self, tier):
+            raise AssertionError("--no-llm must not touch the LLM")
+
+    tk.llm = _MustNotBeAsked()
+    return tk
+''', encoding="utf-8")
+    with _in_dir(run_dir):
+        _commit(run_dir, capsys, "50.0", "constant baseline")
+        rc = cmd_report(["--out", "-", "--no-llm"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "## Summary" in out
+    assert "## State of the run" not in out
+
+
+def test_report_out_resolves_against_run_dir(tmp_path, capsys, monkeypatch):
+    run_dir = _write_run_dir(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    with _in_dir(run_dir):
+        _commit(run_dir, capsys, "50.0", "constant baseline")
+        # Invoke from a different cwd: relative --out must land in the run
+        # dir, exactly like the default path does.
+        import groundhog.cli as cli_mod
+        import groundhog.rundir as rundir_mod
+        run = rundir_mod.load_run(run_dir=run_dir)
+        monkeypatch.setattr(cli_mod, "_resolve_run", lambda args=None: run)
+        monkeypatch.chdir(elsewhere)
+        rc = cmd_report(["--out", "sub/custom.md"])
+    assert rc == 0
+    assert (run_dir / "sub" / "custom.md").exists()
+    assert not (elsewhere / "sub").exists()

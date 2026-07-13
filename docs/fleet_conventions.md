@@ -167,6 +167,14 @@ there is never a question of who owns what. It is the multi-writer
 extension of the single-writer rule: still one writer *per claimed
 region*.
 
+**Reconciling with `groundhog-orchestrate`'s pre-open-K step.** A
+single orchestrator's fan-out round legitimately holds K open
+workspaces at once — all K are inside its own claimed region, opened
+and committed by the one lifecycle writer, so the invariant (one
+writer per claimed region) is intact. The one-open-workspace-at-a-time
+bound governs workspaces opened *outside* a claimed fan-out, where
+ownership would otherwise be ambiguous between orchestrators.
+
 ## Namespacing — unique module stems for generated code
 
 **Rule.** Parallel workers that generate Python code MUST give their

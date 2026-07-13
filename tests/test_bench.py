@@ -4,8 +4,12 @@ Everything runs on the seedable MockTask with LLM-free strategies —
 deterministic and fast, safe for CI.
 """
 
+import pytest
+
 from groundhog.bench import BenchConfig, compare, run_config
 from groundhog.bench.cli import bench_group
+from groundhog.bench.comparison import compare_results
+from groundhog.bench.runner import BenchResult, SeedRun
 from groundhog.bench.stats import paired_stats
 from groundhog.templates.mock_strategy import MockStrategy
 from groundhog.templates.mock_task import MockTask
@@ -73,6 +77,60 @@ def test_paired_stats_none_loses():
                       higher_is_better=False)
     assert (ps.wins_a, ps.wins_b, ps.ties) == (1, 0, 1)
     assert ps.mean_delta is None
+
+
+def test_paired_stats_counts_one_sided_pairs_and_sd():
+    """One-sided pairs are excluded from the delta but counted explicitly —
+    win counts and mean_delta can disagree, and the fields say why."""
+    ps = paired_stats("final_best",
+                      [0.9, None, 0.5, 0.8],
+                      [None, None, 0.6, 0.6])
+    assert ps.n == 4
+    assert (ps.n_a, ps.n_b) == (3, 2)
+    assert (ps.only_a, ps.only_b) == (1, 0)
+    assert (ps.wins_a, ps.wins_b, ps.ties) == (2, 1, 1)
+    assert ps.deltas == [None, None, pytest.approx(-0.1), pytest.approx(0.2)]
+    assert ps.mean_delta == pytest.approx(0.05)
+    assert ps.sd_delta == pytest.approx(0.2121, abs=1e-3)
+
+
+def _bench_result(name, final_bests, first_improvements=None):
+    fi = first_improvements or [None] * len(final_bests)
+    runs = [SeedRun(seed=i, scores=[f], trajectory=[f], final_best=f,
+                    first_improvement=fi[i], total_attempts=1,
+                    wall_time_s=0.01)
+            for i, f in enumerate(final_bests)]
+    return BenchResult(config_name=name, n_iterations=1, runs=runs)
+
+
+def test_verdict_requires_a_win_margin():
+    """A one-seed win lead is noise: the verdict must not crown a winner."""
+    close = compare_results(_bench_result("a", [0.5, 0.5, 0.5]),
+                            _bench_result("b", [0.4, 0.6, 0.4]))
+    assert close.verdict.startswith("no clear winner")
+    assert "2" in close.verdict and "1" in close.verdict
+
+    clear = compare_results(_bench_result("a", [0.5, 0.7, 0.6]),
+                            _bench_result("b", [0.4, 0.4, 0.4]))
+    assert clear.verdict.startswith("A (a) better on 3/3 seeds")
+
+
+def test_verdict_reports_one_sided_improvements():
+    a = _bench_result("a", [0.5, 0.6, 0.7], first_improvements=[2, 3, None])
+    b = _bench_result("b", [0.4, 0.4, 0.4], first_improvements=[None, None, None])
+    comparison = compare_results(a, b)
+    fi = comparison.metrics["first_improvement"]
+    assert (fi.only_a, fi.only_b) == (2, 0)
+    assert "A-only" in comparison.format()
+
+
+def test_compare_results_rejects_mismatched_seeds():
+    a = _bench_result("a", [0.5, 0.6])
+    b = BenchResult(config_name="b", n_iterations=1, runs=[
+        SeedRun(seed=7, scores=[0.4], trajectory=[0.4], final_best=0.4,
+                first_improvement=None, total_attempts=1, wall_time_s=0.01)])
+    with pytest.raises(ValueError, match="different seeds"):
+        compare_results(a, b)
 
 
 CONFIG_TEMPLATE = """\

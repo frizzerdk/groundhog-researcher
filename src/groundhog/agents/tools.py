@@ -133,6 +133,7 @@ def build_default_agent_tools(toolkit) -> list:
 
     tools = [agent_tool(check_gates), agent_tool(raise_insight)]
     tools.append(agent_tool(search_attempts))
+    tools.append(agent_tool(rebuild_kb_index))
     for t in tools:
         t.bind_toolkit(toolkit)
     return tools
@@ -211,6 +212,7 @@ def check_gates(toolkit) -> str:
 
 
 INSIGHT_KINDS = ("insight", "tool-request", "blocker", "idea")
+_INSIGHT_MAX_CHARS = 4000
 
 
 def raise_insight(toolkit, kind: str = "insight", text: str = "") -> str:
@@ -225,6 +227,8 @@ def raise_insight(toolkit, kind: str = "insight", text: str = "") -> str:
     text = (text or "").strip()
     if not text:
         return "raise-insight: nothing recorded (text was empty)."
+    if len(text) > _INSIGHT_MAX_CHARS:
+        text = text[:_INSIGHT_MAX_CHARS].rstrip() + "\n[truncated]"
     kind = (kind or "").strip().lower() or "insight"
     if kind not in INSIGHT_KINDS:
         kind = "insight"  # unknown kinds fold into a plain insight, never rejected
@@ -273,16 +277,19 @@ def _insight_phase(toolkit):
 
 
 def _append_insight(path, entry):
-    """Learnings-style append: entries joined by a --- rule, one file per run."""
+    """Learnings-style append: entries joined by a --- rule, one file per run.
+
+    A true O(1) append — never reads the existing file, so one stray
+    non-UTF8 byte can't permanently kill the channel, and a crash mid-write
+    can't lose prior entries the way the old whole-file rewrite could.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    if existing.strip():
-        path.write_text(
-            existing.rstrip() + "\n\n---\n\n" + entry.strip() + "\n",
-            encoding="utf-8")
-    else:
-        path.write_text(entry.strip() + "\n", encoding="utf-8")
+    nonempty = path.exists() and path.stat().st_size > 0
+    with open(path, "a", encoding="utf-8") as f:
+        if nonempty:
+            f.write("\n---\n\n")
+        f.write(entry.strip() + "\n")
 
 
 def _log_insight_event(toolkit, kind, text, ws_id, phase):
@@ -768,6 +775,7 @@ def build_prior_tools(
 _SEARCH_SNIPPET_CHARS = 160
 _SEARCH_OUTPUT_CHARS = 8000
 _SEARCH_MAX_RESULTS = 100
+_SEARCH_QUERY_CHARS = 500
 
 
 def search_attempts(toolkit, query: str, scope: str = "all",
@@ -782,6 +790,7 @@ def search_attempts(toolkit, query: str, scope: str = "all",
 
     if scope not in SCOPES:
         return f"unknown scope {scope!r} (use {'|'.join(SCOPES)})"
+    query = (query or "")[:_SEARCH_QUERY_CHARS]
     try:
         pattern = re.compile(query, re.IGNORECASE)
     except re.error:
@@ -792,7 +801,8 @@ def search_attempts(toolkit, query: str, scope: str = "all",
     history = getattr(toolkit, "history", None)
     docs = list(iter_corpus(root, history, scope=scope))
 
-    rank = _semantic_rank(root, history, query)
+    rank = _semantic_rank(root, history, query,
+                          getattr(toolkit, "embedder", None))
     if rank is not None:
         docs.sort(key=lambda d: rank.get((d.attempt, d.file), len(rank)))
 
@@ -818,17 +828,37 @@ def search_attempts(toolkit, query: str, scope: str = "all",
     return out
 
 
-def _semantic_rank(root, history, query):
+def rebuild_kb_index(toolkit) -> str:
+    """Rebuild the run's semantic knowledge-base index — the derived cache
+    that ranks search-attempts results. Use after new attempts commit:
+    a stale index is skipped automatically (search falls back to lexical
+    order), so rebuilding is what re-enables semantic ranking. Uses a
+    custom ``toolkit.embedder`` when the run provides one; the built-in
+    TF-IDF fallback otherwise.
+    """
+    from groundhog.utils.semantic_index import SemanticIndex
+
+    root = getattr(toolkit, "path", None)
+    if root is None:
+        return "rebuild-kb-index: this toolkit has no run path."
+    index = SemanticIndex(root, getattr(toolkit, "history", None),
+                          embedder=getattr(toolkit, "embedder", None))
+    n = index.rebuild()
+    return f"Semantic index rebuilt: {n} chunk(s) -> {index.cache_path}"
+
+
+def _semantic_rank(root, history, query, embedder=None):
     """File ranking from the tier-2 semantic index — only when its cache
-    already exists (building one is an explicit act, not a search side
-    effect). None means lexical corpus order; any index failure falls back
-    the same way, so the lexical scan is the always-works path."""
+    already exists AND matches the current corpus (building one is an
+    explicit act, not a search side effect — see rebuild-kb-index). None
+    means lexical corpus order; any index failure falls back the same way,
+    so the lexical scan is the always-works path."""
     if root is None:
         return None
     try:
         from groundhog.utils.semantic_index import SemanticIndex
 
-        index = SemanticIndex(root, history)
+        index = SemanticIndex(root, history, embedder=embedder)
         if not index.exists() or not index.load():
             return None
         order = {}

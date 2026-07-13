@@ -53,7 +53,7 @@ def render_markdown(task_name: str, data: dict,
         for f in fams:
             score = (f"{f['best_score']:.4f}"
                      if f.get("best_score") is not None else "-")
-            lines.append(f"| {f['family_name']} | {len(f['members'])} "
+            lines.append(f"| {_cell(f['family_name'])} | {len(f['members'])} "
                          f"| {_short(f.get('best_id'))} | {score} |")
     else:
         lines.append("No attempts yet.")
@@ -67,7 +67,8 @@ def render_markdown(task_name: str, data: dict,
         for r in reversed(recent):
             score = f"{r['score']:.4f}" if r.get("score") is not None else "-"
             lines.append(f"| {_short(r['id'])} | {r['status']} | {score} "
-                         f"| {r.get('strategy') or '-'} | {r.get('name') or ''} |")
+                         f"| {_cell(r.get('strategy') or '-')} "
+                         f"| {_cell(r.get('name') or '')} |")
     else:
         lines.append("No attempts yet.")
     lines.append("")
@@ -158,7 +159,9 @@ def _open_questions(history, rows, recent: int = 10) -> List[str]:
         elif metadata.get("non_promotable"):
             out.append(f"attempt {_short(r['id'])} flagged non-promotable: "
                        f"{metadata.get('non_promotable_reason', '')}")
-        elif metadata.get("no_recorded_result"):
+        elif metadata.get("no_recorded_result") or r.get("score") is None:
+            # Both shapes of "done but unscored": the explicit no-eval commit
+            # flag, and older records with no readable/scoreable result.
             out.append(f"attempt {_short(r['id'])} committed without a "
                        f"recorded evaluation")
     return out
@@ -169,6 +172,11 @@ def _metadata_of(attempt) -> dict:
         return attempt.metadata or {}
     except Exception:  # noqa: BLE001
         return {}
+
+
+def _cell(value) -> str:
+    """Escape a value for a markdown table cell (a | would split it)."""
+    return str(value).replace("|", "\\|").replace("\n", " ")
 
 
 def _short(value, n=8):

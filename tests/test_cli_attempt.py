@@ -976,3 +976,49 @@ def test_summary_text(tmp_path, capsys):
         assert "attempts: 1" in out
         assert "best:" in out
         assert "constant baseline" in out
+
+
+def test_json_out_is_nan_safe():
+    """A scorer can hand back NaN/Inf; the CLI's JSON must stay parseable
+    (json.dumps would otherwise emit bare NaN, which json.loads elsewhere
+    rejects)."""
+    import json as json_mod
+    from groundhog.cli import _json_out
+
+    text = _json_out({
+        "score": float("nan"),
+        "trajectory": [1.0, float("inf"), (float("-inf"),)],
+        "nested": {"ok": 0.5},
+    })
+    parsed = json_mod.loads(text)
+    assert parsed["score"] is None
+    assert parsed["trajectory"] == [1.0, None, [None]]
+    assert parsed["nested"]["ok"] == 0.5
+
+
+def test_show_json_with_file_returns_wrapped_json(tmp_path, capsys):
+    """--json + --file used to silently drop --json; now both are honored."""
+    import json as json_mod
+
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        attempt_group(["new", "--fresh", "--no-seed"])
+        out = capsys.readouterr().out
+        wsid = [l for l in out.splitlines()
+                if l.startswith("Opened workspace")][0].split()[-1]
+        loaded = rundir.load_run(run_dir=run_dir)
+        ws_path = [ip.path for ip in loaded.history.list_in_progress()
+                   if ip.workspace_id == wsid][0]
+        (ws_path / "solution.py").write_text("def solve():\n    return 50.0\n",
+                                             encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
+        attempt_group(["commit", wsid, "--eval"])
+        capsys.readouterr()
+        aid = rundir.load_run(run_dir=run_dir).history.list()[-1].id
+
+        rc = attempt_group(["show", aid, "--file", "solution.py", "--json"])
+        assert rc == 0
+        parsed = json_mod.loads(capsys.readouterr().out)
+        assert parsed["file"] == "solution.py"
+        assert "return 50.0" in parsed["content"]

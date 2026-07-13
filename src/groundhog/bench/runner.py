@@ -39,10 +39,13 @@ class BenchConfig:
     the toolkit rng, so runs are deterministic and comparisons pair by seed.
     ``strategies`` is the SimpleOptimizer rotation schedule
     ``[(strategy, repeats), ...]`` (a bare strategy is accepted).
-    ``seed_strategy`` defaults to None — the optimizer's own default seeds
-    with FreshApproach, which needs an LLM. ``configure_toolkit(toolkit)``
-    runs after assembly and is the injection point for LLM-backed configs
-    (e.g. ``toolkit.llm = auto_registry()``) — those work but cost money.
+    ``seed_strategy`` defaults to None, which DISABLES seeding — the first
+    rotation strategy runs against an empty history. (The optimizer's own
+    default is the string ``"default"``, which seeds with FreshApproach and
+    needs an LLM; pass that string or a strategy instance to opt in.)
+    ``configure_toolkit(toolkit)`` runs after assembly and is the injection
+    point for LLM-backed configs (e.g. ``toolkit.llm = auto_registry()``) —
+    those work but cost money.
     """
     name: str
     task_factory: Callable[[int], object]
@@ -134,12 +137,14 @@ def _toolkit_seed(seed: int) -> int:
 
 
 def _run_seed(config: BenchConfig, seed: int, quiet: bool = True) -> SeedRun:
-    t0 = time.perf_counter()
     task = config.task_factory(seed)
     sink = io.StringIO()
     silence = redirect_stdout(sink) if quiet else nullcontext()
     with tempfile.TemporaryDirectory(prefix="ghg_bench_",
                                      ignore_cleanup_errors=True) as d:
+        # Wall time covers the optimization itself, measured inside the
+        # tempdir block — teardown (slow on Windows) is not the strategy's.
+        t0 = time.perf_counter()
         with silence:
             toolkit = assemble_toolkit(task, path=Path(d),
                                        seed=_toolkit_seed(seed),
@@ -161,7 +166,7 @@ def _run_seed(config: BenchConfig, seed: int, quiet: bool = True) -> SeedRun:
         scorer = scorer_for(task, config.through)
         attempts = toolkit.history.list(only_done=False)
         scores = [_attempt_score(a, scorer) for a in attempts]
-    wall = time.perf_counter() - t0
+        wall = time.perf_counter() - t0
 
     first_improvement = None
     for i, s in enumerate(scores[1:], start=2):
