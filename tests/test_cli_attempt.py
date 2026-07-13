@@ -837,6 +837,32 @@ def test_eval_fail_records_shaped_failure(tmp_path, capsys):
         assert result.failed_stage == "manual"
 
 
+def test_commit_echo_survives_git_path_failure(tmp_path, capsys, monkeypatch):
+    """The at:-echo materializes the git attempt's worktree and can raise —
+    that must never turn a successful commit into 'Commit failed' + exit 1."""
+    if not _git_available():
+        pytest.skip("git not on PATH")
+    from groundhog.histories.git import GitAttempt, GitError
+
+    run_dir = _write_run_dir(tmp_path, git=True)
+    with _in_dir(run_dir):
+        wsid, ws_path = _open_ws(run_dir, capsys)
+        (ws_path / "solution.py").write_text("def solve():\n    return 50.0\n",
+                                             encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
+
+        def boom(self):
+            raise GitError(["git", "worktree", "move"], 128, b"boom")
+
+        monkeypatch.setattr(GitAttempt, "path", property(boom))
+        rc = attempt_group(["commit", wsid, "--eval"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "Committed attempt" in out
+    assert "Commit failed" not in out
+
+
 def test_folder_get_resolves_failed_attempts(tmp_path, capsys):
     run_dir = _write_run_dir(tmp_path)
     with _in_dir(run_dir):

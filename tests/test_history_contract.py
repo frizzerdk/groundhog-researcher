@@ -59,6 +59,19 @@ def test_best_uses_scorer(history_factory, commit_attempt):
     assert best.id == hi.id
 
 
+def test_best_survives_corrupt_result_json(history_factory, commit_attempt):
+    """A corrupt result.json (e.g. synced from another store) is a boundary:
+    the attempt is unscored, best() never crashes."""
+    h = history_factory()
+    good = commit_attempt(h, metrics={"score": 0.9})
+    ws = h.workspace()
+    (ws.path / "solution.py").write_text("x = 2", encoding="utf-8")
+    (ws.path / "result.json").write_text("{not json", encoding="utf-8")
+    ws.commit(success=True)
+    best = h.best(lambda sr: sr.metrics.get("score", 0.0))
+    assert best.id == good.id
+
+
 def test_get_unknown_returns_none(history_factory, commit_attempt):
     h = history_factory()
     commit_attempt(h)

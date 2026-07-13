@@ -937,18 +937,23 @@ def _attempt_commit(args):
                 print(f"note[score] = {note_score:.4f}")
             except Exception as e:  # noqa: BLE001 — a cache miss never fails a commit
                 print(f"Could not write score note: {e}")
-
-        print(f"Committed attempt {attempt.id} ({attempt.status})")
-        # The folder backend renames the workspace dir at commit (suffix
-        # _done/_fail) — echo the new location so scripts don't chase a
-        # stale path.
-        loc = getattr(attempt, "path", None)
-        if loc:
-            print(f"  at: {loc}")
-        return 0
     except Exception as e:  # noqa: BLE001
         print(f"Commit failed: {e}")
         return 1
+
+    print(f"Committed attempt {attempt.id} ({attempt.status})")
+    # The folder backend renames the workspace dir at commit (suffix
+    # _done/_fail) — echo the new location so scripts don't chase a stale
+    # path. Outside the net above: the git backend's .path property can
+    # run git (materialize) and raise, and that must never turn a
+    # successful commit into "Commit failed" + exit 1.
+    try:
+        loc = getattr(attempt, "path", None)
+    except Exception:  # noqa: BLE001
+        loc = None
+    if loc:
+        print(f"  at: {loc}")
+    return 0
 
 
 def _print_gate_outcome(metadata):

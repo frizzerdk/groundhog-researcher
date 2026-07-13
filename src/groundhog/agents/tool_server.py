@@ -262,8 +262,10 @@ if ($kwMode) {
 
 foreach ($n in $PATH_PARAMS) {
     if ($params.ContainsKey($n) -and $params[$n] -is [string]) {
-        try { $params[$n] = [IO.Path]::GetFullPath($params[$n], (Get-Location).Path) }
-        catch { $params[$n] = [IO.Path]::GetFullPath((Join-Path (Get-Location).Path $params[$n])) }
+        # Resolves relative to the PS current location and exists on 5.1
+        # (the 2-arg [IO.Path]::GetFullPath overload does not).
+        try { $params[$n] = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($params[$n]) }
+        catch {}
     }
 }
 

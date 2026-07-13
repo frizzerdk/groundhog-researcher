@@ -59,6 +59,7 @@ from groundhog.base.attempt_history import (
     Attempt, Workspace, AttemptHistory, InProgress)
 from groundhog.utils.results import read_result, write_metadata, read_attempt_metadata
 from groundhog.utils.direction import slugify
+from groundhog.utils.queries import safe_result
 
 _NOTE_KEY = re.compile(r"^[a-z0-9_-]{1,64}$")
 
@@ -826,11 +827,12 @@ class GitAttemptHistory(AttemptHistory):
             return None
 
         def score_attempt(attempt):
-            result = attempt.result
-            if not result.completed or not result.stages:
+            # A corrupt or absent result.json (possibly synced from another
+            # store) is a boundary: unscored, never a crash.
+            result = safe_result(attempt)
+            if result is None or not result.completed:
                 return -1.0
-            last_stage = list(result.stages.values())[-1]
-            return scorer(last_stage)
+            return scorer(list(result.stages.values())[-1])
 
         return max(attempts, key=score_attempt)
 
