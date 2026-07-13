@@ -219,6 +219,104 @@ def test_unpaired_alternates_arms_without_pinning():
         assert a.calls == 2 and b.calls == 2
 
 
+class SkippingArm(Strategy):
+    """Arm that never commits — returns a skip like a real strategy."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.calls = 0
+
+    def __call__(self, toolkit, config=None):
+        self.calls += 1
+        return {"skipped": "nothing to do"}
+
+
+def test_unpaired_skipping_arm_does_not_starve_the_other():
+    """Commit-count balancing re-picked a skipping arm forever (remediation
+    C4): arms are now balanced by CALLS, so a skipper still alternates."""
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        toolkit = _toolkit(history)
+
+        skipper, b = SkippingArm(), ArmB(scores=[0.6], fresh=True)
+        ab = ABTest(skipper, b, paired=False)
+        for _ in range(4):
+            ab(toolkit)
+
+        assert skipper.calls == 2
+        assert b.calls == 2
+
+
+def test_run_arm_restores_outer_extra_metadata():
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        _seed(history)
+        toolkit = _toolkit(history, get_prior=lambda tk: tk.history.list()[0])
+        outer = {"campaign": "x"}
+        toolkit._extra_attempt_metadata = outer
+
+        ab = ABTest(ArmA(scores=[0.8]), ArmB(scores=[0.6]))
+        ab(toolkit)
+
+        assert toolkit._extra_attempt_metadata is outer
+
+
+_CLI_TASK_BODY = '''
+from pathlib import Path
+from groundhog import Task, Data, Context, Evaluator, EvalStage, StageResult
+
+
+class TinyData(Data):
+    def get_train(self): return None
+    def get_test(self): return None
+
+
+class TinyContext(Context):
+    def get_brief(self): return "b"
+    def get_extended(self): return "e"
+
+
+class TinyEvaluator(Evaluator):
+    def evaluate(self, code_or_path, data):
+        return StageResult(metrics={"score": 0.5})
+
+    def get_stages(self, data):
+        return [EvalStage("eval", "eval", lambda cp: self.evaluate(cp, data),
+                          scorer=lambda r: r.metrics.get("score", 0.0))]
+
+
+task = Task(data=TinyData(), context=TinyContext(), evaluator=TinyEvaluator(),
+            name="TinyTask")
+
+
+def build_toolkit():
+    from groundhog import FolderAttemptHistory, assemble_toolkit
+    here = Path(__file__).parent
+    return assemble_toolkit(task, history=FolderAttemptHistory(here), path=here)
+'''
+
+
+def test_cli_strategy_run_explains_programmatic_construction(tmp_path, capsys):
+    """ABTest needs two strategies; cls(config) from the CLI must explain,
+    not traceback."""
+    import os
+
+    from groundhog.cli import strategy_group
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "task.py").write_text(_CLI_TASK_BODY, encoding="utf-8")
+    saved = os.getcwd()
+    os.chdir(run_dir)
+    try:
+        rc = strategy_group(["run", "ab_test"])
+    finally:
+        os.chdir(saved)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "programmatic construction" in out
+
+
 # --- Scoreboard (derived from history) --------------------------------------
 
 def test_summary_math_on_synthetic_history():

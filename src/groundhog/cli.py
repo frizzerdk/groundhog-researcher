@@ -1700,7 +1700,14 @@ def _strategy_run(args):
 
     toolkit = run.toolkit
     scorer = _scorer_for(run.task, through=getattr(toolkit, "through", None))
-    strategy = entry["cls"](config)
+    try:
+        strategy = entry["cls"](config)
+    except TypeError as e:
+        print(f"Could not construct {name!r}: {e}")
+        print("This strategy requires programmatic construction (constructor "
+              "arguments beyond config); run it from task.py or an optimizer "
+              "schedule instead.")
+        return 1
     for _ in range(n):
         count_before = len(run.history.list(only_done=False))
         try:

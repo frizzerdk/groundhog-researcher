@@ -118,26 +118,35 @@ class ABTest(Strategy):
     # --- Unpaired trial ---
 
     def _run_next_arm(self, toolkit):
-        counts = {"a": 0, "b": 0}
-        for meta in self._test_metadata(toolkit):
-            arm = meta.get("ab_arm")
-            if arm in counts:
-                counts[arm] += 1
-        arm = "a" if counts["a"] <= counts["b"] else "b"
+        # Balance by CALLS, not committed trials: a skipping arm commits
+        # nothing, and commit-count balancing re-picked it forever. Call
+        # counts live on the instance, seeded once from history so a
+        # resumed run continues balanced.
+        if not hasattr(self, "_arm_calls"):
+            self._arm_calls = {"a": 0, "b": 0}
+            for meta in self._test_metadata(toolkit):
+                arm = meta.get("ab_arm")
+                if arm in self._arm_calls:
+                    self._arm_calls[arm] += 1
+        arm = "a" if self._arm_calls["a"] <= self._arm_calls["b"] else "b"
+        self._arm_calls[arm] += 1
         strategy = self.strategy_a if arm == "a" else self.strategy_b
-        pair = counts[arm] + 1
+        pair = self._arm_calls[arm]
         return {"pair": pair, arm: self._run_arm(toolkit, strategy, arm, pair)}
 
     # --- Arm execution ---
 
     def _run_arm(self, toolkit, strategy, arm, pair):
+        # Save/restore like _pin_prior: a wrapping producer (nested ABTest,
+        # a session) may have its own pass-through metadata pinned.
+        saved = getattr(toolkit, "_extra_attempt_metadata", None)
         toolkit._extra_attempt_metadata = {
             "ab_test": self._test_name(), "ab_arm": arm, "ab_pair": pair,
         }
         try:
             return strategy(toolkit)
         finally:
-            toolkit._extra_attempt_metadata = None
+            toolkit._extra_attempt_metadata = saved
 
     # --- Scoreboard (read-side, derived from history) ---
 
