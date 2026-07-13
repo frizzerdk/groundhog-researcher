@@ -28,8 +28,10 @@ A config is a python module exposing `def bench_config() -> BenchConfig`:
 - `strategies` — the `SimpleOptimizer` rotation schedule
   `[(strategy, repeats), ...]`; a bare strategy means `[(strategy, 1)]`.
 - `n_iterations` — optimizer iterations per seed.
-- `seed_strategy` — defaults to `None`; the optimizer's own default seeds
-  with `FreshApproach`, which needs an LLM.
+- `seed_strategy` — defaults to `None`, which disables seeding (the first
+  rotation strategy runs against an empty history). The optimizer's own
+  default is the string `"default"`, which seeds with `FreshApproach` and
+  needs an LLM — pass that string or a strategy instance to opt in.
 - `configure_toolkit(toolkit)` — optional post-assembly hook, the
   injection point for LLM-backed configs.
 
