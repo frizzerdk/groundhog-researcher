@@ -175,3 +175,52 @@ def test_attempt_detail(history_factory, commit_attempt):
     assert d["sub_results"] == {"eval": {"cells": {"a": 1}}}
 
     assert queries.attempt_detail(h, "no-such-id", scorer) is None
+
+
+def test_safe_result_and_safe_code_on_normal_attempt(history_factory,
+                                                     commit_attempt):
+    h = history_factory()
+    a = commit_attempt(h, metrics={"score": 0.5})
+
+    result = queries.safe_result(a)
+    assert result is not None
+    assert result.stages["eval"].metrics["score"] == 0.5
+    assert queries.safe_code(a) == "def solve(): return 1"
+
+
+def test_safe_result_none_without_result_json(history_factory):
+    h = history_factory()
+    ws = h.workspace()
+    (ws.path / "solution.py").write_text("def solve(): return 1",
+                                         encoding="utf-8")
+    a = ws.commit(success=True)
+
+    assert queries.safe_result(a) is None
+    assert queries.safe_code(a) == "def solve(): return 1"
+
+
+def test_safe_result_none_on_corrupt_result_json(history_factory):
+    h = history_factory()
+    ws = h.workspace()
+    (ws.path / "solution.py").write_text("def solve(): return 1",
+                                         encoding="utf-8")
+    (ws.path / "result.json").write_text("{not json", encoding="utf-8")
+    a = ws.commit(success=True)
+
+    assert queries.safe_result(a) is None
+
+
+def test_safe_code_none_without_solution(history_factory):
+    h = history_factory()
+    ws = h.workspace()
+    (ws.path / "result.json").write_text(
+        json.dumps({"completed": False, "failed_stage": "generate",
+                    "stages": {"generate": {"metrics": {},
+                                            "errors": {"crash": "boom"},
+                                            "warnings": {}}}}),
+        encoding="utf-8")
+    a = ws.commit(success=False)
+
+    assert queries.safe_code(a) is None
+    result = queries.safe_result(a)
+    assert result is not None and not result.completed

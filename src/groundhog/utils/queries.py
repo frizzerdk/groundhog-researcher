@@ -32,9 +32,38 @@ from __future__ import annotations
 from typing import Callable, List, Optional
 
 from groundhog.base.attempt_history import Attempt, AttemptHistory
-from groundhog.base.types import StageResult
+from groundhog.base.types import EvaluationResult, StageResult
 
 Scorer = Callable[[StageResult], float]
+
+
+def safe_result(attempt: Attempt) -> Optional[EvaluationResult]:
+    """The attempt's result, or ``None`` for the sanctioned no-result state.
+
+    An attempt committed without ``--eval`` has no ``result.json``: the
+    folder backend raises ``OSError``, the git backend hands back an empty
+    (stage-less) result. Both normalize to ``None``, as does a corrupt
+    ``result.json`` (``ValueError``).
+    """
+    try:
+        result = attempt.result
+    except (OSError, ValueError):
+        return None
+    return result if result.stages else None
+
+
+def safe_code(attempt: Attempt) -> Optional[str]:
+    """The attempt's solution code, or ``None`` when absent.
+
+    A failed attempt may lack ``solution.py``: the folder backend raises
+    ``OSError``, the git backend hands back ``""``. Both normalize to
+    ``None``.
+    """
+    try:
+        code = attempt.code
+    except OSError:
+        return None
+    return code or None
 
 
 def attempt_table(history: AttemptHistory, scorer: Optional[Scorer] = None,
