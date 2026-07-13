@@ -1780,22 +1780,16 @@ def queue_group(args):
         print(usage)
         return 1
 
-    import json
+    from groundhog.tools.queue import QueueCorrupt
+    from groundhog.tools.queue import add as queue_add
+    from groundhog.tools.queue import clear as queue_clear
+    from groundhog.tools.queue import read_items
 
     run = _resolve_run()
     if run is None:
         return 1
     queue_root = Path(getattr(run.toolkit, "path", None) or run.run_dir)
     queue_file = queue_root / "queue.json"
-
-    def read_items():
-        if not queue_file.exists():
-            return []
-        try:
-            items = json.loads(queue_file.read_text(encoding="utf-8"))
-        except ValueError:
-            return []
-        return items if isinstance(items, list) else []
 
     if sub == "add":
         config = {}
@@ -1816,15 +1810,23 @@ def queue_group(args):
             print("Usage: groundhog queue add <strategy> [--set k=v ...]")
             return 1
         strategy = positional[0]
-        from groundhog.tools.queue import add as queue_add
-        queue_add(queue_root, strategy, config, source="user")
-        position = len(read_items())
+        try:
+            position = queue_add(queue_root, strategy, config, source="user")
+        except QueueCorrupt as e:
+            print(f"Cannot add: {e}")
+            print("Fix the file, or drop it with: groundhog queue clear")
+            return 1
         config_str = f" config={config}" if config else ""
         print(f"Queued {strategy} at position {position}{config_str}")
         return 0
 
     if sub == "list":
-        items = read_items()
+        try:
+            items = read_items(queue_file)
+        except QueueCorrupt as e:
+            print(f"Queue file unreadable: {e}")
+            print("Fix the file, or drop it with: groundhog queue clear")
+            return 1
         if not items:
             print("Queue is empty.")
             return 0
@@ -1837,13 +1839,11 @@ def queue_group(args):
         return 0
 
     # clear
-    items = read_items()
-    if not items:
+    n = queue_clear(queue_root)
+    if not n:
         print("Queue is empty.")
         return 0
-    # Preserve the file as [] (never unlink) — the read_next convention.
-    queue_file.write_text("[]", encoding="utf-8")
-    print(f"Cleared {len(items)} queued item{'s' if len(items) != 1 else ''}.")
+    print(f"Cleared {n} queued item{'s' if n != 1 else ''}.")
     return 0
 
 
