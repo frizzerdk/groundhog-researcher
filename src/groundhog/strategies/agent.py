@@ -954,12 +954,18 @@ class AgentStrategy(Strategy):
             dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
     def _collect_learnings(self, toolkit, ws):
-        """Promote local learnings to task-level store."""
+        """Promote local learnings to task-level store.
+
+        The seed block is stripped first: an agent that appends below the
+        seed would otherwise promote the instruction text (and its
+        placeholder examples) as if they were observations.
+        """
+        from groundhog.utils.learnings_digest import strip_seed
         learnings_path = ws.path / "work" / "learnings.md"
         if not learnings_path.exists() or not hasattr(toolkit, 'learnings'):
             return
-        text = learnings_path.read_text(encoding="utf-8").strip()
-        if text and text != LEARNINGS_SEED.strip():
+        text = strip_seed(learnings_path.read_text(encoding="utf-8"))
+        if text:
             toolkit.learnings.add(text)
 
     def _evaluate(self, toolkit, ws):

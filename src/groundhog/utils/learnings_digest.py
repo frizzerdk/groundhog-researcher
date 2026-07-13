@@ -41,12 +41,11 @@ Notes from this attempt. Keep high signal-to-noise — only entries that would
 save time or prevent repeated mistakes (confirmed dead-ends, key thresholds,
 techniques with measurable gains). Skip speculation and anything obvious from the code.
 
-Write each learning as one directive line:
-[tried X] -> [because/observed Y] -> [next time do Z]
+Write each learning as one directive line, shaped like:
+- tried [specific change X] -> [observed effect Y, with the measured number] -> [next time do Z]
+- tried [parameter/value X] -> [failure mode Y you saw] -> [what to use instead]
 
-Examples:
-- tried batch norm before every conv -> val acc dropped 0.90->0.86 (overfit) -> keep BN only after the first block
-- tried lr 1e-2 -> loss diverged to NaN by epoch 2 -> start at 1e-3 with warmup
+Fill the brackets with YOUR observations only — never invent numbers.
 
 Prior attempts' notes are NOT auto-copied here. If you want context from
 earlier work, use the get-priors / list-prior / get-prior-file tools to
@@ -106,7 +105,7 @@ def attempt_learnings(attempt) -> List[str]:
         text = attempt.read_file(rel)
         if not text or text.startswith("[binary file"):
             continue
-        text = _strip_seed(text)
+        text = strip_seed(text)
         entries.extend(e.strip() for e in text.split(SEPARATOR) if e.strip())
     return entries
 
@@ -189,7 +188,7 @@ def _llm_digest(llm, collected, max_entries: int) -> str:
     return SEPARATOR.join(parts[:max_entries])
 
 
-def _strip_seed(text: str) -> str:
+def strip_seed(text: str) -> str:
     stripped = text.strip()
     seed = LEARNINGS_SEED.strip()
     if stripped.startswith(seed):

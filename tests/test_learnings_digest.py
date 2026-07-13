@@ -150,6 +150,47 @@ def test_improve_records_learning_in_attempt_and_digest():
         assert "- learned: smaller is better" in toolkit.learnings.get()
 
 
+def test_seed_carries_no_fabricated_observations():
+    """The seed's examples used to embed concrete fake metrics (0.90->0.86,
+    lr 1e-2 -> NaN) that promotion surfaced as real observations
+    (remediation seed): placeholder-shaped examples only."""
+    from groundhog.utils.learnings_digest import LEARNINGS_SEED
+
+    assert "0.90" not in LEARNINGS_SEED
+    assert "1e-2" not in LEARNINGS_SEED
+    assert "[specific change X]" in LEARNINGS_SEED
+
+
+def test_collect_learnings_strips_seed_block_on_promotion():
+    from groundhog.strategies.agent import AgentStrategy
+    from groundhog.utils.learnings_digest import LEARNINGS_SEED
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws_dir = Path(tmp) / "ws"
+        (ws_dir / "work").mkdir(parents=True)
+        (ws_dir / "work" / "learnings.md").write_text(
+            LEARNINGS_SEED + "\n- tried dropout 0.5 -> acc up 2% -> keep it\n",
+            encoding="utf-8")
+
+        toolkit = SimpleNamespace(
+            learnings=MarkdownLearnings(Path(tmp) / "store"))
+        ws = SimpleNamespace(path=ws_dir)
+        AgentStrategy()._collect_learnings(toolkit, ws)
+
+        promoted = toolkit.learnings.get()
+        assert "tried dropout 0.5" in promoted
+        assert "[specific change X]" not in promoted
+        assert "# Learnings" not in promoted
+
+        # A file left as the untouched seed promotes nothing.
+        untouched_tk = SimpleNamespace(
+            learnings=MarkdownLearnings(Path(tmp) / "store2"))
+        (ws_dir / "work" / "learnings.md").write_text(
+            LEARNINGS_SEED, encoding="utf-8")
+        AgentStrategy()._collect_learnings(untouched_tk, ws)
+        assert untouched_tk.learnings.get() == ""
+
+
 # === Lens: rebuild_digest =================================================
 
 def test_rebuild_digest_is_deterministic_and_marked_derived():
