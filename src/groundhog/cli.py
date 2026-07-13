@@ -1487,21 +1487,35 @@ def strategy_group(args):
 
 def _discover_strategies_here():
     """Built-ins plus, when the cwd resolves to a run dir, the task module's
-    strategies. Loader failures mean "no task module", never an error —
-    list/show must work outside a run dir."""
+    strategies. No task.py means "no task module", never an error —
+    list/show must work outside a run dir. A task.py that EXISTS but fails
+    to load gets a stderr note: silence here made users think their
+    strategies simply weren't discovered."""
     from groundhog import rundir
     from groundhog.strategies.discover import discover_strategies
 
     module = None
     try:
         module = rundir.load_run().module
-    except (Exception, SystemExit):
+    except FileNotFoundError:
         pass
+    except (Exception, SystemExit) as e:
+        print(f"note: task.py found but failed to load ({e}); "
+              f"showing built-in strategies only", file=sys.stderr)
     return discover_strategies(module=module)
+
+
+def _warn_broken_strategies(entries):
+    for e in entries:
+        if e.get("error"):
+            print(f"warning: strategy {e['name']!r} ({e['source']}) skipped: "
+                  f"Config broken ({e['error']})", file=sys.stderr)
 
 
 def _strategy_list(args):
     entries = _discover_strategies_here()
+    _warn_broken_strategies(entries)
+    entries = [e for e in entries if not e.get("error")]
     width = max(len(e["name"]) for e in entries)
     for e in entries:
         print(f"  {e['name']:<{width}}  {e['source']:<7}  {e['doc']}")
@@ -1522,6 +1536,12 @@ def _strategy_show(args):
         (e for e in _discover_strategies_here() if e["name"] == name), None)
     if entry is None:
         print(f"No strategy named {name!r}. Try: groundhog strategy list")
+        return 1
+    if entry.get("error"):
+        print(f"Strategy {name!r} ({entry['source']}) is unavailable: its "
+              f"Config could not be described ({entry['error']}).")
+        print("Every Config field needs a default: "
+              "field: type = param(default, \"description\")")
         return 1
     params = entry["params"]
 
@@ -1599,6 +1619,12 @@ def _strategy_run(args):
          if e["name"] == name), None)
     if entry is None:
         print(f"No strategy named {name!r}. Try: groundhog strategy list")
+        return 1
+    if entry.get("error"):
+        print(f"Strategy {name!r} ({entry['source']}) cannot run: its "
+              f"Config could not be described ({entry['error']}).")
+        print("Every Config field needs a default: "
+              "field: type = param(default, \"description\")")
         return 1
 
     config = {}

@@ -143,6 +143,65 @@ def test_strategy_list_works_outside_a_run_dir(tmp_path, capsys):
     assert "echo" not in out
 
 
+_BROKEN_STRATEGY = '''
+
+@dataclass
+class BrokenConfig(StrategyConfig):
+    required: float  # no default — Config() raises
+
+class BrokenStrategy(Strategy):
+    """Broken on purpose."""
+    Config = BrokenConfig
+    def __call__(self, toolkit, config=None):
+        return {}
+'''
+
+
+def test_strategy_list_skips_broken_config_with_warning(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "task.py").write_text(_TASK_BODY + _BROKEN_STRATEGY,
+                                     encoding="utf-8")
+    with _in_dir(run_dir):
+        rc = strategy_group(["list"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "echo" in captured.out
+    assert "improve" in captured.out
+    assert "broken" not in captured.out
+    assert "broken" in captured.err and "Config broken" in captured.err
+
+
+def test_strategy_show_and_run_explain_broken_config(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "task.py").write_text(_TASK_BODY + _BROKEN_STRATEGY,
+                                     encoding="utf-8")
+    with _in_dir(run_dir):
+        rc = strategy_group(["show", "broken"])
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "unavailable" in out and "default" in out
+
+        rc = strategy_group(["run", "broken"])
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "cannot run" in out
+
+
+def test_strategy_list_notes_task_module_load_failure(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "task.py").write_text("import nonexistent_module_xyz\n",
+                                     encoding="utf-8")
+    with _in_dir(run_dir):
+        rc = strategy_group(["list"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "improve" in captured.out  # builtins still listed
+    assert "failed to load" in captured.err
+
+
 # --- show -------------------------------------------------------------------
 
 def test_strategy_show_prints_params_table(tmp_path, capsys):

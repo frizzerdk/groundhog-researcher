@@ -24,7 +24,12 @@ def discover_strategies(module=None):
 
     Returns a list of dicts, builtins first, each sorted by name:
         {name, cls, source: "builtin"|"task", doc: first docstring line,
-         params: cls.Config().describe()}
+         params: cls.Config().describe(), error: None}
+
+    A class whose Config cannot be instantiated/described (e.g. a
+    defaultless field) still gets an entry — with ``params: {}`` and
+    ``error`` set to the one-line reason — so one broken user strategy
+    never takes down the whole scan and the CLI can explain by name.
     """
     import groundhog.strategies as pkg
 
@@ -39,16 +44,21 @@ def discover_strategies(module=None):
         for cls in _strategy_classes(module):
             found.setdefault(cls, "task")
 
-    entries = [
-        {
+    entries = []
+    for cls, source in found.items():
+        params, error = {}, None
+        try:
+            params = cls.Config().describe()
+        except Exception as e:  # noqa: BLE001 — user Config code, any error
+            error = f"{type(e).__name__}: {e}"
+        entries.append({
             "name": cls.name,
             "cls": cls,
             "source": source,
             "doc": _first_doc_line(cls),
-            "params": cls.Config().describe(),
-        }
-        for cls, source in found.items()
-    ]
+            "params": params,
+            "error": error,
+        })
     entries.sort(key=lambda e: (e["source"] != "builtin", e["name"]))
     return entries
 
