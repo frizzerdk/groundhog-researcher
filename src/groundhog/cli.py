@@ -1254,31 +1254,15 @@ def cmd_summary(args):
     history, task = run.history, run.task
     scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
 
-    from groundhog.utils import queries
-    summary = queries.run_summary(history, scorer)
-    fams = queries.families(history, scorer)
-
     if as_json:
         import json
-        print(json.dumps({"summary": summary, "families": fams},
+        from groundhog.utils import queries
+        print(json.dumps({"summary": queries.run_summary(history, scorer),
+                          "families": queries.families(history, scorer)},
                          indent=2, default=str))
         return 0
 
-    print(f"attempts: {summary['n_attempts']} "
-          f"({summary['n_done']} done, {summary['n_failed']} failed)")
-    best = summary["best"]
-    if best is not None:
-        print(f"best:     {_short(best['id'])} score={best['score']:.4f} "
-              f"{best['name']}")
-    print(f"families: {summary['n_families']}")
-    print(f"cost:     ${summary['total_cost']:.4f}")
-    if fams:
-        print()
-        print(f"{'family':<40} {'n':<4} {'best':<10} best score")
-        for f in fams:
-            score_str = f"{f['best_score']:.4f}" if f["best_score"] is not None else "-"
-            print(f"{f['family_name']:<40} {len(f['members']):<4} "
-                  f"{_short(f['best_id']):<10} {score_str}")
+    _print_run_overview(history, scorer)
     return 0
 
 
@@ -1335,6 +1319,9 @@ def cmd_run(args):
     if args and args[0] in ("-h", "--help"):
         print("Usage: groundhog run [N]   Run N optimizer iterations (default 10)")
         return 0
+    if len(args) > 1:
+        print("Usage: groundhog run [N]")
+        return 1
     n = 10
     if args:
         try:
@@ -1342,32 +1329,68 @@ def cmd_run(args):
         except ValueError:
             print(f"N must be an integer, got {args[0]!r}")
             return 1
+        if n < 1:
+            print(f"N must be a positive integer, got {n}")
+            return 1
 
     run = _resolve_run()
     if run is None:
         return 1
-    try:
-        optimizer, chosen = _resolve_optimizer(run)
-    except Exception as e:  # noqa: BLE001 — user code, surface cleanly
-        print(f"Could not resolve an optimizer: {e}")
-        return 1
-    print(f"Optimizer: {chosen}")
 
     import os
+    import traceback
     saved = os.getcwd()
     try:
-        # task.py __main__ runs from the run dir; give the optimizer the
-        # same footing (relative artifact paths, queue.json siblings).
+        # task.py __main__ runs from the run dir; give build_optimizer AND
+        # the optimizer the same footing (relative artifact paths,
+        # queue.json siblings) — user hooks that read the cwd must not see
+        # the invocation directory.
         os.chdir(run.run_dir)
-        optimizer.run(n=n)
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    except Exception as e:  # noqa: BLE001
-        print(f"Run failed: {e}")
-        return 1
+        try:
+            optimizer, chosen = _resolve_optimizer(run)
+        except Exception as e:  # noqa: BLE001 — user code, keep the evidence
+            print(f"Could not resolve an optimizer: {e}")
+            traceback.print_exc()
+            return 1
+        print(f"Optimizer: {chosen}")
+        try:
+            optimizer.run(n=n)
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+            return 130
+        except Exception as e:  # noqa: BLE001 — user code, keep the evidence
+            print(f"Run failed: {e}")
+            traceback.print_exc()
+            return 1
     finally:
         os.chdir(saved)
     return 0
+
+
+def _print_run_overview(history, scorer):
+    """The shared status/summary header: totals, best, families — all from
+    the read layer (utils/queries), which counts committed attempts only."""
+    from groundhog.utils import queries
+
+    summary = queries.run_summary(history, scorer)
+    fams = queries.families(history, scorer)
+
+    print(f"attempts: {summary['n_attempts']} "
+          f"({summary['n_done']} done, {summary['n_failed']} failed)")
+    best = summary["best"]
+    if best is not None:
+        print(f"best:     {_short(best['id'])} score={best['score']:.4f} "
+              f"{best['name']}")
+    print(f"families: {summary['n_families']}")
+    print(f"cost:     ${summary['total_cost']:.4f}")
+    if fams:
+        print()
+        print(f"{'family':<40} {'n':<4} {'best':<10} best score")
+        for f in fams:
+            score_str = (f"{f['best_score']:.4f}"
+                         if f["best_score"] is not None else "-")
+            print(f"{f['family_name']:<40} {len(f['members']):<4} "
+                  f"{_short(f['best_id']):<10} {score_str}")
 
 
 def cmd_status(args):
@@ -1384,40 +1407,7 @@ def cmd_status(args):
     history, task = run.history, run.task
     scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
 
-    committed = [a for a in history.list(only_done=False)
-                 if a.status in ("done", "fail")]
-    done = [a for a in committed if a.status == "done"]
-    failed = [a for a in committed if a.status == "fail"]
-    print(f"attempts: {len(committed)} ({len(done)} done, {len(failed)} failed)")
-
-    best = history.best(scorer) if done else None
-    if best is not None:
-        print(f"best:     {_short(best.id)} score={_attempt_score(best, scorer):.4f} "
-              f"{best.name}")
-
-    def _cost(a):
-        try:
-            return float(a.metadata.get("cost", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    families = history.derive_families()
-    print(f"families: {len(families)}")
-    print(f"cost:     ${sum(_cost(a) for a in committed):.4f}")
-
-    if families:
-        from groundhog.utils.direction import (
-            direction_title, read_direction_from_attempt,
-        )
-        print()
-        print(f"{'family':<40} {'n':<4} {'best':<10} best score")
-        for members in families:
-            title = direction_title(read_direction_from_attempt(members[0]) or "")
-            best_member = max(members, key=lambda a: _attempt_score(a, scorer))
-            best_score = _attempt_score(best_member, scorer)
-            score_str = f"{best_score:.4f}" if best_score > -1.0 else "-"
-            print(f"{title:<40} {len(members):<4} "
-                  f"{_short(best_member.id):<10} {score_str}")
+    _print_run_overview(history, scorer)
 
     items = history.list_in_progress()
     print()
