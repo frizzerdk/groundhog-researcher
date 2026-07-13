@@ -889,10 +889,12 @@ def _attempt_commit(args):
             # pieces the standard finish uses (result.json stays eval-only).
             from groundhog.utils.direction import (
                 promote_workspace_direction,
-                restore_inherited_first_line,
+                restore_inherited_direction,
                 workspace_name,
             )
-            from groundhog.utils.gates import evaluate_gates
+            from groundhog.utils.gates import (
+                DIRECTION_MODIFIED, evaluate_gates, gate_metadata,
+            )
             from groundhog.utils.results import write_metadata
 
             if prior is None:
@@ -909,20 +911,11 @@ def _attempt_commit(args):
                 print("WARNING: committing with no recorded evaluation - "
                       "best/scoring will treat this attempt as unscored")
                 metadata["no_recorded_result"] = True
-            success = not do_fail
-            for v in violations:
-                if v.severity == "fail":
-                    metadata["gate_failure"] = v.message
-                    success = False
-                elif v.gate == "direction-modified":
-                    metadata["direction_restored"] = True
-                elif v.gate == "direction-body-refined":
-                    metadata["direction_body_refined"] = True
-                elif v.gate == "solution-identical":
-                    metadata["non_promotable"] = True
-                    metadata["non_promotable_reason"] = v.message
-            if prior is not None:
-                restore_inherited_first_line(ws.path, prior)
+            metadata.update(gate_metadata(violations))
+            success = not do_fail and "gate_failure" not in metadata
+            if prior is not None and any(
+                    v.gate == DIRECTION_MODIFIED for v in violations):
+                restore_inherited_direction(ws.path, prior)
             write_metadata(ws.path, metadata)
             if not ws.name:
                 derived = workspace_name(ws.path)
@@ -960,11 +953,8 @@ def _print_gate_outcome(metadata):
         print(f"Gate: {metadata.get('non_promotable_reason', 'non-promotable')} "
               f"-> flagged non-promotable (commit stays done)")
     if metadata.get("direction_restored"):
-        print("Gate: inherited core_direction.md first line was modified -> "
-              "parent's first line restored")
-    if metadata.get("direction_body_refined"):
-        print("Gate: inherited core_direction.md body refined -> kept and "
-              "recorded")
+        print("Gate: inherited core_direction.md was modified -> parent's "
+              "direction restored")
 
 
 def _attempt_abort(args):
