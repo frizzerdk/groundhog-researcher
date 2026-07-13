@@ -60,6 +60,8 @@ from groundhog.base.attempt_history import (
 from groundhog.utils.results import read_result, write_metadata, read_attempt_metadata
 from groundhog.utils.direction import slugify
 from groundhog.utils.queries import safe_result
+from groundhog.utils.liveness import (
+    clear_heartbeat, pid_alive, read_heartbeat, write_heartbeat)
 
 _NOTE_KEY = re.compile(r"^[a-z0-9_-]{1,64}$")
 
@@ -185,9 +187,13 @@ class GitWorkspace(Workspace):
         self._wip_branch = wip_branch
 
     def commit(self, success: bool = True) -> GitAttempt:
+        """Record this workspace as an attempt. ``success=False`` records it
+        as FAILED — recorded work, never discarded (CLI: ``commit --fail``)."""
         return self._history._commit_workspace(self, success)
 
     def abort(self):
+        """Discard: remove the worktree and branch, leaving NO record. To
+        record failed work instead, use ``commit(success=False)``."""
         self._history._abort_workspace(self)
 
     def heartbeat(self):
@@ -355,6 +361,7 @@ class GitAttemptHistory(AttemptHistory):
         message = (f"{subject}\n\nStatus: {status}\n"
                    f"Groundhog-Created: {ts:.6f}\n")
 
+        self._normalize_eol(ws.path)
         self._git("add", "-A", cwd=ws.path)
         self._git("commit", "--allow-empty", "-F", "-",
                   input_bytes=message.encode("utf-8"),
@@ -369,6 +376,31 @@ class GitAttemptHistory(AttemptHistory):
         self._clear_heartbeat(ws.display_id)
         self._push_ref(sha)
         return self._load_attempt(sha)
+
+    def _normalize_eol(self, root: Path):
+        """CRLF -> LF for text files before commit. Stored bytes are then
+        EOL-stable across platforms, so a child byte-identical to its parent
+        modulo line endings is caught by the solution-identical gate
+        (workspace reads already normalize via universal newlines)."""
+        for f in root.rglob("*"):
+            if not f.is_file() or f.name == ".git":
+                continue
+            if f.suffix.lower() in _BINARY_EXTS:
+                continue
+            try:
+                data = f.read_bytes()
+            except OSError:
+                continue
+            if b"\r\n" not in data:
+                continue
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            try:
+                f.write_bytes(data.replace(b"\r\n", b"\n"))
+            except OSError:
+                pass
 
     def _settle_folder(self, ws: GitWorkspace, sha: str):
         """Rename the worktree dir from its uuid to the readable slug; on a
@@ -416,45 +448,13 @@ class GitAttemptHistory(AttemptHistory):
         return self._wip_dir / wsid
 
     def _write_heartbeat(self, wsid: str):
-        try:
-            self._heartbeat(wsid).write_text(
-                json.dumps({"pid": os.getpid(), "started_at": time.time()}),
-                encoding="utf-8")
-        except OSError:
-            pass
+        write_heartbeat(self._heartbeat(wsid))
 
     def _read_heartbeat(self, wsid: str) -> dict:
-        try:
-            return json.loads(self._heartbeat(wsid).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
+        return read_heartbeat(self._heartbeat(wsid))
 
     def _clear_heartbeat(self, wsid: str):
-        try:
-            self._heartbeat(wsid).unlink()
-        except OSError:
-            pass
-
-    @staticmethod
-    def _pid_alive(pid) -> bool:
-        try:
-            pid = int(pid)
-        except (TypeError, ValueError):
-            return False
-        if pid <= 0:
-            return False
-        try:
-            if os.name == "nt":
-                import ctypes
-                h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-                if h:
-                    ctypes.windll.kernel32.CloseHandle(h)
-                    return True
-                return False
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
+        clear_heartbeat(self._heartbeat(wsid))
 
     def _worktree_for_branch(self, branch: str) -> Optional[Path]:
         out = self._git_text("worktree", "list", "--porcelain")
@@ -510,12 +510,30 @@ class GitAttemptHistory(AttemptHistory):
                 parent=parent,
                 started_at=float(hb.get("started_at", 0.0)),
                 path=self._worktree_for_branch(ref),
-                live=self._pid_alive(hb.get("pid")),
+                live=pid_alive(hb.get("pid")),
             ))
         items.sort(key=lambda ip: ip.started_at)
         return items
 
+    def _resolve_wsid(self, wanted: str) -> str:
+        """Exact wip id, or any UNIQUE prefix of one (the CLI displays 8
+        chars of a 12-char id)."""
+        out = self._git_text("for-each-ref", "--format=%(refname:short)",
+                             "refs/heads/wip/", check=False)
+        ids = [r.strip()[len("wip/"):] for r in out.splitlines()
+               if r.strip().startswith("wip/")]
+        if wanted in ids:
+            return wanted
+        matches = [i for i in ids if i.startswith(wanted)]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise KeyError(f"ambiguous workspace id {wanted!r} "
+                           f"(matches {', '.join(sorted(matches))})")
+        raise KeyError(f"no in-progress workspace {wanted!r}")
+
     def resume(self, workspace_id: str) -> GitWorkspace:
+        workspace_id = self._resolve_wsid(str(workspace_id))
         branch = f"wip/{workspace_id}"
         res = self._git("rev-parse", "--verify", "--quiet", branch, check=False)
         if res.returncode != 0:

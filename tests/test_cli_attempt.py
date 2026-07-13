@@ -534,7 +534,8 @@ def test_tool_run_ws_relative_against_committed_attempt(tmp_path, capsys):
         assert attempt_group(["new"]) == 0
         wsid = capsys.readouterr().out.strip().splitlines()[0].split()[-1]
         # write a distinctive solution, commit it
-        ws_dirs = [p for p in (run_dir / "attempts").iterdir() if p.is_dir()]
+        ws_dirs = [p for p in (run_dir / "attempts").iterdir()
+                   if p.is_dir() and not p.name.startswith(".")]
         (ws_dirs[0] / "solution.py").write_text("def solve():\n    return 41.5\n",
                                                 encoding="utf-8")
         (ws_dirs[0] / "core_direction.md").write_text("constant baseline\n",
