@@ -144,9 +144,11 @@ def test_pointer_is_live_during_the_attempt(history_factory):
     assert seen == {"is_set": True, "path_matches": True}
 
 
-def test_preflight_failure_aborts_before_explore(history_factory):
+def test_preflight_failure_aborts_before_explore(history_factory, tmp_path):
     """A dead tool path is caught by the preflight probe: the agent backend
-    is never called, no attempt is committed, and the skip names the wrapper.
+    is never called, no attempt is committed, the workspace is aborted, and
+    the failure is recorded at RUN level (console skip + insights.md) since
+    nothing inside the discarded workspace survives.
     Regression: codex ran 3 full attempts with every tool dead (2026-07)."""
     class _DeadPreflight(AgentStrategy):
         def _preflight_probe(self, backend):
@@ -155,15 +157,39 @@ def test_preflight_failure_aborts_before_explore(history_factory):
     history = history_factory()
     backend = ScriptedAgent([GOOD])
     tk = _toolkit(history, backend)
+    tk.path = tmp_path
 
     log = _DeadPreflight()(tk)
 
     assert "preflight failed" in log.get("skipped", "")
     assert "groundhog-preflight.ps1" in log["skipped"]
-    assert "aborting attempt" in log["skipped"]
+    assert log["skipped"].isascii(), "skip message must be console-safe ASCII"
     assert backend.calls == [], "explore ran despite a failed preflight"
     assert history.list() == [], "a dead-tool attempt was committed"
+    assert history.list_in_progress() == [], "aborted workspace leaked"
     assert tk.ws.is_set() is False
+    # Run-level insights entry survives the abort.
+    insights = (tmp_path / "insights.md").read_text(encoding="utf-8")
+    assert "preflight failed" in insights
+    assert "blocker" in insights
+
+
+def test_optimizer_prints_the_preflight_skip_reason(history_factory, tmp_path, capsys):
+    from groundhog import SimpleOptimizer
+
+    class _DeadPreflight(AgentStrategy):
+        def _preflight_probe(self, backend):
+            return (False, "groundhog-preflight", "connection refused")
+
+    history = history_factory()
+    backend = ScriptedAgent([GOOD])
+    tk = _toolkit(history, backend)
+    tk.path = tmp_path
+
+    opt = SimpleOptimizer(tk, strategy=_DeadPreflight(), seed_strategy=None)
+    opt.run(n=1)
+    out = capsys.readouterr().out
+    assert "skipped: preflight failed" in out
 
 
 def test_preflight_success_proceeds(history_factory):

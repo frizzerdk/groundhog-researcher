@@ -570,11 +570,12 @@ class SimpleOptimizer(Optimizer):
             self.toolkit._current_queue_label = queue_label
 
             count_before = len(self.history.list())
+            out = {}
             try:
                 if config is not None:
-                    strategy(self.toolkit, config=config)
+                    out = strategy(self.toolkit, config=config) or {}
                 else:
-                    strategy(self.toolkit)
+                    out = strategy(self.toolkit) or {}
             except KeyboardInterrupt:
                 self.toolkit.log.end()
                 print("\n  Interrupted by user")
@@ -600,6 +601,8 @@ class SimpleOptimizer(Optimizer):
                     current_score = self._score_attempt(current_best, scorer)
                     if best_score is None or current_score > best_score:
                         best_score = current_score
+            elif out.get("skipped"):
+                print(f"  [{strategy.__class__.__name__}] skipped: {out['skipped']}")
 
         return best_score, total_cost
 
@@ -622,9 +625,13 @@ class SimpleOptimizer(Optimizer):
             strat = copy.copy(strategy)
             try:
                 if config is not None:
-                    strat(view, config=config)
+                    out = strat(view, config=config) or {}
                 else:
-                    strat(view)
+                    out = strat(view) or {}
+                if out.get("skipped"):
+                    view.log.info(
+                        f"[{strategy.__class__.__name__}] skipped: {out['skipped']}")
+                return out
             finally:
                 view.log.end()
 
