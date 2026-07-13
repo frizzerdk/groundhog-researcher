@@ -21,6 +21,12 @@ from pathlib import Path
 from groundhog.base.strategy import Strategy, StrategyConfig, param
 
 
+def _md_cell(text) -> str:
+    """Escape pipes so free text (family names, strategy labels) cannot
+    shred a markdown table row."""
+    return str(text).replace("|", "\\|")
+
+
 @dataclass
 class AnalyseConfig(StrategyConfig):
     """Configuration for the Analyse strategy."""
@@ -117,16 +123,25 @@ class Analyse(Strategy):
 
         lines = []
         for a in recent:
-            result = a.result
-            if not result.completed:
-                lines.append(f"  #{a.id} (parent={a.parent}): FAILED at {result.failed_stage}")
-                continue
-            last = list(result.stages.values())[-1]
-            score = scorer(last)
-            strategy = a.metadata.get("strategy", "?")
-            lines.append(f"  #{a.id} (parent={a.parent}, {strategy}): score={score:.4f}")
+            strategy = (a.metadata or {}).get("strategy", "?")
+            score = self._score_of(a, scorer)
+            if score is not None:
+                lines.append(f"  #{a.id} (parent={a.parent}, {strategy}): score={score:.4f}")
+            else:
+                lines.append(f"  #{a.id} (parent={a.parent}, {strategy}): "
+                             f"{self._status_label(a)}")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _status_label(attempt):
+        """Row label for an unscoreable attempt — by STATUS, not by score:
+        an in-progress leftover or a no-eval commit is not a failure."""
+        if attempt.status == "fail":
+            return "FAILED"
+        if attempt.status == "in-progress":
+            return "IN-PROGRESS"
+        return "no score"
 
     # --- Compression ---
 
@@ -186,14 +201,15 @@ Output only the compressed learnings, nothing else."""
 
     def _report_summary(self, attempts, scorer):
         scores = []
-        completed = failed = 0
+        completed = 0
         for a in attempts:
             s = self._score_of(a, scorer)
-            if s is None:
-                failed += 1
-            else:
+            if s is not None:
                 completed += 1
                 scores.append((a.id, s))
+        # Failed by STATUS: an in-progress leftover or a no-eval commit is
+        # unscoreable but not a failure.
+        failed = sum(1 for a in attempts if a.status == "fail")
         best = max(scores, key=lambda t: t[1]) if scores else None
         latest = scores[-1] if scores else None
         return {
@@ -273,7 +289,7 @@ and concrete. Output only the narrative, no heading."""
         lines += ["## Families", "", "| Family | Attempts | Best score |", "| --- | --- | --- |"]
         for f in families:
             best_s = f"{f['best']:.4f}" if f["best"] is not None else "-"
-            lines.append(f"| {f['name']} | {f['members']} | {best_s} |")
+            lines.append(f"| {_md_cell(f['name'])} | {f['members']} | {best_s} |")
         lines.append("")
 
         k = self.cfg.report_last_k
@@ -281,9 +297,9 @@ and concrete. Output only the narrative, no heading."""
                   "| --- | --- | --- | --- |"]
         for a in attempts[-k:]:
             s = self._score_of(a, scorer)
-            score_s = f"{s:.4f}" if s is not None else "FAILED"
-            strategy = a.metadata.get("strategy", "?")
-            lines.append(f"| {a.id} | {a.parent} | {strategy} | {score_s} |")
+            score_s = f"{s:.4f}" if s is not None else self._status_label(a)
+            strategy = (a.metadata or {}).get("strategy", "?")
+            lines.append(f"| {a.id} | {a.parent} | {_md_cell(strategy)} | {score_s} |")
         lines.append("")
 
         learnings = toolkit.learnings.get(last=self.cfg.report_top_learnings).strip()

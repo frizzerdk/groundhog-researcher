@@ -148,6 +148,35 @@ def test_write_report_false_skips_file():
         assert not (Path(tmp) / "reports" / "state.md").exists()
 
 
+def test_report_renders_in_progress_by_status_not_as_failed():
+    """An in-progress leftover is unscoreable but not a failure (remediation):
+    the summary's failed count goes by status, and the last-K table labels
+    the open workspace IN-PROGRESS."""
+    with tempfile.TemporaryDirectory() as tmp:
+        toolkit, history, task = _toolkit(tmp)
+        _commit_root(history, task, 70.0, direction="rollout")
+        ws = history.workspace()  # left open on purpose
+        (ws.path / "solution.py").write_text(_code(10.0), encoding="utf-8")
+
+        Analyse()(toolkit)
+
+        text = (Path(tmp) / "reports" / "state.md").read_text(encoding="utf-8")
+        assert "IN-PROGRESS" in text
+        assert "FAILED" not in text
+        assert "(1 scored, 0 failed)" in text
+
+
+def test_report_escapes_pipes_in_table_cells():
+    with tempfile.TemporaryDirectory() as tmp:
+        toolkit, history, task = _toolkit(tmp)
+        _commit_root(history, task, 70.0, direction="conv net | wide variant")
+
+        Analyse()(toolkit)
+
+        text = (Path(tmp) / "reports" / "state.md").read_text(encoding="utf-8")
+        assert "conv net \\| wide variant" in text
+
+
 def test_report_written_before_any_learnings():
     with tempfile.TemporaryDirectory() as tmp:
         toolkit, history, task = _toolkit(tmp)
