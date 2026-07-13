@@ -83,6 +83,11 @@ class Analyse(Strategy):
             result["report"] = str(report_path)
 
         result["cost"] = round(self.cost, 6)
+        if self.cost:
+            # Analyse commits no attempt, so this spend attaches to no
+            # record — say it out loud; the optimizer folds it into the
+            # run total from the returned dict.
+            self.log.info(f"analyse cost: ${self.cost:.4f}")
         return result
 
     # --- Init ---

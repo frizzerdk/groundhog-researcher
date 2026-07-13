@@ -667,13 +667,16 @@ class SimpleOptimizer(Optimizer):
                 continue
             self.toolkit.log.end()
 
-            # Some strategies (Analyse) don't create attempts
+            # Some strategies (Analyse) don't create attempts; others
+            # (ABTest) commit several per call — account every one, not
+            # just the last (a real run showed $0.18 console vs $2.29
+            # actual with arm A invisible).
             attempts = self.history.list()
             if len(attempts) > count_before:
-                latest = attempts[-1]
-                cost = self._get_attempt_cost(latest)
-                total_cost += cost
-                self._log_attempt(latest, scorer, best_score, total_cost)
+                for attempt in attempts[count_before:]:
+                    cost = self._get_attempt_cost(attempt)
+                    total_cost += cost
+                    self._log_attempt(attempt, scorer, best_score, total_cost)
 
                 # Update best
                 current_best = self.history.best(scorer)
@@ -681,10 +684,26 @@ class SimpleOptimizer(Optimizer):
                     current_score = self._score_attempt(current_best, scorer)
                     if best_score is None or current_score > best_score:
                         best_score = current_score
-            elif out.get("skipped"):
-                print(f"  [{strategy.__class__.__name__}] skipped: {out['skipped']}")
+            else:
+                if out.get("skipped"):
+                    print(f"  [{strategy.__class__.__name__}] skipped: "
+                          f"{out['skipped']}")
+                # Attempt-less spend (Analyse's compression/narration LLM
+                # calls) still counts toward the run total.
+                cost = self._as_cost(out.get("cost"))
+                if cost:
+                    total_cost += cost
+                    print(f"  [{strategy.__class__.__name__}] "
+                          f"cost ${cost:.4f} (${total_cost:.4f} total)")
 
         return best_score, total_cost
+
+    @staticmethod
+    def _as_cost(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _run_parallel(self, n, scorer, best_score, total_cost):
         """EXPERIMENTAL fan-out loop — see the class docstring for the contract.
@@ -734,6 +753,20 @@ class SimpleOptimizer(Optimizer):
                     if best_score is None or score > best_score:
                         best_score = score
 
+        def account_attemptless(out, strategy_name):
+            # A call that committed nothing can still have spent (Analyse):
+            # committing strategies return {"attempt": ...}, so its absence
+            # plus a cost marks attempt-less spend.
+            nonlocal total_cost
+            if not out or "attempt" in out:
+                return
+            cost = self._as_cost(out.get("cost"))
+            if cost:
+                total_cost += cost
+                with print_lock:
+                    print(f"  [{strategy_name}] cost ${cost:.4f} "
+                          f"(${total_cost:.4f} total)")
+
         interrupted = False
         with ThreadPoolExecutor(max_workers=self.concurrency,
                                 thread_name_prefix="groundhog-strategy") as pool:
@@ -746,7 +779,8 @@ class SimpleOptimizer(Optimizer):
                     strategy, config, queue_label = self._next_dispatch(rotation)
                     dispatched = 1
                     try:
-                        run_one(strategy, config, queue_label)
+                        out = run_one(strategy, config, queue_label)
+                        account_attemptless(out, strategy.__class__.__name__)
                     except Exception as e:
                         print(f"\n  [{strategy.__class__.__name__}] ERROR: {e}")
                     account()
@@ -764,6 +798,8 @@ class SimpleOptimizer(Optimizer):
                         if exc is not None:
                             with print_lock:
                                 print(f"\n  [{strategy_name}] ERROR: {exc}")
+                            continue
+                        account_attemptless(future.result(), strategy_name)
                     account()
             except KeyboardInterrupt:
                 interrupted = True
