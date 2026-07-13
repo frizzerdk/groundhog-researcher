@@ -623,6 +623,24 @@ def attempt_group(args):
     return handler(rest)
 
 
+def _json_out(obj) -> str:
+    """JSON for machine consumers. A scorer can produce NaN/Inf, which
+    json.dumps would emit as invalid JSON — normalize them to null."""
+    import json
+    import math
+
+    def clean(v):
+        if isinstance(v, float) and not math.isfinite(v):
+            return None
+        if isinstance(v, dict):
+            return {k: clean(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [clean(x) for x in v]
+        return v
+
+    return json.dumps(clean(obj), indent=2, default=str)
+
+
 def _flag(args, name):
     """Pop a boolean flag; return (present, remaining_args)."""
     present = name in args
@@ -709,12 +727,11 @@ def _attempt_list(args):
     scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
 
     if as_json:
-        import json
         from groundhog.utils import queries
         rows = queries.attempt_table(history, scorer, only_done=not show_all)
         if tag is not None:
             rows = [r for r in rows if tag in _read_tags(history, r["id"])]
-        print(json.dumps(rows, indent=2, default=str))
+        print(_json_out(rows))
         return 0
 
     attempts = history.list(only_done=not show_all)
@@ -755,11 +772,10 @@ def _attempt_show(args):
         return 1
 
     if as_json and file_arg is None:
-        import json
         from groundhog.utils import queries
         scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
         detail = queries.attempt_detail(history, attempt_id, scorer)
-        print(json.dumps(detail, indent=2, default=str))
+        print(_json_out(detail))
         return 0
 
     if file_arg is not None:
@@ -767,7 +783,12 @@ def _attempt_show(args):
         if content is None:
             print(f"No such file in attempt {attempt_id}: {file_arg}")
             return 1
-        print(content)
+        if as_json:
+            # Both flags honored: the file, wrapped for machine consumers.
+            print(_json_out({"attempt": attempt.id, "file": file_arg,
+                             "content": content}))
+        else:
+            print(content)
         return 0
 
     scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
@@ -1202,8 +1223,6 @@ def cmd_eval(args):
         return per_stage.get(name, scorer)(stage)
 
     if as_json:
-        import json
-
         out = {
             "completed": result.completed,
             "failed_stage": result.failed_stage,
@@ -1219,7 +1238,7 @@ def cmd_eval(args):
                 for name, stage in result.stages.items()
             },
         }
-        print(json.dumps(out, indent=2, default=str))
+        print(_json_out(out))
     else:
         for name, stage in result.stages.items():
             print(f"[{name}] score={_stage_score(name, stage):.4f}")
@@ -1255,11 +1274,9 @@ def cmd_summary(args):
     scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
 
     if as_json:
-        import json
         from groundhog.utils import queries
-        print(json.dumps({"summary": queries.run_summary(history, scorer),
-                          "families": queries.families(history, scorer)},
-                         indent=2, default=str))
+        print(_json_out({"summary": queries.run_summary(history, scorer),
+                         "families": queries.families(history, scorer)}))
         return 0
 
     _print_run_overview(history, scorer)
