@@ -9,6 +9,7 @@ Usage:
     groundhog init --script [directory]     # script-only (no project, inline deps)
 """
 
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -1574,19 +1575,59 @@ def _strategy_show(args):
     return 0
 
 
-def _coerce_param(value, default):
-    """Coerce a --set string by the param default's type; a None default
-    keeps the string (no type to coerce by)."""
-    if isinstance(default, bool):
+def _param_base_type(param_spec):
+    """Resolve a param's coercion type from its DECLARED type (describe()'s
+    f.type), stripping Optional/None from unions; falls back to the
+    default's type for undeclared/exotic annotations. Declared-type-first
+    matters: a ``param(None, ...)`` knob has no default type, and coercing
+    by ``type(None)`` left every ``--set timeout=600`` a string."""
+    import typing
+
+    declared = param_spec.get("type")
+    by_name = {"bool": bool, "int": int, "float": float, "str": str}
+
+    def resolve(t):
+        if t in (bool, int, float, str):
+            return t
+        if isinstance(t, str):
+            s = t.replace("typing.", "").strip()
+            m = re.fullmatch(r"Optional\[(.+)\]", s)
+            if m:
+                s = m.group(1).strip()
+            else:
+                parts = [p.strip() for p in s.split("|")
+                         if p.strip() not in ("None", "NoneType")]
+                if len(parts) == 1:
+                    s = parts[0]
+            return by_name.get(s)
+        args = [a for a in typing.get_args(t) if a is not type(None)]
+        if len(args) == 1:
+            return resolve(args[0])
+        return None
+
+    base = resolve(declared)
+    if base is None:
+        default = param_spec.get("default")
+        if isinstance(default, (bool, int, float, str)):
+            base = type(default)
+    return base
+
+
+def _coerce_param(value, param_spec):
+    """Coerce a --set string by the param's declared type (Optional[T]
+    coerces by T; bool checked before int since bool subclasses int).
+    Unresolvable types keep the string."""
+    base = _param_base_type(param_spec)
+    if base is bool:
         low = value.lower()
         if low in ("1", "true", "yes", "on"):
             return True
         if low in ("0", "false", "no", "off"):
             return False
         raise ValueError(f"expected a boolean, got {value!r}")
-    if isinstance(default, int):
+    if base is int:
         return int(value)
-    if isinstance(default, float):
+    if base is float:
         return float(value)
     return value
 
@@ -1638,7 +1679,7 @@ def _strategy_run(args):
                   f"See: groundhog strategy show {name}")
             return 1
         try:
-            config[k] = _coerce_param(v, entry["params"][k]["default"])
+            config[k] = _coerce_param(v, entry["params"][k])
         except ValueError as e:
             print(f"--set {k}: {e}")
             return 1
