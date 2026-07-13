@@ -1527,14 +1527,30 @@ def _type_name(t):
     return t.__name__ if isinstance(t, type) else str(t)
 
 
+def _find_strategy_entry(entries, name):
+    """Resolve ``name`` among discovered entries. On a builtin/task-module
+    name collision the task-module entry wins — the more local definition,
+    the same rule agent-tool collisions follow — and a loud warning says
+    the shadowing happened."""
+    matches = [e for e in entries if e["name"] == name]
+    if not matches:
+        return None
+    task_matches = [e for e in matches if e["source"] == "task"]
+    chosen = task_matches[0] if task_matches else matches[0]
+    if task_matches and len(task_matches) < len(matches):
+        print(f"WARNING: strategy name {name!r} is defined by both a "
+              f"builtin and the task module; using the task module's "
+              f"{chosen['cls'].__name__}", file=sys.stderr)
+    return chosen
+
+
 def _strategy_show(args):
     as_json, args = _flag(args, "--json")
     if not args:
         print("Usage: groundhog strategy show <name> [--json]")
         return 1
     name = args[0]
-    entry = next(
-        (e for e in _discover_strategies_here() if e["name"] == name), None)
+    entry = _find_strategy_entry(_discover_strategies_here(), name)
     if entry is None:
         print(f"No strategy named {name!r}. Try: groundhog strategy list")
         return 1
@@ -1655,9 +1671,7 @@ def _strategy_run(args):
     if run is None:
         return 1
     from groundhog.strategies.discover import discover_strategies
-    entry = next(
-        (e for e in discover_strategies(module=run.module)
-         if e["name"] == name), None)
+    entry = _find_strategy_entry(discover_strategies(module=run.module), name)
     if entry is None:
         print(f"No strategy named {name!r}. Try: groundhog strategy list")
         return 1

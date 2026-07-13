@@ -293,6 +293,51 @@ def test_strategy_run_bad_coercion_errors(tmp_path, capsys):
     assert "--set value" in out
 
 
+_SHADOWING_STRATEGY = '''
+
+class Improve(Strategy):
+    """Task-local improve that shadows the builtin."""
+    def __call__(self, toolkit, config=None):
+        from groundhog.utils.direction import write_direction
+        ws = toolkit.history.workspace()
+        (ws.path / "solution.py").write_text(
+            "def solve():\\n    return 50.0", encoding="utf-8")
+        write_direction(ws.path, "shadow direction")
+        result = toolkit.task.evaluate(ws.path)
+        toolkit.finalize(ws, result, strategy=self.name)
+        return {}
+'''
+
+
+def test_strategy_show_prefers_task_module_on_name_collision(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "task.py").write_text(_TASK_BODY + _SHADOWING_STRATEGY,
+                                     encoding="utf-8")
+    with _in_dir(run_dir):
+        rc = strategy_group(["show", "improve"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "(task)" in captured.out
+    assert "Task-local improve" in captured.out
+    assert "WARNING" in captured.err and "improve" in captured.err
+
+
+def test_strategy_run_prefers_task_module_on_name_collision(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "task.py").write_text(_TASK_BODY + _SHADOWING_STRATEGY,
+                                     encoding="utf-8")
+    with _in_dir(run_dir):
+        rc = strategy_group(["run", "improve"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "WARNING" in captured.err
+    attempts = FolderAttemptHistory(run_dir).list()
+    assert len(attempts) == 1
+    assert "return 50.0" in attempts[0].code  # task-module Improve, no LLM
+
+
 def test_coerce_param_uses_declared_type_not_default():
     """param(None, ...) knobs must coerce by the DECLARED type (remediation
     C2): --set timeout=600 used to stay the string "600"."""
