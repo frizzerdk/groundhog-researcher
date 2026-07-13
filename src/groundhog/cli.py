@@ -444,19 +444,22 @@ def set_prefer_tier(args):
 
 
 def cmd_report(args):
-    """`groundhog report [--out PATH]` — write a run-state markdown report.
+    """`groundhog report [--out PATH] [--no-llm]` — write a run-state
+    markdown report.
 
     Data-only by default; when the run's toolkit carries an LLM, one cheap
-    default-tier pass adds a short narrative on top. ``--out -`` prints to
-    stdout instead of writing a file.
+    default-tier pass adds a short narrative on top (``--no-llm`` skips it).
+    ``--out -`` prints to stdout; a relative ``--out`` resolves against the
+    run dir, like the default path.
     """
+    no_llm, args = _flag(args, "--no-llm")
     out_arg, args = _opt(args, "--out")
     if args and args[0] in ("-h", "--help"):
-        print("Usage: groundhog report [--out reports/state.md]")
+        print("Usage: groundhog report [--out reports/state.md] [--no-llm]")
         print("       groundhog report --out -      (print to stdout)")
         return 0
     if args:
-        print("Usage: groundhog report [--out reports/state.md]")
+        print("Usage: groundhog report [--out reports/state.md] [--no-llm]")
         return 1
 
     run = _resolve_run()
@@ -467,7 +470,7 @@ def cmd_report(args):
     from groundhog.tools import report as report_mod
     data = report_mod.gather(run.history, scorer)
     narrative = None
-    llm = getattr(run.toolkit, "llm", None)
+    llm = None if no_llm else getattr(run.toolkit, "llm", None)
     if llm is not None:
         narrative = report_mod.narrative(llm, data)
     text = report_mod.render_markdown(run.task.name, data, narrative)
@@ -475,7 +478,12 @@ def cmd_report(args):
     if out_arg == "-":
         print(text)
         return 0
-    out_path = Path(out_arg) if out_arg else (run.run_dir / "reports" / "state.md")
+    if out_arg:
+        out_path = Path(out_arg)
+        if not out_path.is_absolute():
+            out_path = run.run_dir / out_path
+    else:
+        out_path = run.run_dir / "reports" / "state.md"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(text, encoding="utf-8")
     print(f"Wrote {out_path}")
