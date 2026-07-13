@@ -51,13 +51,16 @@ class MarkdownLearnings(Learnings):
         self._path.write_text(content.replace(search, replace), encoding="utf-8")
 
     def _entries(self):
+        from groundhog.utils.learnings_digest import DIGEST_HEADER
         content = self._path.read_text(encoding="utf-8").strip()
         if not content:
             return []
         # Split on the exact separator add() writes — a bare "---" would
         # also match markdown table rows (|---|) inside entries and shred
-        # them into fragments.
-        return [e.strip() for e in content.split(SEPARATOR) if e.strip()]
+        # them into fragments. The rebuilt digest's header comment is
+        # file furniture, not an entry.
+        return [e.strip() for e in content.split(SEPARATOR)
+                if e.strip() and e.strip() != DIGEST_HEADER]
 
     def _sample(self, entries, last, random):
         if last >= len(entries):

@@ -188,69 +188,15 @@ def inherited_direction_changed_from(ws_dir: Path | str, prior) -> bool:
     return normalize_direction(current or "") != normalize_direction(parent)
 
 
-def _split_direction(text: str) -> tuple[str, str]:
-    """Split a normalized direction into ``(first_line, body)``.
+def restore_inherited_direction(ws_dir: Path | str, prior) -> Optional[Path]:
+    """Restore the parent ATTEMPT's full direction into the workspace.
 
-    The first line is the approach name — the family's immutable
-    identity, doubling as the display slug. The body is everything after
-    it: refinable. Both parts are normalized so trivial formatting churn
-    doesn't register as a change.
+    The commit-time soft-gate response: directions are IMMUTABLE on
+    inheritance — any mid-session edit (first line, body, or a deleted
+    file) is reverted to the parent's direction byte-for-byte. Returns
+    the written path, or ``None`` when the parent records no direction.
     """
-    norm = normalize_direction(text or "")
-    first, _, body = norm.partition("\n")
-    return first.strip(), body.strip()
-
-
-def inherited_direction_first_line_changed_from(ws_dir: Path | str, prior) -> bool:
-    """True when the workspace direction's FIRST LINE differs from the
-    parent ATTEMPT's — the immutable family-identity line."""
-    if prior is None:
-        return False
-    parent = read_direction_from_attempt(prior)
-    if parent is None:
-        return False
-    current = read_direction(ws_dir)
-    return _split_direction(current or "")[0] != _split_direction(parent)[0]
-
-
-def inherited_direction_body_changed_from(ws_dir: Path | str, prior) -> bool:
-    """True when the workspace direction's BODY (everything after the
-    first line) differs from the parent ATTEMPT's — a permitted
-    refinement, kept and recorded rather than reverted."""
-    if prior is None:
-        return False
-    parent = read_direction_from_attempt(prior)
-    if parent is None:
-        return False
-    current = read_direction(ws_dir)
-    return _split_direction(current or "")[1] != _split_direction(parent)[1]
-
-
-def restore_inherited_first_line(ws_dir: Path | str, prior) -> Optional[Path]:
-    """Restore the parent's first line, preserving the workspace body.
-
-    The family-identity soft-gate: a child may refine the direction's
-    body but not rename the approach. Replaces the first non-empty line
-    of the workspace direction with the parent's, keeping the refined
-    body verbatim. Falls back to a full inherit when the workspace has no
-    direction left to keep. Returns the written path, or ``None`` when the
-    parent records no direction.
-    """
-    if prior is None:
-        return None
-    parent = read_direction_from_attempt(prior)
-    if parent is None:
-        return None
-    current = read_direction(ws_dir)
-    if not current or not current.strip():
-        return inherit_direction_from_attempt(prior, ws_dir)
-    parent_first = _split_direction(parent)[0]
-    lines = current.splitlines()
-    for i, line in enumerate(lines):
-        if line.strip():
-            lines[i] = parent_first
-            break
-    return write_direction(ws_dir, "\n".join(lines))
+    return inherit_direction_from_attempt(prior, ws_dir)
 
 
 def solution_matches_attempt(ws_dir: Path | str, other) -> bool:

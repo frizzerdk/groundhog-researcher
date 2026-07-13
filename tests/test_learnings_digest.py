@@ -113,7 +113,7 @@ def test_attempt_learnings_reads_root_and_work_files():
 
 
 def test_attempt_learnings_strips_agent_seed():
-    from groundhog.strategies.agent import LEARNINGS_SEED
+    from groundhog.utils.learnings_digest import LEARNINGS_SEED
 
     with tempfile.TemporaryDirectory() as tmp:
         history = FolderAttemptHistory(Path(tmp))
@@ -148,6 +148,47 @@ def test_improve_records_learning_in_attempt_and_digest():
         assert attempt.metadata["strategy"] == "improve"
         assert attempt_learnings(attempt) == ["- learned: smaller is better"]
         assert "- learned: smaller is better" in toolkit.learnings.get()
+
+
+def test_seed_carries_no_fabricated_observations():
+    """The seed's examples used to embed concrete fake metrics (0.90->0.86,
+    lr 1e-2 -> NaN) that promotion surfaced as real observations
+    (remediation seed): placeholder-shaped examples only."""
+    from groundhog.utils.learnings_digest import LEARNINGS_SEED
+
+    assert "0.90" not in LEARNINGS_SEED
+    assert "1e-2" not in LEARNINGS_SEED
+    assert "[specific change X]" in LEARNINGS_SEED
+
+
+def test_collect_learnings_strips_seed_block_on_promotion():
+    from groundhog.strategies.agent import AgentStrategy
+    from groundhog.utils.learnings_digest import LEARNINGS_SEED
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws_dir = Path(tmp) / "ws"
+        (ws_dir / "work").mkdir(parents=True)
+        (ws_dir / "work" / "learnings.md").write_text(
+            LEARNINGS_SEED + "\n- tried dropout 0.5 -> acc up 2% -> keep it\n",
+            encoding="utf-8")
+
+        toolkit = SimpleNamespace(
+            learnings=MarkdownLearnings(Path(tmp) / "store"))
+        ws = SimpleNamespace(path=ws_dir)
+        AgentStrategy()._collect_learnings(toolkit, ws)
+
+        promoted = toolkit.learnings.get()
+        assert "tried dropout 0.5" in promoted
+        assert "[specific change X]" not in promoted
+        assert "# Learnings" not in promoted
+
+        # A file left as the untouched seed promotes nothing.
+        untouched_tk = SimpleNamespace(
+            learnings=MarkdownLearnings(Path(tmp) / "store2"))
+        (ws_dir / "work" / "learnings.md").write_text(
+            LEARNINGS_SEED, encoding="utf-8")
+        AgentStrategy()._collect_learnings(untouched_tk, ws)
+        assert untouched_tk.learnings.get() == ""
 
 
 # === Lens: rebuild_digest =================================================
@@ -207,6 +248,24 @@ def test_rebuild_digest_groups_by_family_and_keeps_failures():
                              text.index("rollout follow-up")]
         mcts_position = text.index("mcts insight")
         assert not (min(rollout_positions) < mcts_position < max(rollout_positions))
+
+
+def test_rebuild_digest_header_never_glues_into_entries():
+    """The header used to join the first entry with a bare blank line, so
+    every prompt embedding the digest carried the comment (remediation):
+    the header now joins with the standard separator and the reader drops
+    it as file furniture."""
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        _commit(history, learnings=["note a"], direction="rollout")
+
+        text = rebuild_digest(history, Path(tmp) / "learnings.md")
+        assert text.startswith(DIGEST_HEADER + SEPARATOR)
+
+        learnings = MarkdownLearnings(Path(tmp))
+        assert learnings.count() == 1
+        assert DIGEST_HEADER not in learnings.get()
+        assert DIGEST_HEADER not in learnings.get(last=1)
 
 
 def test_markdown_learnings_reads_rebuilt_digest_unchanged():

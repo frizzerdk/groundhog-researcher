@@ -9,6 +9,7 @@ Usage:
     groundhog init --script [directory]     # script-only (no project, inline deps)
 """
 
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -888,10 +889,12 @@ def _attempt_commit(args):
             # pieces the standard finish uses (result.json stays eval-only).
             from groundhog.utils.direction import (
                 promote_workspace_direction,
-                restore_inherited_first_line,
+                restore_inherited_direction,
                 workspace_name,
             )
-            from groundhog.utils.gates import evaluate_gates
+            from groundhog.utils.gates import (
+                DIRECTION_MODIFIED, evaluate_gates, gate_metadata,
+            )
             from groundhog.utils.results import write_metadata
 
             if prior is None:
@@ -908,20 +911,11 @@ def _attempt_commit(args):
                 print("WARNING: committing with no recorded evaluation - "
                       "best/scoring will treat this attempt as unscored")
                 metadata["no_recorded_result"] = True
-            success = not do_fail
-            for v in violations:
-                if v.severity == "fail":
-                    metadata["gate_failure"] = v.message
-                    success = False
-                elif v.gate == "direction-modified":
-                    metadata["direction_restored"] = True
-                elif v.gate == "direction-body-refined":
-                    metadata["direction_body_refined"] = True
-                elif v.gate == "solution-identical":
-                    metadata["non_promotable"] = True
-                    metadata["non_promotable_reason"] = v.message
-            if prior is not None:
-                restore_inherited_first_line(ws.path, prior)
+            metadata.update(gate_metadata(violations))
+            success = not do_fail and "gate_failure" not in metadata
+            if prior is not None and any(
+                    v.gate == DIRECTION_MODIFIED for v in violations):
+                restore_inherited_direction(ws.path, prior)
             write_metadata(ws.path, metadata)
             if not ws.name:
                 derived = workspace_name(ws.path)
@@ -964,11 +958,8 @@ def _print_gate_outcome(metadata):
         print(f"Gate: {metadata.get('non_promotable_reason', 'non-promotable')} "
               f"-> flagged non-promotable (commit stays done)")
     if metadata.get("direction_restored"):
-        print("Gate: inherited core_direction.md first line was modified -> "
-              "parent's first line restored")
-    if metadata.get("direction_body_refined"):
-        print("Gate: inherited core_direction.md body refined -> kept and "
-              "recorded")
+        print("Gate: inherited core_direction.md was modified -> parent's "
+              "direction restored")
 
 
 def _attempt_abort(args):
@@ -1492,21 +1483,35 @@ def strategy_group(args):
 
 def _discover_strategies_here():
     """Built-ins plus, when the cwd resolves to a run dir, the task module's
-    strategies. Loader failures mean "no task module", never an error —
-    list/show must work outside a run dir."""
+    strategies. No task.py means "no task module", never an error —
+    list/show must work outside a run dir. A task.py that EXISTS but fails
+    to load gets a stderr note: silence here made users think their
+    strategies simply weren't discovered."""
     from groundhog import rundir
     from groundhog.strategies.discover import discover_strategies
 
     module = None
     try:
         module = rundir.load_run().module
-    except (Exception, SystemExit):
+    except FileNotFoundError:
         pass
+    except (Exception, SystemExit) as e:
+        print(f"note: task.py found but failed to load ({e}); "
+              f"showing built-in strategies only", file=sys.stderr)
     return discover_strategies(module=module)
+
+
+def _warn_broken_strategies(entries):
+    for e in entries:
+        if e.get("error"):
+            print(f"warning: strategy {e['name']!r} ({e['source']}) skipped: "
+                  f"Config broken ({e['error']})", file=sys.stderr)
 
 
 def _strategy_list(args):
     entries = _discover_strategies_here()
+    _warn_broken_strategies(entries)
+    entries = [e for e in entries if not e.get("error")]
     width = max(len(e["name"]) for e in entries)
     for e in entries:
         print(f"  {e['name']:<{width}}  {e['source']:<7}  {e['doc']}")
@@ -1517,16 +1522,38 @@ def _type_name(t):
     return t.__name__ if isinstance(t, type) else str(t)
 
 
+def _find_strategy_entry(entries, name):
+    """Resolve ``name`` among discovered entries. On a builtin/task-module
+    name collision the task-module entry wins — the more local definition,
+    the same rule agent-tool collisions follow — and a loud warning says
+    the shadowing happened."""
+    matches = [e for e in entries if e["name"] == name]
+    if not matches:
+        return None
+    task_matches = [e for e in matches if e["source"] == "task"]
+    chosen = task_matches[0] if task_matches else matches[0]
+    if task_matches and len(task_matches) < len(matches):
+        print(f"WARNING: strategy name {name!r} is defined by both a "
+              f"builtin and the task module; using the task module's "
+              f"{chosen['cls'].__name__}", file=sys.stderr)
+    return chosen
+
+
 def _strategy_show(args):
     as_json, args = _flag(args, "--json")
     if not args:
         print("Usage: groundhog strategy show <name> [--json]")
         return 1
     name = args[0]
-    entry = next(
-        (e for e in _discover_strategies_here() if e["name"] == name), None)
+    entry = _find_strategy_entry(_discover_strategies_here(), name)
     if entry is None:
         print(f"No strategy named {name!r}. Try: groundhog strategy list")
+        return 1
+    if entry.get("error"):
+        print(f"Strategy {name!r} ({entry['source']}) is unavailable: its "
+              f"Config could not be described ({entry['error']}).")
+        print("Every Config field needs a default: "
+              "field: type = param(default, \"description\")")
         return 1
     params = entry["params"]
 
@@ -1559,19 +1586,59 @@ def _strategy_show(args):
     return 0
 
 
-def _coerce_param(value, default):
-    """Coerce a --set string by the param default's type; a None default
-    keeps the string (no type to coerce by)."""
-    if isinstance(default, bool):
+def _param_base_type(param_spec):
+    """Resolve a param's coercion type from its DECLARED type (describe()'s
+    f.type), stripping Optional/None from unions; falls back to the
+    default's type for undeclared/exotic annotations. Declared-type-first
+    matters: a ``param(None, ...)`` knob has no default type, and coercing
+    by ``type(None)`` left every ``--set timeout=600`` a string."""
+    import typing
+
+    declared = param_spec.get("type")
+    by_name = {"bool": bool, "int": int, "float": float, "str": str}
+
+    def resolve(t):
+        if t in (bool, int, float, str):
+            return t
+        if isinstance(t, str):
+            s = t.replace("typing.", "").strip()
+            m = re.fullmatch(r"Optional\[(.+)\]", s)
+            if m:
+                s = m.group(1).strip()
+            else:
+                parts = [p.strip() for p in s.split("|")
+                         if p.strip() not in ("None", "NoneType")]
+                if len(parts) == 1:
+                    s = parts[0]
+            return by_name.get(s)
+        args = [a for a in typing.get_args(t) if a is not type(None)]
+        if len(args) == 1:
+            return resolve(args[0])
+        return None
+
+    base = resolve(declared)
+    if base is None:
+        default = param_spec.get("default")
+        if isinstance(default, (bool, int, float, str)):
+            base = type(default)
+    return base
+
+
+def _coerce_param(value, param_spec):
+    """Coerce a --set string by the param's declared type (Optional[T]
+    coerces by T; bool checked before int since bool subclasses int).
+    Unresolvable types keep the string."""
+    base = _param_base_type(param_spec)
+    if base is bool:
         low = value.lower()
         if low in ("1", "true", "yes", "on"):
             return True
         if low in ("0", "false", "no", "off"):
             return False
         raise ValueError(f"expected a boolean, got {value!r}")
-    if isinstance(default, int):
+    if base is int:
         return int(value)
-    if isinstance(default, float):
+    if base is float:
         return float(value)
     return value
 
@@ -1599,11 +1666,15 @@ def _strategy_run(args):
     if run is None:
         return 1
     from groundhog.strategies.discover import discover_strategies
-    entry = next(
-        (e for e in discover_strategies(module=run.module)
-         if e["name"] == name), None)
+    entry = _find_strategy_entry(discover_strategies(module=run.module), name)
     if entry is None:
         print(f"No strategy named {name!r}. Try: groundhog strategy list")
+        return 1
+    if entry.get("error"):
+        print(f"Strategy {name!r} ({entry['source']}) cannot run: its "
+              f"Config could not be described ({entry['error']}).")
+        print("Every Config field needs a default: "
+              "field: type = param(default, \"description\")")
         return 1
 
     config = {}
@@ -1617,14 +1688,21 @@ def _strategy_run(args):
                   f"See: groundhog strategy show {name}")
             return 1
         try:
-            config[k] = _coerce_param(v, entry["params"][k]["default"])
+            config[k] = _coerce_param(v, entry["params"][k])
         except ValueError as e:
             print(f"--set {k}: {e}")
             return 1
 
     toolkit = run.toolkit
     scorer = _scorer_for(run.task, through=getattr(toolkit, "through", None))
-    strategy = entry["cls"](config)
+    try:
+        strategy = entry["cls"](config)
+    except TypeError as e:
+        print(f"Could not construct {name!r}: {e}")
+        print("This strategy requires programmatic construction (constructor "
+              "arguments beyond config); run it from task.py or an optimizer "
+              "schedule instead.")
+        return 1
     for _ in range(n):
         count_before = len(run.history.list(only_done=False))
         try:

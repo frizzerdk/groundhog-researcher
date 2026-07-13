@@ -1,6 +1,7 @@
 """Simple optimizer: weighted strategy rotation, potential-based prior selection."""
 
 import copy
+import json
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from itertools import cycle
@@ -73,6 +74,28 @@ class _LockedHistory:
 
     def __getattr__(self, name):
         return getattr(self._history, name)
+
+
+class _LockedLearnings:
+    """Learnings proxy serializing writes on the run's attempt lock.
+
+    The markdown backend's ``add``/``edit`` are read-modify-write on one
+    file — two workers appending at once lose entries. Reads pass through."""
+
+    def __init__(self, learnings, lock):
+        self._learnings = learnings
+        self._lock = lock
+
+    def add(self, text):
+        with self._lock:
+            return self._learnings.add(text)
+
+    def edit(self, search, replace):
+        with self._lock:
+            return self._learnings.edit(search, replace)
+
+    def __getattr__(self, name):
+        return getattr(self._learnings, name)
 
 
 class _LineAtomicLog(StrategyLog):
@@ -156,9 +179,14 @@ class SimpleOptimizer(Optimizer):
       text, and per-attempt event streams still land in each attempt's
       ``attemptlog.jsonl``/``.md``.
     - Strategy instances are shallow-copied per dispatch (their per-call
-      instance state is not thread-safe). Agent strategies whose build-time
-      tools closed over the ROOT toolkit's workspace handle are not
-      parallel-safe yet.
+      instance state is not thread-safe). Agent strategies are REFUSED at
+      construction with N > 1: the default agent tools bind the root
+      toolkit's workspace handle, so parallel agent attempts would
+      silently read each other's workspaces.
+    - Up to N ``task.evaluate`` calls run at once, each on its own
+      workspace. The task's evaluator must tolerate N-way concurrency:
+      shared datasets, GPU memory, fixed-name temp files, or module
+      globals in the evaluation path will collide across workers.
     """
 
     def __init__(self, toolkit: Toolkit,
@@ -237,6 +265,24 @@ class SimpleOptimizer(Optimizer):
             self._register_strategy(s)
         for s in (extras or []):
             self._register_strategy(s, allow_overwrite=False)
+
+        self._print_lock = threading.Lock()
+
+        if self.concurrency > 1:
+            from groundhog.strategies.agent import AgentStrategy
+            offenders = sorted({
+                s.__class__.__name__
+                for s in [*self._schedule, *(extras or [])]
+                if isinstance(s, AgentStrategy)
+            })
+            if offenders:
+                raise ValueError(
+                    f"concurrency={self.concurrency} with agent strategies "
+                    f"({', '.join(offenders)}) is not supported: the default "
+                    f"agent tools bind the root toolkit's workspace handle, "
+                    f"so parallel agent attempts silently read each other's "
+                    f"workspaces. Run agent strategies with concurrency=1."
+                )
 
     def _register_strategy(self, strategy: Strategy, allow_overwrite: bool = True) -> None:
         """Add a strategy to the queue-resolution registry under its declared
@@ -547,6 +593,8 @@ class SimpleOptimizer(Optimizer):
         best_str = f"Best: {best_score:.4f}" if best_score is not None else "No successful attempts"
         print(f"{best_str}  Total cost: ${total_cost:.4f}")
 
+    ROTATION_STATE_FILENAME = "rotation_state.json"
+
     def _next_dispatch(self, rotation):
         """Pick the next (strategy, config, queue_label) — queue overrides rotation."""
         queue_item = read_queue(self.path)
@@ -555,10 +603,43 @@ class SimpleOptimizer(Optimizer):
             strategy = self._strategy_registry.get(strategy_name)
             if strategy:
                 queue_label = f"{strategy_name} from {queue_item.get('source', '?')}"
-                self.toolkit.log.info(f"[queue] {queue_label}")
+                with self._print_lock:
+                    self.toolkit.log.info(f"[queue] {queue_label}")
                 return strategy, queue_item.get("config"), queue_label
-            self.toolkit.log.info(f"[queue] unknown strategy: {strategy_name}, skipping")
-        return next(rotation), None, ""
+            with self._print_lock:
+                self.toolkit.log.info(
+                    f"[queue] unknown strategy: {strategy_name}, skipping")
+        return self._next_rotation(rotation), None, ""
+
+    def _next_rotation(self, rotation):
+        """Advance the rotation with the schedule position PERSISTED in the
+        run dir (``rotation_state.json``, beside queue.json), so chunked
+        ``groundhog run`` invocations continue the rotation instead of
+        restarting it at slot 0 every time (a real run produced 52/54
+        Improve because the cursor reset per invocation).
+
+        Semantics: the position is stored modulo the schedule length —
+        deleting the file (or changing the schedule) restarts the rotation
+        at the schedule start, nothing else. Read-advance-write holds the
+        cross-process file lock (utils.fileio.locked) and the write is
+        atomic, matching the shared-state lock discipline. Queue-served
+        iterations never advance the cursor. A one-slot schedule has no
+        rotation to continue and a toolkit without a run path has nowhere
+        to persist — both fall back to the in-memory cycle."""
+        if len(self._schedule) < 2 or getattr(self.toolkit, "path", None) is None:
+            return next(rotation)
+        from groundhog.utils.fileio import atomic_write_text, locked
+        state_path = self.path / self.ROTATION_STATE_FILENAME
+        with locked(state_path):
+            try:
+                pos = int(json.loads(
+                    state_path.read_text(encoding="utf-8"))["position"])
+            except (OSError, ValueError, KeyError, TypeError):
+                pos = 0
+            strategy = self._schedule[pos % len(self._schedule)]
+            atomic_write_text(state_path, json.dumps(
+                {"position": (pos + 1) % len(self._schedule)}))
+        return strategy
 
     def _run_serial(self, n, scorer, best_score, total_cost):
         rotation = cycle(self._schedule)
@@ -570,11 +651,12 @@ class SimpleOptimizer(Optimizer):
             self.toolkit._current_queue_label = queue_label
 
             count_before = len(self.history.list())
+            out = {}
             try:
                 if config is not None:
-                    strategy(self.toolkit, config=config)
+                    out = strategy(self.toolkit, config=config) or {}
                 else:
-                    strategy(self.toolkit)
+                    out = strategy(self.toolkit) or {}
             except KeyboardInterrupt:
                 self.toolkit.log.end()
                 print("\n  Interrupted by user")
@@ -586,13 +668,16 @@ class SimpleOptimizer(Optimizer):
                 continue
             self.toolkit.log.end()
 
-            # Some strategies (Analyse) don't create attempts
+            # Some strategies (Analyse) don't create attempts; others
+            # (ABTest) commit several per call — account every one, not
+            # just the last (a real run showed $0.18 console vs $2.29
+            # actual with arm A invisible).
             attempts = self.history.list()
             if len(attempts) > count_before:
-                latest = attempts[-1]
-                cost = self._get_attempt_cost(latest)
-                total_cost += cost
-                self._log_attempt(latest, scorer, best_score, total_cost)
+                for attempt in attempts[count_before:]:
+                    cost = self._get_attempt_cost(attempt)
+                    total_cost += cost
+                    self._log_attempt(attempt, scorer, best_score, total_cost)
 
                 # Update best
                 current_best = self.history.best(scorer)
@@ -600,8 +685,26 @@ class SimpleOptimizer(Optimizer):
                     current_score = self._score_attempt(current_best, scorer)
                     if best_score is None or current_score > best_score:
                         best_score = current_score
+            else:
+                if out.get("skipped"):
+                    print(f"  [{strategy.__class__.__name__}] skipped: "
+                          f"{out['skipped']}")
+                # Attempt-less spend (Analyse's compression/narration LLM
+                # calls) still counts toward the run total.
+                cost = self._as_cost(out.get("cost"))
+                if cost:
+                    total_cost += cost
+                    print(f"  [{strategy.__class__.__name__}] "
+                          f"cost ${cost:.4f} (${total_cost:.4f} total)")
 
         return best_score, total_cost
+
+    @staticmethod
+    def _as_cost(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _run_parallel(self, n, scorer, best_score, total_cost):
         """EXPERIMENTAL fan-out loop — see the class docstring for the contract.
@@ -611,7 +714,7 @@ class SimpleOptimizer(Optimizer):
         re-entrant lock serializes the racy sections: prior selection,
         workspace allocation, commit/finalize, score notes."""
         lock = threading.RLock()
-        print_lock = threading.Lock()
+        print_lock = self._print_lock
         self.toolkit._ws_lock = lock
         rotation = cycle(self._schedule)
         seen = {a.id for a in self.history.list()}
@@ -622,16 +725,21 @@ class SimpleOptimizer(Optimizer):
             strat = copy.copy(strategy)
             try:
                 if config is not None:
-                    strat(view, config=config)
+                    out = strat(view, config=config) or {}
                 else:
-                    strat(view)
+                    out = strat(view) or {}
+                if out.get("skipped"):
+                    view.log.info(
+                        f"[{strategy.__class__.__name__}] skipped: {out['skipped']}")
+                return out
             finally:
                 view.log.end()
 
         def account():
             # Under the attempt lock: an accounting scan must never interleave
             # with a commit (a git ref mid-update or a folder dir mid-rename
-            # reads back as a torn, stage-less result).
+            # reads back as a torn, stage-less result). Printing takes the
+            # print lock so summary lines don't shear through worker output.
             nonlocal best_score, total_cost
             with lock:
                 for attempt in self.history.list():
@@ -640,10 +748,25 @@ class SimpleOptimizer(Optimizer):
                     seen.add(attempt.id)
                     cost = self._get_attempt_cost(attempt)
                     total_cost += cost
-                    self._log_attempt(attempt, scorer, best_score, total_cost)
+                    with print_lock:
+                        self._log_attempt(attempt, scorer, best_score, total_cost)
                     score = self._score_attempt(attempt, scorer)
                     if best_score is None or score > best_score:
                         best_score = score
+
+        def account_attemptless(out, strategy_name):
+            # A call that committed nothing can still have spent (Analyse):
+            # committing strategies return {"attempt": ...}, so its absence
+            # plus a cost marks attempt-less spend.
+            nonlocal total_cost
+            if not out or "attempt" in out:
+                return
+            cost = self._as_cost(out.get("cost"))
+            if cost:
+                total_cost += cost
+                with print_lock:
+                    print(f"  [{strategy_name}] cost ${cost:.4f} "
+                          f"(${total_cost:.4f} total)")
 
         interrupted = False
         with ThreadPoolExecutor(max_workers=self.concurrency,
@@ -657,7 +780,8 @@ class SimpleOptimizer(Optimizer):
                     strategy, config, queue_label = self._next_dispatch(rotation)
                     dispatched = 1
                     try:
-                        run_one(strategy, config, queue_label)
+                        out = run_one(strategy, config, queue_label)
+                        account_attemptless(out, strategy.__class__.__name__)
                     except Exception as e:
                         print(f"\n  [{strategy.__class__.__name__}] ERROR: {e}")
                     account()
@@ -675,6 +799,8 @@ class SimpleOptimizer(Optimizer):
                         if exc is not None:
                             with print_lock:
                                 print(f"\n  [{strategy_name}] ERROR: {exc}")
+                            continue
+                        account_attemptless(future.result(), strategy_name)
                     account()
             except KeyboardInterrupt:
                 interrupted = True
@@ -703,6 +829,8 @@ class SimpleOptimizer(Optimizer):
         d["history"] = history
         d["ws"] = WorkspaceHandle(history)
         d["workspace"] = d["ws"]
+        if getattr(root, "learnings", None) is not None:
+            d["learnings"] = _LockedLearnings(root.learnings, lock)
         d["log"] = _LineAtomicLog(print_lock)
         # No console: the shared live box cannot render concurrent attempts.
         # Event streams still land in each attempt's attemptlog.jsonl/.md.

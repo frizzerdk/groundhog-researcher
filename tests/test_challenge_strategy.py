@@ -219,6 +219,120 @@ def test_no_target_skips():
         assert out == {"skipped": "no challengeable target"}
 
 
+def test_select_target_skips_mechanical_failures():
+    """Gate rejections and plain coding errors carry no assumption to
+    falsify (remediation B5) — the denylist excludes them from selection."""
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        task = _task()
+        _commit(history, task, 0.0, direction="gated", success=False,
+                metadata={"gate_failure": "fresh attempt duplicated an existing core direction"})
+        _commit(history, task, 0.0, direction="typo", success=False,
+                fail_errors={"crash": "NameError: name 'x' is not defined"})
+        _commit(history, task, 0.0, direction="syntax", success=False,
+                fail_errors={"crash": "SyntaxError: invalid syntax"})
+        real = _commit(history, task, 0.0, direction="oom", success=False,
+                       fail_errors={"crash": "out of memory at batch 512"})
+
+        toolkit = Toolkit(task=task, history=history)
+        target = _select(toolkit)
+        assert target is not None
+        assert target.attempt.id == real.id
+
+
+def test_select_target_denylist_is_configurable():
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        task = _task()
+        oom = _commit(history, task, 0.0, direction="oom", success=False,
+                      fail_errors={"crash": "out of memory at batch 512"})
+        toolkit = Toolkit(task=task, history=history)
+        assert _select(toolkit, exclude_failures="out of memory") is None
+        assert _select(toolkit).attempt.id == oom.id
+
+
+def test_select_target_skips_attempts_without_code():
+    """A failed attempt lacking solution.py cannot be challenged — the
+    prompts embed the target code (remediation B5: safe_code, None=skip)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        task = _task()
+        ws = history.workspace()
+        result = EvaluationResult(
+            stages={"eval": StageResult(errors={"crash": "generation failed upstream"})},
+            completed=False, failed_stage="eval")
+        write_result(ws.path, result)
+        codeless = ws.commit(success=False)
+
+        toolkit = Toolkit(task=task, history=history)
+        assert _select(toolkit) is None
+        assert _select(toolkit, target=codeless.id) is None
+
+
+def test_select_target_tolerates_missing_result():
+    """An attempt without result.json must not crash selection (safe_result)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        task = _task()
+        ws = history.workspace()
+        (ws.path / "solution.py").write_text(_code(0.0), encoding="utf-8")
+        write_direction(ws.path, "no result recorded")
+        resultless = ws.commit(success=False)
+
+        toolkit = Toolkit(task=task, history=history)
+        target = _select(toolkit)
+        assert target is not None
+        assert target.attempt.id == resultless.id
+
+
+def test_crash_after_workspace_aborts_it():
+    """A post-workspace crash (LLM error) must abort the workspace instead of
+    leaking an in-progress dir, then re-raise."""
+    import pytest
+
+    class _BoomLLM:
+        def get(self, tier):
+            return self
+
+        def generate(self, prompt, system_prompt=""):
+            raise RuntimeError("provider down")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        task = _task()
+        _commit(history, task, 0.0, direction="mcts", success=False,
+                fail_errors={"crash": "value too high"})
+
+        toolkit = Toolkit(task=task, history=history)
+        toolkit.llm = _BoomLLM()
+
+        with pytest.raises(RuntimeError, match="provider down"):
+            Challenge()(toolkit)
+        assert history.list_in_progress() == []
+
+
+def test_retry_fix_repairs_failed_evaluation():
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        task = _task()
+        _commit(history, task, 0.0, direction="mcts", success=False,
+                fail_errors={"crash": "value too high"})
+
+        bad_code = "```python\ndef solve():\n    raise ValueError('boom')\n```"
+        toolkit = Toolkit(task=task, history=history)
+        # diagnosis -> broken attack code -> retry fix (full block fallback)
+        toolkit.llm = BackendRegistry(default=MockBackend([
+            DIAGNOSIS, bad_code, _code_block(90.0),
+        ]))
+
+        out = Challenge(max_retries=1)(toolkit)
+        assert out["score"] == 0.9
+
+        attempt = history.list()[-1]
+        assert attempt.status == "done"
+        assert "return 90.0" in attempt.code
+
+
 # --- Diagnosis parsing --------------------------------------------------------
 
 def test_parse_diagnosis_structured():
@@ -226,6 +340,17 @@ def test_parse_diagnosis_structured():
     assert d["blocker"] == "values above 60 crash the harness"
     assert d["evidence"].startswith("inherited")
     assert "return 80" in d["plan"]
+
+
+def test_parse_diagnosis_tolerates_markdown_bolding():
+    d = Challenge._parse_diagnosis(
+        "**BLOCKER**: values above 60 crash\n"
+        "**EVIDENCE:** inherited - never tested\n"
+        "PLAN: return 80"
+    )
+    assert d["blocker"] == "values above 60 crash"
+    assert d["evidence"] == "inherited - never tested"
+    assert d["plan"] == "return 80"
 
 
 def test_parse_diagnosis_multiline_and_fallback():

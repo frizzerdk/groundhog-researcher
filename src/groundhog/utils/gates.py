@@ -14,10 +14,11 @@ Severities:
            never blocked): a fresh attempt with no core_direction.md,
            or one duplicating an existing family.
     flag — recorded in metadata, the attempt stays done: solution
-           byte-identical to the parent (non-promotable), an inherited
-           direction whose FIRST LINE was changed mid-session (the
-           family-identity line, restored at finish), or an inherited
-           direction whose BODY was refined (kept and recorded).
+           byte-identical to the parent (non-promotable), or an
+           inherited direction changed mid-session (directions are
+           IMMUTABLE — the parent's full direction is restored at
+           finish; an explicit direction-change strategy is a future
+           feature, not a per-commit allowance).
 
 These are legitimacy gates only. Performance acceptance is deliberately
 read-side (scorer + selection); a run that wants a performance gate
@@ -32,8 +33,7 @@ from typing import Iterable, Optional
 
 from groundhog.utils.direction import (
     direction_exists,
-    inherited_direction_body_changed_from,
-    inherited_direction_first_line_changed_from,
+    inherited_direction_changed_from,
     read_direction,
     solution_matches_attempt,
 )
@@ -42,7 +42,6 @@ from groundhog.utils.direction import (
 DIRECTION_MISSING = "direction-missing"
 DIRECTION_DUPLICATE = "direction-duplicate"
 DIRECTION_MODIFIED = "direction-modified"
-DIRECTION_BODY_REFINED = "direction-body-refined"
 SOLUTION_IDENTICAL = "solution-identical"
 
 # Messages are load-bearing: the strategy writes them into
@@ -51,11 +50,8 @@ _MESSAGES = {
     DIRECTION_MISSING: "fresh attempt did not create core_direction.md",
     DIRECTION_DUPLICATE: "fresh attempt duplicated an existing core direction",
     DIRECTION_MODIFIED: (
-        "inherited core_direction.md first line was modified; the parent's "
-        "first line is restored at finish"
-    ),
-    DIRECTION_BODY_REFINED: (
-        "inherited core_direction.md body was refined; kept and recorded"
+        "inherited core_direction.md was modified; the parent's direction "
+        "is restored at finish"
     ),
     SOLUTION_IDENTICAL: "solution.py is byte-identical to parent",
 }
@@ -105,10 +101,8 @@ def evaluate_gates(
         ):
             violations.append(_violation(DIRECTION_DUPLICATE, "fail"))
     else:
-        if inherited_direction_first_line_changed_from(ws_dir, parent):
+        if inherited_direction_changed_from(ws_dir, parent):
             violations.append(_violation(DIRECTION_MODIFIED, "flag"))
-        if inherited_direction_body_changed_from(ws_dir, parent):
-            violations.append(_violation(DIRECTION_BODY_REFINED, "flag"))
 
     if solution_matches_attempt(ws_dir, parent):
         violations.append(_violation(SOLUTION_IDENTICAL, "flag"))
@@ -118,6 +112,26 @@ def evaluate_gates(
 
 def _violation(gate: str, severity: str) -> GateViolation:
     return GateViolation(gate=gate, severity=severity, message=_MESSAGES[gate])
+
+
+def gate_metadata(violations: Iterable[GateViolation]) -> dict:
+    """The standard metadata stamps for a violation set.
+
+    Shared by the strategy finish (``finalize_attempt``) and the CLI
+    commit so the record reads identically no matter who committed.
+    The caller still owns the ACTIONS (mark the result failed, restore
+    the direction) — this maps facts to record fields only.
+    """
+    metadata: dict = {}
+    for v in violations:
+        if v.severity == "fail":
+            metadata["gate_failure"] = v.message
+        elif v.gate == DIRECTION_MODIFIED:
+            metadata["direction_restored"] = True
+        elif v.gate == SOLUTION_IDENTICAL:
+            metadata["non_promotable"] = True
+            metadata["non_promotable_reason"] = v.message
+    return metadata
 
 
 class GateKit:

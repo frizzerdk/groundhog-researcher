@@ -172,6 +172,42 @@ def test_discover_finds_builtins():
     assert improve["params"]["max_retries"]["description"]
 
 
+def test_discover_survives_a_broken_config():
+    """One defaultless user Config must not take down the whole scan
+    (remediation C1): the broken class gets an ``error`` entry, everything
+    else describes normally."""
+    from dataclasses import dataclass
+
+    from groundhog.base.strategy import StrategyConfig
+
+    mod = types.ModuleType("fake_task")
+
+    @dataclass
+    class BrokenConfig(StrategyConfig):
+        required: int  # no default — Config() raises TypeError
+
+    class BrokenStrategy(Strategy):
+        Config = BrokenConfig
+
+        def __call__(self, toolkit, config=None):
+            return {}
+
+    class FineStrategy(Strategy):
+        def __call__(self, toolkit, config=None):
+            return {}
+
+    mod.BrokenStrategy = BrokenStrategy
+    mod.FineStrategy = FineStrategy
+
+    entries = discover_strategies(module=mod)
+    by_name = {e["name"]: e for e in entries}
+    assert by_name["broken"]["error"] and "TypeError" in by_name["broken"]["error"]
+    assert by_name["broken"]["params"] == {}
+    assert by_name["fine"]["error"] is None
+    assert by_name["improve"]["error"] is None
+    assert "max_retries" in by_name["improve"]["params"]
+
+
 def test_discover_includes_task_module_strategies():
     mod = types.ModuleType("fake_task")
 

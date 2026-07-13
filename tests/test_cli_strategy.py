@@ -143,6 +143,65 @@ def test_strategy_list_works_outside_a_run_dir(tmp_path, capsys):
     assert "echo" not in out
 
 
+_BROKEN_STRATEGY = '''
+
+@dataclass
+class BrokenConfig(StrategyConfig):
+    required: float  # no default — Config() raises
+
+class BrokenStrategy(Strategy):
+    """Broken on purpose."""
+    Config = BrokenConfig
+    def __call__(self, toolkit, config=None):
+        return {}
+'''
+
+
+def test_strategy_list_skips_broken_config_with_warning(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "task.py").write_text(_TASK_BODY + _BROKEN_STRATEGY,
+                                     encoding="utf-8")
+    with _in_dir(run_dir):
+        rc = strategy_group(["list"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "echo" in captured.out
+    assert "improve" in captured.out
+    assert "broken" not in captured.out
+    assert "broken" in captured.err and "Config broken" in captured.err
+
+
+def test_strategy_show_and_run_explain_broken_config(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "task.py").write_text(_TASK_BODY + _BROKEN_STRATEGY,
+                                     encoding="utf-8")
+    with _in_dir(run_dir):
+        rc = strategy_group(["show", "broken"])
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "unavailable" in out and "default" in out
+
+        rc = strategy_group(["run", "broken"])
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "cannot run" in out
+
+
+def test_strategy_list_notes_task_module_load_failure(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "task.py").write_text("import nonexistent_module_xyz\n",
+                                     encoding="utf-8")
+    with _in_dir(run_dir):
+        rc = strategy_group(["list"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "improve" in captured.out  # builtins still listed
+    assert "failed to load" in captured.err
+
+
 # --- show -------------------------------------------------------------------
 
 def test_strategy_show_prints_params_table(tmp_path, capsys):
@@ -232,6 +291,120 @@ def test_strategy_run_bad_coercion_errors(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "--set value" in out
+
+
+_SHADOWING_STRATEGY = '''
+
+class Improve(Strategy):
+    """Task-local improve that shadows the builtin."""
+    def __call__(self, toolkit, config=None):
+        from groundhog.utils.direction import write_direction
+        ws = toolkit.history.workspace()
+        (ws.path / "solution.py").write_text(
+            "def solve():\\n    return 50.0", encoding="utf-8")
+        write_direction(ws.path, "shadow direction")
+        result = toolkit.task.evaluate(ws.path)
+        toolkit.finalize(ws, result, strategy=self.name)
+        return {}
+'''
+
+
+def test_strategy_show_prefers_task_module_on_name_collision(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "task.py").write_text(_TASK_BODY + _SHADOWING_STRATEGY,
+                                     encoding="utf-8")
+    with _in_dir(run_dir):
+        rc = strategy_group(["show", "improve"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "(task)" in captured.out
+    assert "Task-local improve" in captured.out
+    assert "WARNING" in captured.err and "improve" in captured.err
+
+
+def test_strategy_run_prefers_task_module_on_name_collision(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "task.py").write_text(_TASK_BODY + _SHADOWING_STRATEGY,
+                                     encoding="utf-8")
+    with _in_dir(run_dir):
+        rc = strategy_group(["run", "improve"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "WARNING" in captured.err
+    attempts = FolderAttemptHistory(run_dir).list()
+    assert len(attempts) == 1
+    assert "return 50.0" in attempts[0].code  # task-module Improve, no LLM
+
+
+def test_coerce_param_uses_declared_type_not_default():
+    """param(None, ...) knobs must coerce by the DECLARED type (remediation
+    C2): --set timeout=600 used to stay the string "600"."""
+    import pytest
+    from typing import Optional
+
+    from groundhog.cli import _coerce_param
+
+    assert _coerce_param("600", {"type": Optional[int], "default": None}) == 600
+    assert _coerce_param("0.5", {"type": Optional[float], "default": None}) == 0.5
+    assert _coerce_param("true", {"type": Optional[bool], "default": None}) is True
+    assert _coerce_param("x", {"type": Optional[str], "default": None}) == "x"
+
+    # String annotations (task.py with `from __future__ import annotations`).
+    assert _coerce_param("600", {"type": "Optional[int]", "default": None}) == 600
+    assert _coerce_param("600", {"type": "typing.Optional[int]", "default": None}) == 600
+    assert _coerce_param("600", {"type": "int | None", "default": None}) == 600
+
+    # bool before int: bool subclasses int, must not coerce "true" via int().
+    assert _coerce_param("1", {"type": bool, "default": False}) is True
+    assert _coerce_param("off", {"type": "Optional[bool]", "default": None}) is False
+    with pytest.raises(ValueError):
+        _coerce_param("maybe", {"type": bool, "default": False})
+
+    # Unresolvable declared type falls back to the default's type.
+    assert _coerce_param("3", {"type": "List[int]", "default": 2}) == 3
+    # Nothing to coerce by: keep the string.
+    assert _coerce_param("raw", {"type": "List[int]", "default": None}) == "raw"
+
+
+_OPT_STRATEGY = '''
+
+from typing import Optional
+
+@dataclass
+class OptEchoConfig(StrategyConfig):
+    value: Optional[float] = param(None, "Optional value; None means 50")
+
+class OptEchoStrategy(Strategy):
+    """Echo with an Optional-typed knob."""
+    Config = OptEchoConfig
+    def __call__(self, toolkit, config=None):
+        from groundhog.utils.direction import write_direction
+        cfg = self._resolve_config(config)
+        value = 50.0 if cfg.value is None else cfg.value + 0.0  # crashes on str
+        ws = toolkit.history.workspace()
+        (ws.path / "solution.py").write_text(
+            f"def solve():\\n    return {value}", encoding="utf-8")
+        write_direction(ws.path, "opt echo direction")
+        result = toolkit.task.evaluate(ws.path)
+        toolkit.finalize(ws, result, strategy=self.name)
+        return {}
+'''
+
+
+def test_strategy_run_coerces_optional_typed_param(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "task.py").write_text(_TASK_BODY + _OPT_STRATEGY,
+                                     encoding="utf-8")
+    with _in_dir(run_dir):
+        rc = strategy_group(["run", "opt_echo", "--set", "value=75"])
+    capsys.readouterr()
+    assert rc == 0
+    attempts = FolderAttemptHistory(run_dir).list()
+    assert len(attempts) == 1
+    assert "return 75.0" in attempts[0].code
 
 
 def test_strategy_run_unknown_strategy_errors(tmp_path, capsys):

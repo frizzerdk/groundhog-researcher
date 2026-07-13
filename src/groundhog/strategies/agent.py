@@ -23,6 +23,7 @@ from groundhog.tools.attempt_logger import (
     AssistantEvent, LogEvent, MarkdownAttemptLogger,
     ToolCallEvent, UserEvent, eval_event,
 )
+from groundhog.utils.learnings_digest import LEARNINGS_SEED
 
 
 # --- Preflight probe ---
@@ -66,10 +67,11 @@ class AgentConfig(StrategyConfig):
     tier: str = param("default", "Agent backend tier (default/high/budget)")
     preflight: bool = param(
         True,
-        "Before the explore phase, issue one trivial tool call through the "
-        "same wrapper chain the agent uses. If the tools are unreachable "
-        "(dead sandbox, broken interpreter), abort the attempt loudly before "
-        "spending any agent budget instead of running blind.",
+        "Before the explore phase, run a HOST-SIDE probe: one trivial tool "
+        "call through the same wrapper chain the agent's CLI resolves. "
+        "Catches a dead tool server or broken interpreter before any agent "
+        "budget is spent; a pass approximates but does not guarantee the "
+        "agent's own environment can reach the tools.",
     )
     core_direction: str = param(
         "",
@@ -134,25 +136,6 @@ PHASE_TOOLS = {
 
 
 # --- Prompt templates ---
-
-LEARNINGS_SEED = """\
-# Learnings
-
-Notes from this attempt. Keep high signal-to-noise — only entries that would
-save time or prevent repeated mistakes (confirmed dead-ends, key thresholds,
-techniques with measurable gains). Skip speculation and anything obvious from the code.
-
-Write each learning as one directive line:
-[tried X] -> [because/observed Y] -> [next time do Z]
-
-Examples:
-- tried batch norm before every conv -> val acc dropped 0.90->0.86 (overfit) -> keep BN only after the first block
-- tried lr 1e-2 -> loss diverged to NaN by epoch 2 -> start at 1e-3 with warmup
-
-Prior attempts' notes are NOT auto-copied here. If you want context from
-earlier work, use the get-priors / list-prior / get-prior-file tools to
-read them on demand.
-"""
 
 
 # Human-readable sandbox contract injected into every phase prompt.
@@ -449,13 +432,17 @@ class AgentStrategy(Strategy):
     # --- Preflight ---
 
     def _preflight_probe(self, backend):
-        """Round-trip one trivial tool call through the real wrapper chain.
+        """Round-trip one trivial tool call through the wrapper chain,
+        HOST-SIDE.
 
         Serves a ping tool exactly as a real run does (same ToolServer +
         generate_wrappers), then invokes the generated wrapper through the
-        backend-appropriate shell — the same path the agent's shell resolves.
-        Returns ``(ok, wrapper_label, detail)``; ``ok`` is False whenever the
-        wrapper can't reach the tool server or doesn't echo the token back.
+        backend-appropriate shell — mirroring, from the host process, the
+        path the agent's shell resolves. Returns ``(ok, wrapper_label,
+        detail)``; ``ok`` is False whenever the wrapper can't reach the
+        tool server or doesn't echo the token back. Because the probe runs
+        outside the agent's own sandbox, a pass is strong evidence, not
+        proof, that the agent can reach the tools.
         """
         import subprocess
         import tempfile
@@ -516,6 +503,16 @@ class AgentStrategy(Strategy):
         # POSIX: every CLI resolves the extensionless executable wrapper.
         return [str(bin_dir / name)], name
 
+    def _record_preflight_failure(self, toolkit, msg):
+        """Run-level trace of a preflight abort (loud console line + an
+        insights.md entry) — the aborted workspace keeps nothing."""
+        self.log.info(f"PREFLIGHT FAILED - skipping attempt: {msg}")
+        try:
+            from groundhog.agents.tools import raise_insight
+            raise_insight(toolkit, kind="blocker", text=msg)
+        except Exception:  # noqa: BLE001 — a diagnostics write never blocks the skip
+            pass
+
     def __call__(self, toolkit, config=None):
         self._init(toolkit, config)
 
@@ -555,11 +552,14 @@ class AgentStrategy(Strategy):
                 if self.cfg.preflight:
                     ok, wrapper, detail = self._preflight_probe(backend)
                     if not ok:
-                        msg = (f"agent tools unreachable via {wrapper}: "
-                               f"{detail} — aborting attempt")
-                        self.logger.log(LogEvent(type="error", data={"error": msg}))
+                        msg = (f"preflight failed: agent tools unreachable "
+                               f"via {wrapper}: {detail}")
+                        # Record at RUN level before aborting: the workspace
+                        # is discarded (no fake failed attempts), so nothing
+                        # written inside it survives.
+                        self._record_preflight_failure(toolkit, msg)
                         ws.abort()
-                        return {"skipped": f"preflight failed: {msg}"}
+                        return {"skipped": msg}
 
                 self._prepare_workspace(toolkit, ws, prior)
 
@@ -972,12 +972,18 @@ class AgentStrategy(Strategy):
             dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
     def _collect_learnings(self, toolkit, ws):
-        """Promote local learnings to task-level store."""
+        """Promote local learnings to task-level store.
+
+        The seed block is stripped first: an agent that appends below the
+        seed would otherwise promote the instruction text (and its
+        placeholder examples) as if they were observations.
+        """
+        from groundhog.utils.learnings_digest import strip_seed
         learnings_path = ws.path / "work" / "learnings.md"
         if not learnings_path.exists() or not hasattr(toolkit, 'learnings'):
             return
-        text = learnings_path.read_text(encoding="utf-8").strip()
-        if text and text != LEARNINGS_SEED.strip():
+        text = strip_seed(learnings_path.read_text(encoding="utf-8"))
+        if text:
             toolkit.learnings.add(text)
 
     def _evaluate(self, toolkit, ws):
