@@ -213,7 +213,7 @@ def test_report_escapes_pipes_in_cells(tmp_path, capsys):
         rc = cmd_report(["--out", "-"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "constant \| piped family" in out
+    assert r"constant \| piped family" in out
 
 
 def test_report_no_llm_flag_skips_narrative(tmp_path, capsys):
