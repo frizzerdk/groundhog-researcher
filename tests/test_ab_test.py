@@ -261,6 +261,126 @@ def test_run_arm_restores_outer_extra_metadata():
         assert toolkit._extra_attempt_metadata is outer
 
 
+# --- Per-pair isolation -------------------------------------------------------
+
+class SpyArm(StubArm):
+    """StubArm that records the world it saw before committing."""
+
+    def __init__(self, *args, order_log=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.seen_ids = []
+        self.seen_learnings = []
+        self.order_log = order_log if order_log is not None else []
+
+    def __call__(self, toolkit, config=None):
+        self.order_log.append(self.name)
+        self.seen_ids.append(
+            sorted(a.id for a in toolkit.history.list(only_done=False)))
+        if hasattr(toolkit, "learnings"):
+            self.seen_learnings.append(toolkit.learnings.get())
+            toolkit.learnings.add(f"{self.name} fresh note")
+        return super().__call__(toolkit, config)
+
+
+class SpyArmA(SpyArm):
+    name = "arm_a"
+
+
+class SpyArmB(SpyArm):
+    name = "arm_b"
+
+
+def test_pair_world_is_frozen_for_both_arms():
+    """Same-pair contamination: arm B used to see arm A's fresh commit and
+    learnings. Both arms now read the world as of pair start; writes pass
+    through to the real store."""
+    from groundhog.learnings.markdown import MarkdownLearnings
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        seed = _seed(history)
+        toolkit = _toolkit(history, get_prior=lambda tk: seed)
+        toolkit.learnings = MarkdownLearnings(Path(tmp))
+        toolkit.learnings.add("pre-pair note")
+
+        a = SpyArmA(scores=[0.8], fresh=True)
+        b = SpyArmB(scores=[0.6], fresh=True)
+        ab = ABTest(a, b)
+        ab(toolkit)
+
+        # Both arms saw the identical pre-pair world.
+        assert a.seen_ids == b.seen_ids == [[seed.id]]
+        assert a.seen_learnings == b.seen_learnings
+        assert "fresh note" not in a.seen_learnings[0]
+        assert "fresh note" not in b.seen_learnings[0]
+
+        # Writes passed through: both commits and both notes are real.
+        assert len(_ab_attempts(history)) == 2
+        final = toolkit.learnings.get()
+        assert "arm_a fresh note" in final and "arm_b fresh note" in final
+        # The freeze was scoped to the pair.
+        assert isinstance(history, FolderAttemptHistory)
+        assert toolkit.history is history
+
+
+def test_arm_order_randomizes_per_pair_via_toolkit_rng():
+    import random
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        _seed(history)
+        toolkit = _toolkit(history, get_prior=lambda tk: tk.history.list()[0])
+        toolkit.rng = random.Random(7)
+
+        order_log = []
+        a = SpyArmA(scores=[0.8], order_log=order_log)
+        b = SpyArmB(scores=[0.6], order_log=order_log)
+        ab = ABTest(a, b)
+        for _ in range(6):
+            ab(toolkit)
+
+        firsts = [order_log[i] for i in range(0, len(order_log), 2)]
+        assert set(firsts) == {"arm_a", "arm_b"}, \
+            f"one arm always ran first: {firsts}"
+
+
+def test_summary_reports_incomplete_pairs_and_skip_rates():
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        test = "arm_a-vs-arm_b"
+        _commit_trial(history, test, "a", 1, 0.8)
+        _commit_trial(history, test, "b", 1, 0.6)
+        _commit_trial(history, test, "a", 2, 0.5)  # b skipped round 2
+        _commit_trial(history, test, "b", 3, 0.7)  # a skipped round 3
+
+        toolkit = _toolkit(history)
+        s = ABTest(ArmA(scores=[0.0]), ArmB(scores=[0.0])).summary(toolkit)
+
+        assert s["pairs"] == 1
+        assert s["incomplete_pairs"] == 2
+        assert s["skips_a"] == 1 and s["skips_b"] == 1
+        assert abs(s["skip_rate_a"] - 1 / 3) < 1e-9
+        assert abs(s["skip_rate_b"] - 1 / 3) < 1e-9
+
+
+def test_paired_skipping_arm_shows_as_incomplete_pair():
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        seed = _seed(history)
+        toolkit = _toolkit(history, get_prior=lambda tk: seed)
+
+        skipper = SkippingArm()
+        skipper.name = "arm_b"
+        ab = ABTest(ArmA(scores=[0.8]), skipper, test_name="arm_a-vs-arm_b")
+        out = ab(toolkit)
+
+        s = out["summary"]
+        assert s["trials_a"] == 1 and s["trials_b"] == 0
+        assert s["pairs"] == 0
+        assert s["incomplete_pairs"] == 1
+        assert s["skips_b"] == 1 and s["skip_rate_b"] == 1.0
+
+
 _CLI_TASK_BODY = '''
 from pathlib import Path
 from groundhog import Task, Data, Context, Evaluator, EvalStage, StageResult

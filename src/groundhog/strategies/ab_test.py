@@ -9,21 +9,97 @@ stamps ``ab_test`` / ``ab_arm`` / ``ab_pair`` metadata onto whatever the
 arms commit, via the ``toolkit._extra_attempt_metadata`` pass-through the
 standard finalize merges.
 
+Per-pair isolation: the WORLD is frozen for the trial's duration. Both
+arms read the history (``list()``) and the learnings as they were at
+pair start, and the arm ORDER is randomized per pair (``toolkit.rng``),
+so the second arm is neither contaminated by the first arm's fresh
+commit/notes nor systematically the later one. Writes pass through —
+every commit and learning lands in the real store.
+
+Stale-view tradeoff, accepted deliberately: only ``list()`` (and the
+learnings reads) are frozen. History members that bypass the filtered
+``list`` — ``get``/``best`` bound to the real backend, note reads — see
+the live store, and a fresh arm's duplicate-direction gate cannot see
+the sibling arm's brand-new direction. Prior selection is safe anyway
+(the pin outranks ``best``).
+
 Fresh-style arms ignore the pinned prior (they always start from scratch),
 so for them pairing degrades to same-call: time-of-run is still controlled,
 prior quality is moot. Unpaired mode (``paired=False``) skips the pinning
-and alternates arms across calls; ``ab_pair`` then numbers each arm's own
+and alternates arms across calls (balanced by CALLS, so a skipping arm
+cannot starve the other); ``ab_pair`` then numbers each arm's own
 trials, so the summary's "pairs" are same-round trials, not shared-prior
 ones.
 
 The scoreboard (:meth:`ABTest.summary`) is derived from attempt records on
-demand — no state files.
+demand — no state files. A round where only one arm committed (the other
+skipped or failed to record) is an INCOMPLETE PAIR: excluded from the
+paired stats, reported via ``incomplete_pairs`` and the per-arm
+``skips_a``/``skips_b`` counts and ``skip_rate_a``/``skip_rate_b``.
 """
 
+import random as rand_module
 from dataclasses import dataclass
 
 from groundhog.base.strategy import Strategy, StrategyConfig, param
 from groundhog.bench.stats import paired_stats
+from groundhog.learnings.markdown import SEPARATOR
+
+
+class _FrozenHistoryView:
+    """Read view pinned to the attempt ids present at pair start.
+
+    ``list()`` filters to the frozen set; everything else (writes like
+    ``workspace``/``resume``/``set_note``, plus ``get``/``best``) passes
+    through to the live history. See the module docstring for the
+    stale-view tradeoff.
+    """
+
+    def __init__(self, history, frozen_ids):
+        self._history = history
+        self._frozen_ids = frozen_ids
+
+    def list(self, only_done=True):
+        return [a for a in self._history.list(only_done=only_done)
+                if a.id in self._frozen_ids]
+
+    def __getattr__(self, name):
+        return getattr(self._history, name)
+
+
+class _FrozenLearnings:
+    """Learnings view serving the entries present at pair start.
+
+    ``get``/``count`` read the frozen snapshot (same last/random sampling
+    contract as MarkdownLearnings); ``add`` and everything else pass
+    through, so an arm's notes land in the real store without the sibling
+    arm reading them mid-pair.
+    """
+
+    def __init__(self, learnings):
+        self._learnings = learnings
+        text = learnings.get() if hasattr(learnings, "get") else ""
+        self._entries = [e.strip() for e in (text or "").split(SEPARATOR)
+                         if e.strip()]
+
+    def get(self, last=0, random=0):
+        entries = self._entries
+        if not entries:
+            return ""
+        if last <= 0 and random <= 0:
+            return SEPARATOR.join(entries)
+        recent = entries[-last:] if last > 0 else []
+        older = entries[:-last] if last > 0 else list(entries)
+        sampled = []
+        if random > 0 and older:
+            sampled = rand_module.sample(older, min(random, len(older)))
+        return SEPARATOR.join(sampled + recent)
+
+    def count(self):
+        return len(self._entries)
+
+    def __getattr__(self, name):
+        return getattr(self._learnings, name)
 
 
 @dataclass
@@ -80,12 +156,47 @@ class ABTest(Strategy):
         pair = self._next_pair(toolkit)
         prior = self._select_prior(toolkit)
         unpin = self._pin_prior(toolkit, prior)
+        unfreeze = self._freeze_world(toolkit)
+        trial = {"pair": pair}
         try:
-            a = self._run_arm(toolkit, self.strategy_a, "a", pair)
-            b = self._run_arm(toolkit, self.strategy_b, "b", pair)
+            for arm, strategy in self._arm_order(toolkit):
+                trial[arm] = self._run_arm(toolkit, strategy, arm, pair)
         finally:
+            unfreeze()
             unpin()
-        return {"pair": pair, "a": a, "b": b}
+        return trial
+
+    def _arm_order(self, toolkit):
+        """Randomize which arm runs first, per pair (``toolkit.rng`` when
+        present) — otherwise the same arm is systematically the later,
+        possibly resource-warmer run."""
+        arms = [("a", self.strategy_a), ("b", self.strategy_b)]
+        rng = getattr(toolkit, "rng", None) or rand_module.Random()
+        rng.shuffle(arms)
+        return arms
+
+    def _freeze_world(self, toolkit):
+        """Freeze the pair's world: both arms read history and learnings as
+        they were at pair start; writes pass through. object.__setattr__
+        skips Toolkit's override print — a scoped swap restored in the
+        caller's finally, not a configuration change."""
+        swapped = []
+        history = getattr(toolkit, "history", None)
+        if history is not None:
+            frozen_ids = {a.id for a in history.list(only_done=False)}
+            object.__setattr__(
+                toolkit, "history", _FrozenHistoryView(history, frozen_ids))
+            swapped.append(("history", history))
+        learnings = getattr(toolkit, "learnings", None)
+        if learnings is not None:
+            object.__setattr__(toolkit, "learnings", _FrozenLearnings(learnings))
+            swapped.append(("learnings", learnings))
+
+        def unfreeze():
+            for name, original in swapped:
+                object.__setattr__(toolkit, name, original)
+
+        return unfreeze
 
     def _select_prior(self, toolkit):
         if hasattr(toolkit, 'get_prior'):
@@ -168,6 +279,12 @@ class ABTest(Strategy):
             [by_arm["a"][p] for p in pairs],
             [by_arm["b"][p] for p in pairs],
         )
+        # A round with only one arm recorded (the other skipped) is an
+        # incomplete pair: excluded from the paired stats above, reported
+        # here so attrition is visible instead of silently vanishing.
+        rounds = set(by_arm["a"]) | set(by_arm["b"])
+        skips_a = len(rounds - set(by_arm["a"]))
+        skips_b = len(rounds - set(by_arm["b"]))
         return {
             "test": self._test_name(),
             "arm_a": self.strategy_a.name,
@@ -175,6 +292,11 @@ class ABTest(Strategy):
             "trials_a": len(by_arm["a"]),
             "trials_b": len(by_arm["b"]),
             "pairs": stats.n,
+            "incomplete_pairs": skips_a + skips_b,
+            "skips_a": skips_a,
+            "skips_b": skips_b,
+            "skip_rate_a": skips_a / len(rounds) if rounds else 0.0,
+            "skip_rate_b": skips_b / len(rounds) if rounds else 0.0,
             "wins_a": stats.wins_a,
             "wins_b": stats.wins_b,
             "ties": stats.ties,
