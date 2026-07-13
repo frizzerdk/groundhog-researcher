@@ -285,10 +285,10 @@ def test_select_target_tolerates_missing_result():
         assert target.attempt.id == resultless.id
 
 
-def test_crash_after_workspace_aborts_it():
-    """A post-workspace crash (LLM error) must abort the workspace instead of
-    leaking an in-progress dir, then re-raise."""
-    import pytest
+def test_generation_failure_records_failed_attempt():
+    """A dead provider (every generate raises) must not leak an in-progress
+    dir OR crash the call: generate_text exhausts its retries and Challenge
+    records a FAILED attempt instead (nothing discarded)."""
 
     class _BoomLLM:
         def get(self, tier):
@@ -306,7 +306,37 @@ def test_crash_after_workspace_aborts_it():
         toolkit = Toolkit(task=task, history=history)
         toolkit.llm = _BoomLLM()
 
-        with pytest.raises(RuntimeError, match="provider down"):
+        out = Challenge()(toolkit)
+        assert "provider down" in out["failed"]
+        assert history.list_in_progress() == []
+        attempt = history.get(out["attempt"])
+        assert not attempt.result.completed
+
+
+def test_crash_after_workspace_aborts_it():
+    """A post-workspace crash that is NOT a generation failure (here the
+    attempt logger) must abort the workspace instead of leaking an
+    in-progress dir, then re-raise."""
+    import pytest
+
+    class _BoomLogger:
+        def attempt_start(self, *args, **kwargs):
+            raise RuntimeError("logger down")
+
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        task = _task()
+        _commit(history, task, 0.0, direction="mcts", success=False,
+                fail_errors={"crash": "value too high"})
+
+        toolkit = Toolkit(task=task, history=history)
+        toolkit.llm = object()
+        toolkit.attempt_logger = _BoomLogger()
+
+        with pytest.raises(RuntimeError, match="logger down"):
             Challenge()(toolkit)
         assert history.list_in_progress() == []
 
