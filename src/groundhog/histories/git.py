@@ -78,6 +78,9 @@ _BINARY_EXTS = {".png", ".gif", ".jpg", ".jpeg", ".bmp", ".ico", ".pdf",
 # commit's date is not pinned — still reads as a root (parent None).
 _EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
+# Refspecs per backfill push — one giant argv trips the Windows 32K limit.
+_BACKFILL_CHUNK = 50
+
 
 @dataclass
 class SyncPolicy:
@@ -229,10 +232,7 @@ class GitAttemptHistory(AttemptHistory):
         self._base_sha = self._git_text("rev-parse", "main")
         self._reap_trash()
         if self._remote:
-            # First contact: report reachability once, then backfill any
-            # attempt refs that predate this remote being attached.
-            self._probe_remote()
-            self._backfill_refs()
+            self._first_contact()
 
     # --- store setup ----------------------------------------------------
 
@@ -561,6 +561,9 @@ class GitAttemptHistory(AttemptHistory):
         ``git log --show-notes=groundhog/<key>``. Overwrites on re-set; the
         attempt commit itself is untouched (immutability holds — notes are a
         scratch channel, e.g. the latest computed score cache).
+
+        Notes are purely LOCAL: they never sync. Raw results travel with the
+        attempt refs, and every store recomputes scores read-side.
         """
         if not _NOTE_KEY.match(key or ""):
             raise ValueError(f"invalid note key {key!r} (use [a-z0-9_-], max 64)")
@@ -571,7 +574,6 @@ class GitAttemptHistory(AttemptHistory):
             raise KeyError(f"unknown attempt {sha!r}")
         self._git("notes", f"--ref=refs/notes/groundhog/{key}",
                   "add", "-f", "-m", str(value), sha)
-        self._push_note(key)
 
     def get_note(self, attempt_or_id, key: str) -> Optional[str]:
         if not _NOTE_KEY.match(key or ""):
@@ -709,15 +711,13 @@ class GitAttemptHistory(AttemptHistory):
     def _push_ref(self, sha: str):
         if not (self._remote and self._policy.push_after_commit):
             return
+        # Attempt refs are create-only per-origin — never a conflict. Notes
+        # stay local by design (results travel, scores are recomputed).
         ref = f"refs/attempts/{self.origin}/{sha}"
-        # Attempt refs are create-only per-origin (never conflict); note refs
-        # share one name across stores, so force-push them (last-writer-wins —
-        # a note is a display-only cache, never read for decisions).
-        specs = [f"{ref}:{ref}"] + self._note_refspecs()
         last_err = None
         for _ in range(max(1, self._policy.push_retries)):
             try:
-                self._git("push", self._remote, *specs,
+                self._git("push", self._remote, f"{ref}:{ref}",
                           timeout=self._policy.timeout_s)
                 return
             except (GitError, subprocess.SubprocessError, OSError) as e:
@@ -727,21 +727,6 @@ class GitAttemptHistory(AttemptHistory):
         # identical to one that does unless somebody says otherwise.
         print(f"WARNING: attempt {sha[:12]} committed locally but could not "
               f"be pushed to {self._remote} ({last_err})", file=sys.stderr)
-
-    def _note_refspecs(self) -> List[str]:
-        out = self._git_text("for-each-ref", "--format=%(refname)",
-                             "refs/notes/groundhog/", check=False)
-        return [f"+{r}:{r}" for r in out.splitlines() if r.strip()]
-
-    def _push_note(self, key: str):
-        if not self._remote:
-            return
-        ref = f"refs/notes/groundhog/{key}"
-        try:
-            self._git("push", self._remote, f"+{ref}:{ref}",
-                      timeout=self._policy.timeout_s)
-        except (GitError, subprocess.SubprocessError, OSError):
-            pass
 
     def _maybe_fetch(self):
         if not (self._remote and self._policy.fetch_before_reads):
@@ -753,12 +738,24 @@ class GitAttemptHistory(AttemptHistory):
         try:
             self._git("fetch", self._remote,
                       "+refs/attempts/*:refs/attempts/*",
-                      "+refs/notes/groundhog/*:refs/notes/groundhog/*",
                       timeout=self._policy.timeout_s)
         except (GitError, subprocess.SubprocessError, OSError):
             pass
 
-    def _probe_remote(self):
+    def _first_contact(self):
+        """Probe + backfill, once per store+remote, gated on the marker.
+
+        With the marker present, construction does ZERO network. Unreachable
+        remote -> no marker -> retried on the next construction; a reachable
+        probe whose backfill lands writes the marker."""
+        if self._backfill_marker().exists():
+            return
+        if not self._probe_remote():
+            return
+        if self._backfill_refs():
+            self._backfill_marker().write_text("", encoding="utf-8")
+
+    def _probe_remote(self) -> bool:
         """One first-contact reachability check, reported on stderr. Uses a
         generous fixed timeout: the first call pays DNS + auth handshake that
         steady-state ops (on ``policy.timeout_s``) don't."""
@@ -767,34 +764,34 @@ class GitAttemptHistory(AttemptHistory):
                                  timeout=30.0)
             n = sum(1 for line in out.splitlines() if line.strip())
             print(f"sync: remote reachable, {n} attempt refs", file=sys.stderr)
+            return True
         except (GitError, subprocess.SubprocessError, OSError) as e:
             print(f"WARNING: remote unreachable ({e})", file=sys.stderr)
+            return False
 
     def _backfill_marker(self) -> Path:
         h = hashlib.sha1((self._remote or "").encode("utf-8")).hexdigest()[:16]
         return self._git_dir / f"groundhog-synced-{h}"
 
-    def _backfill_refs(self):
+    def _backfill_refs(self) -> bool:
         """On attach, push attempt refs that predate this remote (a store used
-        offline, then given a remote). One batched best-effort push; a marker
-        per store+remote keeps it from repeating once it lands."""
+        offline, then given a remote). Chunked pushes — one giant refspec argv
+        blows the Windows 32K limit at ~250 attempts. True once every chunk
+        (or nothing) landed."""
         if not self._policy.push_after_commit:
-            return
-        marker = self._backfill_marker()
-        if marker.exists():
-            return
+            return True
         out = self._git_text("for-each-ref", "--format=%(refname)",
                              f"refs/attempts/{self.origin}/", check=False)
         refs = [r for r in out.splitlines() if r.strip()]
-        if not refs:
-            marker.write_text("", encoding="utf-8")
-            return
-        try:
-            self._git("push", self._remote, *[f"{r}:{r}" for r in refs],
-                      timeout=self._policy.timeout_s)
-            marker.write_text("", encoding="utf-8")
-        except (GitError, subprocess.SubprocessError, OSError):
-            pass
+        for i in range(0, len(refs), _BACKFILL_CHUNK):
+            chunk = refs[i:i + _BACKFILL_CHUNK]
+            try:
+                self._git("push", self._remote,
+                          *[f"{r}:{r}" for r in chunk],
+                          timeout=max(self._policy.timeout_s, 60.0))
+            except (GitError, subprocess.SubprocessError, OSError):
+                return False
+        return True
 
     # --- queries -------------------------------------------------------
 
@@ -815,7 +812,9 @@ class GitAttemptHistory(AttemptHistory):
         if res.returncode != 0:
             return None
         sha = res.stdout.decode("utf-8").strip()
-        if sha == self._base_sha:
+        # Structural, like list()/lineage(): a FOREIGN base commit (synced
+        # root's parent) must not resolve to a phantom attempt.
+        if self._is_base_commit(sha):
             return None
         return self._load_attempt(sha)
 
