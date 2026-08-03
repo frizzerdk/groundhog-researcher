@@ -108,6 +108,66 @@ angle gets retried blindly. The only abortable workspace is one whose
 subagent never started (spawn failed, zero writes) — and even then,
 say so in the report; abort is allowed, *silent* abort is not.
 
+## Fleet conventions — when the fan-out gets large
+
+A big round (many workers, long runs, or more than one orchestrator)
+breaks in ways a K=3 round never shows. These seven rules are the
+scars of a large real campaign -- each prevents a silent-loss incident
+that actually happened; the one idea behind them is *fan work out
+widely, but funnel every store mutation through a single throat*. The
+full per-rule rationale lives in the repository (it is not shipped in
+the installed package): `docs/fleet_conventions.md` at
+https://github.com/frizzerdk/groundhog-researcher. Hold to the rules
+and silent loss stops happening.
+
+1. **Single-writer lifecycle.** Exactly ONE process runs `attempt new`
+   / `commit` / `abort`. Parallel workers never touch the lifecycle —
+   they bank their results as manifests in their own scratch dirs, and
+   one collector folds every manifest into the store. Two writers on
+   one store is how attempts vanish.
+
+2. **Manifest → collector → reconcile.** Each worker writes a
+   `{solves, metrics}` manifest; the fold compares realized (what
+   landed in the store) against claimed (what the manifests say) and
+   *investigates every mismatch* rather than trusting the total. This
+   reconcile step caught every silent-loss bug in the campaign — a run
+   with no reconcile is a run you can't trust the count of.
+
+3. **Foreground-only for agent work.** Never park agent runs in the
+   background and wait — background waits stall the agent. Chunk a long
+   run into foreground segments instead.
+
+4. **Never `cd` into a workspace.** A shell left parked with its CWD
+   inside a workspace blocks the folder backend from committing it on
+   Windows (`WinError 5`, the dir is in use). Run every `groundhog`
+   command from the run dir; pass the workspace by path, never by
+   walking into it.
+
+5. **Fail-loud chaining.** Verify each pipeline step's output exists
+   and is fresh before feeding the next step. A masked step failure let
+   a stale artifact get submitted twice — check, don't assume the
+   previous stage wrote what you expected.
+
+6. **Resume over respawn.** A stalled agent resumed with its context
+   (`groundhog attempt resume <wsid>`) beats a fresh one that has to
+   rediscover everything. Reach for respawn only when there is nothing
+   left to resume into.
+
+7. **Concurrent orchestrators coordinate via a claims file.** When more
+   than one orchestrator runs at once, they share a claims file
+   recording who owns which dirs and workspaces, and each keeps
+   one-open-workspace-at-a-time. No claim, no touch. (This does not
+   contradict this skill's pre-open-K step: the K workspaces of one
+   fan-out round all belong to the single orchestrator that opened
+   them -- one writer per claimed region. The one-at-a-time bound is
+   for workspaces opened *outside* your claimed fan-out.)
+
+**Namespacing.** Parallel workers that generate code MUST give their
+modules unique stems (prefix by wsid, angle, or worker id). Two workers
+writing same-named modules collide in `sys.modules` — the second import
+silently returns the first worker's module and shadows the file on
+disk, so a worker evaluates someone else's code without any error.
+
 ## Recovery and boundaries
 
 - If your session crashed mid-round: `groundhog attempt in-progress`

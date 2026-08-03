@@ -5,11 +5,13 @@ import threading
 import urllib.request
 
 
-def _urlopen_with_warnings(req, label="LLM", warn_interval=30):
+def _urlopen_with_warnings(req, label="LLM", warn_interval=30, timeout=None):
     """urlopen that prints warnings if the request takes too long.
 
     Prints "still waiting..." every warn_interval seconds so the user
-    knows it's not frozen. No timeout — the request can take as long as needed.
+    knows it's not frozen. ``timeout`` (seconds) caps a single request so a
+    stalled backend surfaces as a socket timeout instead of hanging the
+    optimizer forever; None keeps the old unbounded behavior.
     """
     warnings_printed = 0
 
@@ -29,6 +31,6 @@ def _urlopen_with_warnings(req, label="LLM", warn_interval=30):
     timer.start()
 
     try:
-        return urllib.request.urlopen(req)
+        return urllib.request.urlopen(req, timeout=timeout)
     finally:
         timer.cancel()

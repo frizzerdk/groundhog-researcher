@@ -41,11 +41,13 @@ Git config is neutralized and identity/date injected per call, so commit hashes
 never depend on machine configuration; ``core.autocrlf`` is forced off.
 """
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -57,6 +59,9 @@ from groundhog.base.attempt_history import (
     Attempt, Workspace, AttemptHistory, InProgress)
 from groundhog.utils.results import read_result, write_metadata, read_attempt_metadata
 from groundhog.utils.direction import slugify
+from groundhog.utils.queries import safe_result
+from groundhog.utils.liveness import (
+    clear_heartbeat, pid_alive, read_heartbeat, write_heartbeat)
 
 _NOTE_KEY = re.compile(r"^[a-z0-9_-]{1,64}$")
 
@@ -69,6 +74,15 @@ _FS = "\x1f"
 _BINARY_EXTS = {".png", ".gif", ".jpg", ".jpeg", ".bmp", ".ico", ".pdf",
                 ".zip", ".gz", ".tar", ".bin", ".pkl", ".npy", ".npz",
                 ".whl", ".so", ".dll", ".exe", ".pyc"}
+
+# The well-known empty-tree object. A task-root (base) commit is a parentless
+# commit whose tree is empty; roots are detected by that shape, not by sha, so
+# a root synced from another store — whose base sha differs, since the base
+# commit's date is not pinned — still reads as a root (parent None).
+_EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+# Refspecs per backfill push — one giant argv trips the Windows 32K limit.
+_BACKFILL_CHUNK = 50
 
 
 @dataclass
@@ -173,9 +187,13 @@ class GitWorkspace(Workspace):
         self._wip_branch = wip_branch
 
     def commit(self, success: bool = True) -> GitAttempt:
+        """Record this workspace as an attempt. ``success=False`` records it
+        as FAILED — recorded work, never discarded (CLI: ``commit --fail``)."""
         return self._history._commit_workspace(self, success)
 
     def abort(self):
+        """Discard: remove the worktree and branch, leaving NO record. To
+        record failed work instead, use ``commit(success=False)``."""
         self._history._abort_workspace(self)
 
     def heartbeat(self):
@@ -209,6 +227,7 @@ class GitAttemptHistory(AttemptHistory):
         self._remote = str(remote) if remote else None
         self._policy = policy or SyncPolicy()
         self._last_fetch = 0.0
+        self._base_cache: dict = {}   # sha -> is-base-commit, computed on demand
 
         self._root.mkdir(parents=True, exist_ok=True)
         self._store.mkdir(parents=True, exist_ok=True)
@@ -219,6 +238,8 @@ class GitAttemptHistory(AttemptHistory):
         self._load_origin()
         self._base_sha = self._git_text("rev-parse", "main")
         self._reap_trash()
+        if self._remote:
+            self._first_contact()
 
     # --- store setup ----------------------------------------------------
 
@@ -262,9 +283,14 @@ class GitAttemptHistory(AttemptHistory):
         for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
                     "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"):
             env.pop(var, None)
-        env["GIT_CONFIG_GLOBAL"] = os.devnull
-        env["GIT_CONFIG_SYSTEM"] = os.devnull
-        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        # Config isolation keeps commits hermetic, but credential helpers
+        # live in global/system config — stripping them makes authenticated
+        # remotes fail on every push/fetch. Network ops keep the user's
+        # config; identity stays forced via the env vars below.
+        if str(args[0]) not in ("push", "fetch", "ls-remote"):
+            env["GIT_CONFIG_GLOBAL"] = os.devnull
+            env["GIT_CONFIG_SYSTEM"] = os.devnull
+            env["GIT_CONFIG_NOSYSTEM"] = "1"
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = _IDENTITY_NAME
         env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = _IDENTITY_EMAIL
@@ -315,7 +341,9 @@ class GitAttemptHistory(AttemptHistory):
     def _commit_workspace(self, ws: GitWorkspace, success: bool) -> GitAttempt:
         status = "done" if success else "fail"
 
-        ts = time.time()
+        # A replayed attempt (migration) carries its original creation time
+        # as ws.created_at; live commits stamp now.
+        ts = getattr(ws, "created_at", None) or time.time()
         if ts <= self._last_created:
             ts = self._last_created + 1e-6
         self._last_created = ts
@@ -333,6 +361,7 @@ class GitAttemptHistory(AttemptHistory):
         message = (f"{subject}\n\nStatus: {status}\n"
                    f"Groundhog-Created: {ts:.6f}\n")
 
+        self._normalize_eol(ws.path)
         self._git("add", "-A", cwd=ws.path)
         self._git("commit", "--allow-empty", "-F", "-",
                   input_bytes=message.encode("utf-8"),
@@ -347,6 +376,31 @@ class GitAttemptHistory(AttemptHistory):
         self._clear_heartbeat(ws.display_id)
         self._push_ref(sha)
         return self._load_attempt(sha)
+
+    def _normalize_eol(self, root: Path):
+        """CRLF -> LF for text files before commit. Stored bytes are then
+        EOL-stable across platforms, so a child byte-identical to its parent
+        modulo line endings is caught by the solution-identical gate
+        (workspace reads already normalize via universal newlines)."""
+        for f in root.rglob("*"):
+            if not f.is_file() or f.name == ".git":
+                continue
+            if f.suffix.lower() in _BINARY_EXTS:
+                continue
+            try:
+                data = f.read_bytes()
+            except OSError:
+                continue
+            if b"\r\n" not in data:
+                continue
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            try:
+                f.write_bytes(data.replace(b"\r\n", b"\n"))
+            except OSError:
+                pass
 
     def _settle_folder(self, ws: GitWorkspace, sha: str):
         """Rename the worktree dir from its uuid to the readable slug; on a
@@ -394,45 +448,13 @@ class GitAttemptHistory(AttemptHistory):
         return self._wip_dir / wsid
 
     def _write_heartbeat(self, wsid: str):
-        try:
-            self._heartbeat(wsid).write_text(
-                json.dumps({"pid": os.getpid(), "started_at": time.time()}),
-                encoding="utf-8")
-        except OSError:
-            pass
+        write_heartbeat(self._heartbeat(wsid))
 
     def _read_heartbeat(self, wsid: str) -> dict:
-        try:
-            return json.loads(self._heartbeat(wsid).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
+        return read_heartbeat(self._heartbeat(wsid))
 
     def _clear_heartbeat(self, wsid: str):
-        try:
-            self._heartbeat(wsid).unlink()
-        except OSError:
-            pass
-
-    @staticmethod
-    def _pid_alive(pid) -> bool:
-        try:
-            pid = int(pid)
-        except (TypeError, ValueError):
-            return False
-        if pid <= 0:
-            return False
-        try:
-            if os.name == "nt":
-                import ctypes
-                h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-                if h:
-                    ctypes.windll.kernel32.CloseHandle(h)
-                    return True
-                return False
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
+        clear_heartbeat(self._heartbeat(wsid))
 
     def _worktree_for_branch(self, branch: str) -> Optional[Path]:
         out = self._git_text("worktree", "list", "--porcelain")
@@ -488,12 +510,30 @@ class GitAttemptHistory(AttemptHistory):
                 parent=parent,
                 started_at=float(hb.get("started_at", 0.0)),
                 path=self._worktree_for_branch(ref),
-                live=self._pid_alive(hb.get("pid")),
+                live=pid_alive(hb.get("pid")),
             ))
         items.sort(key=lambda ip: ip.started_at)
         return items
 
+    def _resolve_wsid(self, wanted: str) -> str:
+        """Exact wip id, or any UNIQUE prefix of one (the CLI displays 8
+        chars of a 12-char id)."""
+        out = self._git_text("for-each-ref", "--format=%(refname:short)",
+                             "refs/heads/wip/", check=False)
+        ids = [r.strip()[len("wip/"):] for r in out.splitlines()
+               if r.strip().startswith("wip/")]
+        if wanted in ids:
+            return wanted
+        matches = [i for i in ids if i.startswith(wanted)]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise KeyError(f"ambiguous workspace id {wanted!r} "
+                           f"(matches {', '.join(sorted(matches))})")
+        raise KeyError(f"no in-progress workspace {wanted!r}")
+
     def resume(self, workspace_id: str) -> GitWorkspace:
+        workspace_id = self._resolve_wsid(str(workspace_id))
         branch = f"wip/{workspace_id}"
         res = self._git("rev-parse", "--verify", "--quiet", branch, check=False)
         if res.returncode != 0:
@@ -542,6 +582,9 @@ class GitAttemptHistory(AttemptHistory):
         ``git log --show-notes=groundhog/<key>``. Overwrites on re-set; the
         attempt commit itself is untouched (immutability holds — notes are a
         scratch channel, e.g. the latest computed score cache).
+
+        Notes are purely LOCAL: they never sync. Raw results travel with the
+        attempt refs, and every store recomputes scores read-side.
         """
         if not _NOTE_KEY.match(key or ""):
             raise ValueError(f"invalid note key {key!r} (use [a-z0-9_-], max 64)")
@@ -562,6 +605,22 @@ class GitAttemptHistory(AttemptHistory):
         if res.returncode != 0:
             return None
         return res.stdout.decode("utf-8", errors="replace").strip()
+
+    def list_notes(self, attempt_or_id) -> dict:
+        prefix = "refs/notes/groundhog/"
+        res = self._git("for-each-ref", "--format=%(refname)", prefix,
+                        check=False)
+        if res.returncode != 0:
+            return {}
+        notes = {}
+        for line in res.stdout.decode("utf-8", errors="replace").splitlines():
+            key = line.strip()[len(prefix):]
+            if not key:
+                continue
+            value = self.get_note(attempt_or_id, key)
+            if value is not None:
+                notes[key] = value
+        return notes
 
     def materialize(self, attempt_or_id) -> Path:
         """Ensure the attempt's worktree folder exists on disk; return it.
@@ -637,7 +696,7 @@ class GitAttemptHistory(AttemptHistory):
         parent = parents.split()[0] if parents.strip() else None
         # The base commit is the origin, not an attempt: a child of the base is
         # a "root" attempt with no logical parent.
-        if parent == self._base_sha:
+        if parent is not None and self._is_base_commit(parent):
             parent = None
         created, status = self._parse_trailers(body)
         if not created:
@@ -647,6 +706,28 @@ class GitAttemptHistory(AttemptHistory):
                 created = 0.0
         return GitAttempt(self, id=h.strip(), parent=parent,
                           created_at=created, status=status)
+
+    def _is_base_commit(self, sha: str) -> bool:
+        """True if ``sha`` is a task-root (base) commit — parentless, empty tree.
+
+        Structural, not ``== self._base_sha``: a store synced from a remote
+        branches its roots off the ORIGINATING store's base commit, whose sha
+        differs from ours (the base commit's date is not pinned), so the literal
+        check would show cross-store roots as non-root. Results are cached."""
+        if sha == self._base_sha:
+            return True
+        cached = self._base_cache.get(sha)
+        if cached is not None:
+            return cached
+        # Use _git (not _git_text): str.strip() eats the leading empty-%P
+        # field, since \x1f counts as whitespace to Python.
+        res = self._git("show", "-s", f"--format=%P{_FS}%T", sha, check=False)
+        out = res.stdout.decode("utf-8", "replace")
+        parents, _, tree = out.partition(_FS)
+        is_base = (res.returncode == 0 and not parents.strip()
+                   and tree.strip() == _EMPTY_TREE_SHA)
+        self._base_cache[sha] = is_base
+        return is_base
 
     @staticmethod
     def _parse_trailers(body: str):
@@ -667,14 +748,22 @@ class GitAttemptHistory(AttemptHistory):
     def _push_ref(self, sha: str):
         if not (self._remote and self._policy.push_after_commit):
             return
+        # Attempt refs are create-only per-origin — never a conflict. Notes
+        # stay local by design (results travel, scores are recomputed).
         ref = f"refs/attempts/{self.origin}/{sha}"
+        last_err = None
         for _ in range(max(1, self._policy.push_retries)):
             try:
                 self._git("push", self._remote, f"{ref}:{ref}",
                           timeout=self._policy.timeout_s)
                 return
-            except (GitError, subprocess.SubprocessError, OSError):
+            except (GitError, subprocess.SubprocessError, OSError) as e:
+                last_err = e
                 continue
+        # Best-effort, but not silent: a store that never syncs looks
+        # identical to one that does unless somebody says otherwise.
+        print(f"WARNING: attempt {sha[:12]} committed locally but could not "
+              f"be pushed to {self._remote} ({last_err})", file=sys.stderr)
 
     def _maybe_fetch(self):
         if not (self._remote and self._policy.fetch_before_reads):
@@ -689,6 +778,57 @@ class GitAttemptHistory(AttemptHistory):
                       timeout=self._policy.timeout_s)
         except (GitError, subprocess.SubprocessError, OSError):
             pass
+
+    def _first_contact(self):
+        """Probe + backfill, once per store+remote, gated on the marker.
+
+        With the marker present, construction does ZERO network. Unreachable
+        remote -> no marker -> retried on the next construction; a reachable
+        probe whose backfill lands writes the marker."""
+        if self._backfill_marker().exists():
+            return
+        if not self._probe_remote():
+            return
+        if self._backfill_refs():
+            self._backfill_marker().write_text("", encoding="utf-8")
+
+    def _probe_remote(self) -> bool:
+        """One first-contact reachability check, reported on stderr. Uses a
+        generous fixed timeout: the first call pays DNS + auth handshake that
+        steady-state ops (on ``policy.timeout_s``) don't."""
+        try:
+            out = self._git_text("ls-remote", self._remote, "refs/attempts/*",
+                                 timeout=30.0)
+            n = sum(1 for line in out.splitlines() if line.strip())
+            print(f"sync: remote reachable, {n} attempt refs", file=sys.stderr)
+            return True
+        except (GitError, subprocess.SubprocessError, OSError) as e:
+            print(f"WARNING: remote unreachable ({e})", file=sys.stderr)
+            return False
+
+    def _backfill_marker(self) -> Path:
+        h = hashlib.sha1((self._remote or "").encode("utf-8")).hexdigest()[:16]
+        return self._git_dir / f"groundhog-synced-{h}"
+
+    def _backfill_refs(self) -> bool:
+        """On attach, push attempt refs that predate this remote (a store used
+        offline, then given a remote). Chunked pushes — one giant refspec argv
+        blows the Windows 32K limit at ~250 attempts. True once every chunk
+        (or nothing) landed."""
+        if not self._policy.push_after_commit:
+            return True
+        out = self._git_text("for-each-ref", "--format=%(refname)",
+                             f"refs/attempts/{self.origin}/", check=False)
+        refs = [r for r in out.splitlines() if r.strip()]
+        for i in range(0, len(refs), _BACKFILL_CHUNK):
+            chunk = refs[i:i + _BACKFILL_CHUNK]
+            try:
+                self._git("push", self._remote,
+                          *[f"{r}:{r}" for r in chunk],
+                          timeout=max(self._policy.timeout_s, 60.0))
+            except (GitError, subprocess.SubprocessError, OSError):
+                return False
+        return True
 
     # --- queries -------------------------------------------------------
 
@@ -709,7 +849,9 @@ class GitAttemptHistory(AttemptHistory):
         if res.returncode != 0:
             return None
         sha = res.stdout.decode("utf-8").strip()
-        if sha == self._base_sha:
+        # Structural, like list()/lineage(): a FOREIGN base commit (synced
+        # root's parent) must not resolve to a phantom attempt.
+        if self._is_base_commit(sha):
             return None
         return self._load_attempt(sha)
 
@@ -719,11 +861,12 @@ class GitAttemptHistory(AttemptHistory):
             return None
 
         def score_attempt(attempt):
-            result = attempt.result
-            if not result.completed:
+            # A corrupt or absent result.json (possibly synced from another
+            # store) is a boundary: unscored, never a crash.
+            result = safe_result(attempt)
+            if result is None or not result.completed:
                 return -1.0
-            last_stage = list(result.stages.values())[-1]
-            return scorer(last_stage)
+            return scorer(list(result.stages.values())[-1])
 
         return max(attempts, key=score_attempt)
 

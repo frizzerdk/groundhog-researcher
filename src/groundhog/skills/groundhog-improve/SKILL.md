@@ -60,11 +60,13 @@ at every level.
 
 ## Direction obligations
 
-- **Preserve the inherited direction.** `core_direction.md` is seeded
-  from the parent. Its FIRST LINE is the approach name itself (no
-  heading, no label) and doubles as the attempt's display name and
-  folder slug — keep that line intact. Refine the body only while the
-  work remains the same approach.
+- **Preserve the inherited direction byte-for-byte.** `core_direction.md`
+  is seeded from the parent and is IMMUTABLE for a child: its first line
+  is the approach name (doubling as display name and folder slug), and
+  the rest pins the algorithmic backbone. Do not edit any of it. The
+  commit gate enforces exactly this: any change — first line, body, or
+  a deleted file — is reverted to the parent's full direction and
+  flagged (`direction_restored`).
 - **A pivot is not an improve.** If the changes amount to a new
   approach, that is the approach-pivot checkpoint: pause and surface
   it (pair/checkpoint) or safe-stop and report (auto). New directions

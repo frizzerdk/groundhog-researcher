@@ -156,6 +156,86 @@ def test_inherited_modified_direction_is_restored_and_flagged():
         assert read_direction(child_ws.path).strip() == "rollout"
 
 
+def _inherited_child(tk, parent_direction, child_direction, child_code="print(2)"):
+    parent_ws = tk.history.workspace()
+    (parent_ws.path / "solution.py").write_text("print(1)", encoding="utf-8")
+    write_direction(parent_ws.path, parent_direction)
+    parent = finalize_attempt(tk, parent_ws, _ok_result(), None)
+
+    child_ws = tk.history.workspace(parent=parent.id)
+    (child_ws.path / "solution.py").write_text(child_code, encoding="utf-8")
+    write_direction(child_ws.path, child_direction)
+    return parent, child_ws
+
+
+def test_body_only_edit_restores_full_direction():
+    # Directions are IMMUTABLE by default — a body edit is a modification
+    # and the parent's FULL direction is restored (the body-refinable
+    # premise was rejected; an explicit direction-change strategy is a
+    # future feature).
+    with tempfile.TemporaryDirectory() as tmp:
+        tk = _toolkit(tmp)
+        parent, child_ws = _inherited_child(
+            tk,
+            "rollout\n\nGreedy lookahead.",
+            "rollout\n\nGreedy lookahead with deeper search.",
+        )
+        attempt = finalize_attempt(tk, child_ws, _ok_result(), parent)
+
+        assert attempt.status == "done"
+        assert attempt.metadata.get("direction_restored") is True
+        kept = read_direction(child_ws.path)
+        assert kept.strip() == "rollout\n\nGreedy lookahead."
+        assert "deeper search" not in kept
+
+
+def test_first_line_and_body_edit_restores_full_direction():
+    with tempfile.TemporaryDirectory() as tmp:
+        tk = _toolkit(tmp)
+        parent, child_ws = _inherited_child(
+            tk,
+            "rollout\n\nGreedy lookahead.",
+            "beam search\n\nGreedy lookahead, wider.",
+        )
+        attempt = finalize_attempt(tk, child_ws, _ok_result(), parent)
+
+        assert attempt.status == "done"
+        assert attempt.metadata.get("direction_restored") is True
+        kept = read_direction(child_ws.path)
+        assert kept.strip() == "rollout\n\nGreedy lookahead."
+        assert "wider" not in kept
+
+
+def test_deleted_direction_records_a_plain_restore():
+    with tempfile.TemporaryDirectory() as tmp:
+        tk = _toolkit(tmp)
+        parent, child_ws = _inherited_child(
+            tk,
+            "rollout\n\nGreedy lookahead.",
+            "placeholder",
+        )
+        (child_ws.path / "core_direction.md").unlink()
+        attempt = finalize_attempt(tk, child_ws, _ok_result(), parent)
+
+        assert attempt.status == "done"
+        assert attempt.metadata.get("direction_restored") is True
+        assert read_direction(child_ws.path).strip() == "rollout\n\nGreedy lookahead."
+
+
+def test_unchanged_inherited_direction_is_not_flagged():
+    with tempfile.TemporaryDirectory() as tmp:
+        tk = _toolkit(tmp)
+        parent, child_ws = _inherited_child(
+            tk,
+            "rollout\n\nGreedy lookahead.",
+            "rollout\n\nGreedy lookahead.",
+        )
+        attempt = finalize_attempt(tk, child_ws, _ok_result(), parent)
+
+        assert attempt.status == "done"
+        assert attempt.metadata.get("direction_restored") is None
+
+
 def test_identical_solution_flags_non_promotable_but_commits_done():
     with tempfile.TemporaryDirectory() as tmp:
         tk = _toolkit(tmp)

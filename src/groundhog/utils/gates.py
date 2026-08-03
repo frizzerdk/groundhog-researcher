@@ -15,8 +15,10 @@ Severities:
            or one duplicating an existing family.
     flag — recorded in metadata, the attempt stays done: solution
            byte-identical to the parent (non-promotable), or an
-           inherited direction that was modified mid-session (it is
-           restored at finish).
+           inherited direction changed mid-session (directions are
+           IMMUTABLE — the parent's full direction is restored at
+           finish; an explicit direction-change strategy is a future
+           feature, not a per-commit allowance).
 
 These are legitimacy gates only. Performance acceptance is deliberately
 read-side (scorer + selection); a run that wants a performance gate
@@ -110,6 +112,26 @@ def evaluate_gates(
 
 def _violation(gate: str, severity: str) -> GateViolation:
     return GateViolation(gate=gate, severity=severity, message=_MESSAGES[gate])
+
+
+def gate_metadata(violations: Iterable[GateViolation]) -> dict:
+    """The standard metadata stamps for a violation set.
+
+    Shared by the strategy finish (``finalize_attempt``) and the CLI
+    commit so the record reads identically no matter who committed.
+    The caller still owns the ACTIONS (mark the result failed, restore
+    the direction) — this maps facts to record fields only.
+    """
+    metadata: dict = {}
+    for v in violations:
+        if v.severity == "fail":
+            metadata["gate_failure"] = v.message
+        elif v.gate == DIRECTION_MODIFIED:
+            metadata["direction_restored"] = True
+        elif v.gate == SOLUTION_IDENTICAL:
+            metadata["non_promotable"] = True
+            metadata["non_promotable_reason"] = v.message
+    return metadata
 
 
 class GateKit:

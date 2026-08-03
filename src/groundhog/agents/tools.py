@@ -17,7 +17,9 @@ policies like promote-best.
 import copy
 import json
 import operator
+import re
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -129,7 +131,9 @@ def build_default_agent_tools(toolkit) -> list:
     """
     from groundhog.base.agent import agent_tool
 
-    tools = [agent_tool(check_gates)]
+    tools = [agent_tool(check_gates), agent_tool(raise_insight)]
+    tools.append(agent_tool(search_attempts))
+    tools.append(agent_tool(rebuild_kb_index))
     for t in tools:
         t.bind_toolkit(toolkit)
     return tools
@@ -205,6 +209,103 @@ def check_gates(toolkit) -> str:
                 "    -> recorded in metadata; the commit itself stays done"
             )
     return "\n".join(lines)
+
+
+INSIGHT_KINDS = ("insight", "tool-request", "blocker", "idea")
+_INSIGHT_MAX_CHARS = 4000
+
+
+def raise_insight(toolkit, kind: str = "insight", text: str = "") -> str:
+    """Raise a note out of the sandbox to the humans running this optimization:
+    a general observation (``insight``), a wish for a tool that would have
+    helped (``tool-request``), something that blocked progress (``blocker``),
+    or an idea worth trying later (``idea``). Appends a stamped entry to the
+    run's ``insights.md`` and records it in the attempt log. Use it whenever
+    you hit friction or notice something the framework's authors should know —
+    it changes nothing about the solution.
+    """
+    text = (text or "").strip()
+    if not text:
+        return "raise-insight: nothing recorded (text was empty)."
+    if len(text) > _INSIGHT_MAX_CHARS:
+        text = text[:_INSIGHT_MAX_CHARS].rstrip() + "\n[truncated]"
+    kind = (kind or "").strip().lower() or "insight"
+    if kind not in INSIGHT_KINDS:
+        kind = "insight"  # unknown kinds fold into a plain insight, never rejected
+
+    stamp = datetime.now().isoformat(timespec="seconds")
+    ws_id = _insight_workspace_id(toolkit)
+    phase = _insight_phase(toolkit)
+
+    header = f"## {stamp} | {kind}"
+    if ws_id:
+        header += f" | attempt {ws_id}"
+    if phase:
+        header += f" | phase {phase}"
+    entry = f"{header}\n\n{text}"
+
+    root = Path(getattr(toolkit, "path", ".") or ".")
+    _append_insight(root / "insights.md", entry)
+    _log_insight_event(toolkit, kind, text, ws_id, phase)
+
+    where = f"attempt {ws_id}" if ws_id else "no open attempt"
+    return f"raise-insight recorded ({kind}, {where}) -> insights.md"
+
+
+def _insight_workspace_id(toolkit):
+    handle = getattr(toolkit, "ws", None)
+    if handle is None or not handle.is_set():
+        return None
+    try:
+        return getattr(handle.current, "display_id", None)
+    except Exception:
+        return None
+
+
+def _insight_phase(toolkit):
+    logger = getattr(toolkit, "attempt_logger", None)
+    if logger is None:
+        return None
+    try:
+        events = logger.events()
+    except Exception:
+        return None
+    for event in reversed(events):
+        if getattr(event, "type", None) == "phase":
+            return getattr(event, "phase", None) or None
+    return None
+
+
+def _append_insight(path, entry):
+    """Learnings-style append: entries joined by a --- rule, one file per run.
+
+    A true O(1) append — never reads the existing file, so one stray
+    non-UTF8 byte can't permanently kill the channel, and a crash mid-write
+    can't lose prior entries the way the old whole-file rewrite could.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    nonempty = path.exists() and path.stat().st_size > 0
+    with open(path, "a", encoding="utf-8") as f:
+        if nonempty:
+            f.write("\n---\n\n")
+        f.write(entry.strip() + "\n")
+
+
+def _log_insight_event(toolkit, kind, text, ws_id, phase):
+    logger = getattr(toolkit, "attempt_logger", None)
+    if logger is None or getattr(logger, "path", None) is None:
+        return  # no open attempt — the insights.md entry stands on its own
+    from groundhog.tools.attempt_logger import LogEvent
+    data = {"kind": kind, "text": text}
+    if ws_id:
+        data["attempt"] = ws_id
+    if phase:
+        data["phase"] = phase
+    try:
+        logger.log(LogEvent(type="insight", data=data))
+    except Exception:
+        pass
 
 
 def _resolve_parent(ws, history):
@@ -669,3 +770,101 @@ def build_prior_tools(
             },
         ),
     ]
+
+
+_SEARCH_SNIPPET_CHARS = 160
+_SEARCH_OUTPUT_CHARS = 8000
+_SEARCH_MAX_RESULTS = 100
+_SEARCH_QUERY_CHARS = 500
+
+
+def search_attempts(toolkit, query: str, scope: str = "all",
+                    max_results: int = 20) -> str:
+    """Search the run's knowledge base for a keyword or regex: run-root
+    learnings.md and insights.md, plus every attempt's core direction,
+    attempt log, and work/learnings.md. Returns attempt-stamped matching
+    lines (attempt id, file, line, snippet). scope narrows the corpus:
+    all | learnings | directions | logs | insights.
+    """
+    from groundhog.utils.semantic_index import SCOPES, iter_corpus
+
+    if scope not in SCOPES:
+        return f"unknown scope {scope!r} (use {'|'.join(SCOPES)})"
+    query = (query or "")[:_SEARCH_QUERY_CHARS]
+    try:
+        pattern = re.compile(query, re.IGNORECASE)
+    except re.error:
+        pattern = re.compile(re.escape(query), re.IGNORECASE)
+    max_results = max(1, min(max_results, _SEARCH_MAX_RESULTS))
+
+    root = getattr(toolkit, "path", None)
+    history = getattr(toolkit, "history", None)
+    docs = list(iter_corpus(root, history, scope=scope))
+
+    rank = _semantic_rank(root, history, query,
+                          getattr(toolkit, "embedder", None))
+    if rank is not None:
+        docs.sort(key=lambda d: rank.get((d.attempt, d.file), len(rank)))
+
+    hits = []
+    for doc in docs:
+        stamp = f"attempt_{doc.attempt}" if doc.attempt else "run-root"
+        for lineno, line in enumerate(doc.text.splitlines(), start=1):
+            if pattern.search(line):
+                snippet = line.strip()[:_SEARCH_SNIPPET_CHARS]
+                hits.append(f"{stamp} {doc.file}:{lineno}: {snippet}")
+                if len(hits) >= max_results:
+                    break
+        if len(hits) >= max_results:
+            break
+
+    if not hits:
+        return f"(no hits for {query!r} in scope {scope})"
+    ranked = ", semantic rank" if rank is not None else ""
+    out = "\n".join([f"{len(hits)} hit(s) for {query!r} [scope={scope}{ranked}]",
+                     *hits])
+    if len(out) > _SEARCH_OUTPUT_CHARS:
+        out = out[:_SEARCH_OUTPUT_CHARS] + "\n(truncated)"
+    return out
+
+
+def rebuild_kb_index(toolkit) -> str:
+    """Rebuild the run's semantic knowledge-base index — the derived cache
+    that ranks search-attempts results. Use after new attempts commit:
+    a stale index is skipped automatically (search falls back to lexical
+    order), so rebuilding is what re-enables semantic ranking. Uses a
+    custom ``toolkit.embedder`` when the run provides one; the built-in
+    TF-IDF fallback otherwise.
+    """
+    from groundhog.utils.semantic_index import SemanticIndex
+
+    root = getattr(toolkit, "path", None)
+    if root is None:
+        return "rebuild-kb-index: this toolkit has no run path."
+    index = SemanticIndex(root, getattr(toolkit, "history", None),
+                          embedder=getattr(toolkit, "embedder", None))
+    n = index.rebuild()
+    return f"Semantic index rebuilt: {n} chunk(s) -> {index.cache_path}"
+
+
+def _semantic_rank(root, history, query, embedder=None):
+    """File ranking from the tier-2 semantic index — only when its cache
+    already exists AND matches the current corpus (building one is an
+    explicit act, not a search side effect — see rebuild-kb-index). None
+    means lexical corpus order; any index failure falls back the same way,
+    so the lexical scan is the always-works path."""
+    if root is None:
+        return None
+    try:
+        from groundhog.utils.semantic_index import SemanticIndex
+
+        index = SemanticIndex(root, history, embedder=embedder)
+        if not index.exists() or not index.load():
+            return None
+        order = {}
+        for hit in index.search(query, k=_SEARCH_MAX_RESULTS):
+            key = (hit.attempt, hit.file.split("#", 1)[0])
+            order.setdefault(key, len(order))
+        return order
+    except Exception:
+        return None

@@ -9,6 +9,7 @@ Usage:
     groundhog init --script [directory]     # script-only (no project, inline deps)
 """
 
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -41,7 +42,7 @@ TEMPLATES = {
 }
 
 
-def init(template_name, target_dir=None, script_only=False):
+def init(template_name, target_dir=None, script_only=False, use_git=False):
     template = TEMPLATES[template_name]
     target = Path(target_dir) if target_dir else Path("my_task")
 
@@ -85,6 +86,16 @@ def init(template_name, target_dir=None, script_only=False):
     # Copy template files (after uv init so task.py overwrites the default)
     for dest_name, src_name in template["files"].items():
         shutil.copy2(TEMPLATES_DIR / src_name, target / dest_name)
+
+    if use_git:
+        from groundhog.tools.migrate import wire_git_history
+        if wire_git_history(target / "task.py"):
+            print("Attempt store: GitAttemptHistory (see the remote= comment "
+                  "in task.py to sync it)")
+        else:
+            print("WARNING: could not wire GitAttemptHistory into task.py - "
+                  "pass history=GitAttemptHistory(run_dir) to assemble_toolkit "
+                  "yourself")
 
     if template.get("env"):
         (target / ".env").write_text("# Add API keys here (optional - auto_registry finds CLI tools automatically)\n# ANTHROPIC_API_KEY=\n# OPENAI_API_KEY=\n# GEMINI_API_KEY=\n", encoding="utf-8")
@@ -240,6 +251,53 @@ def new_component(args):
     return 0
 
 
+def cmd_migrate_store(args):
+    """`groundhog migrate-store <dest> [--dry-run] [--full-work]` — copy this
+    folder-backend run to <dest> with its store replayed through
+    GitAttemptHistory. The source run is never touched."""
+    if not args or args[0] in ("-h", "--help"):
+        print("Usage: groundhog migrate-store <dest> [--dry-run] [--full-work]")
+        print()
+        print("Copies the run (excluding .venv/attempts/caches) and rebuilds the")
+        print("attempt store as a git store: committed attempts are replayed in id")
+        print("order preserving parents, status, and score notes; the folder id is")
+        print("kept as migrated_from_folder_id metadata; task.py is patched to")
+        print("build GitAttemptHistory. Refuses while workspaces are in progress.")
+        print("--full-work also copies each attempt's work/ dir (can be huge).")
+        return 0 if args else 1
+
+    dry_run = "--dry-run" in args
+    full_work = "--full-work" in args
+    rest = [a for a in args if a not in ("--dry-run", "--full-work")]
+    if len(rest) != 1 or rest[0].startswith("--"):
+        print("Usage: groundhog migrate-store <dest> [--dry-run] [--full-work]")
+        return 1
+
+    from groundhog import rundir
+    from groundhog.tools.migrate import MigrationError, migrate_store
+
+    try:
+        src = rundir.find_task_py().parent
+    except FileNotFoundError as e:
+        print(str(e))
+        return 1
+
+    try:
+        migrate_store(src, Path(rest[0]), full_work=full_work, dry_run=dry_run)
+    except MigrationError as e:
+        print(str(e))
+        return 1
+    except Exception as e:  # noqa: BLE001 — surface a clean error, src is safe
+        print(f"Migration failed: {e}")
+        return 1
+    if not dry_run:
+        print()
+        print("done. Next steps in the copy:")
+        print(f"  cd {rest[0]} && uv sync")
+        print("  uv run groundhog attempt list   # verify count + scores match")
+    return 0
+
+
 def show_backends():
     """Show available LLM backends and auto_registry tier assignments."""
     try:
@@ -386,6 +444,55 @@ def set_prefer_tier(args):
     return 0
 
 
+def cmd_report(args):
+    """`groundhog report [--out PATH] [--no-llm]` — write a run-state
+    markdown report.
+
+    Data-only by default; when the run's toolkit carries an LLM, one cheap
+    default-tier pass adds a short narrative on top (``--no-llm`` skips it).
+    ``--out -`` prints to stdout; a relative ``--out`` resolves against the
+    run dir, like the default path.
+    """
+    no_llm, args = _flag(args, "--no-llm")
+    out_arg, args = _opt(args, "--out")
+    if args and args[0] in ("-h", "--help"):
+        print("Usage: groundhog report [--out reports/state.md] [--no-llm]")
+        print("       groundhog report --out -      (print to stdout)")
+        return 0
+    if args:
+        print("Usage: groundhog report [--out reports/state.md] [--no-llm]")
+        return 1
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    scorer = _scorer_for(run.task, through=getattr(run.toolkit, "through", None))
+
+    from groundhog.tools import report as report_mod
+    data = report_mod.gather(run.history, scorer)
+    narrative = None
+    llm = None if no_llm else getattr(run.toolkit, "llm", None)
+    if llm is not None:
+        narrative = report_mod.narrative(llm, data)
+    text = report_mod.render_markdown(run.task.name, data, narrative)
+
+    if out_arg == "-":
+        print(text)
+        return 0
+    if out_arg:
+        out_path = Path(out_arg)
+        if not out_path.is_absolute():
+            out_path = run.run_dir / out_path
+    else:
+        out_path = run.run_dir / "reports" / "state.md"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(text, encoding="utf-8")
+    print(f"Wrote {out_path}")
+    if llm is not None and narrative is None:
+        print("(LLM narrative unavailable - wrote the data-only report)")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # attempt / eval commands — manual attempt lifecycle + scoring (LLM-free).
 #
@@ -438,10 +545,21 @@ def _short(value, n=8):
     return s[:n] if len(s) > n else s
 
 
-def _print_stage_scores(result, scorer):
+def _stage_scorers(task):
+    """Per-stage scorers by name — each stage is scored by its own scorer;
+    the through-stage scorer is only meaningful for the overall score."""
+    try:
+        return {s.name: s.score for s in task.evaluator.get_stages(task.data)}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _print_stage_scores(result, scorer, task=None):
     """Print per-stage score + the final overall line."""
+    per_stage = _stage_scorers(task) if task is not None else {}
     for name, stage in result.stages.items():
-        print(f"  {name}: score={scorer(stage):.4f}")
+        stage_score = per_stage.get(name, scorer)(stage)
+        print(f"  {name}: score={stage_score:.4f}")
     overall = _score_result(result, scorer)
     if result.completed:
         print(f"  overall: {overall:.4f}  (completed)")
@@ -464,11 +582,15 @@ def attempt_group(args):
         "  new [--fresh] [--parent ID] [--no-seed] [--name NAME]\n"
         "                                Open a workspace (--fresh: parentless,\n"
         "                                founds a new family; default parent = best)\n"
-        "  list [--all]                                  List attempts (--all incl. failed)\n"
-        "  show <id> [--file F]                          Show an attempt (or one file)\n"
+        "  list [--all] [--tag TAG] [--json]             List attempts (--all incl. failed)\n"
+        "  show <id> [--file F] [--json]                 Show an attempt (or one file)\n"
+        "  note <id> <key> [<value>]                     Get (no value) or set a mutable note\n"
+        "  tag <id> <tag>                                Add a tag (stored as note key 'tags')\n"
+        "  untag <id> <tag>                              Remove a tag\n"
         "  in-progress                                   List open workspaces\n"
         "  resume <wsid>                                 Re-acquire an open workspace\n"
-        "  commit <wsid> [--fail] [--eval] [--through S] Finalize a workspace\n"
+        "  commit <wsid> [--fail] [--eval] [--through S]\n"
+        "         [--note-score FLOAT]                   Finalize a workspace\n"
         "  abort <wsid>                                  Discard an open workspace\n"
         "  reap [--ttl S]                                Abort crashed workspaces\n"
         "  best                                          Show the best attempt\n"
@@ -484,6 +606,9 @@ def attempt_group(args):
         "new": _attempt_new,
         "list": _attempt_list,
         "show": _attempt_show,
+        "note": _attempt_note,
+        "tag": _attempt_tag,
+        "untag": _attempt_untag,
         "in-progress": _attempt_in_progress,
         "resume": _attempt_resume,
         "commit": _attempt_commit,
@@ -497,6 +622,24 @@ def attempt_group(args):
         print(usage)
         return 1
     return handler(rest)
+
+
+def _json_out(obj) -> str:
+    """JSON for machine consumers. A scorer can produce NaN/Inf, which
+    json.dumps would emit as invalid JSON — normalize them to null."""
+    import json
+    import math
+
+    def clean(v):
+        if isinstance(v, float) and not math.isfinite(v):
+            return None
+        if isinstance(v, dict):
+            return {k: clean(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [clean(x) for x in v]
+        return v
+
+    return json.dumps(clean(obj), indent=2, default=str)
 
 
 def _flag(args, name):
@@ -572,15 +715,31 @@ def _attempt_new(args):
 
 def _attempt_list(args):
     show_all, args = _flag(args, "--all")
+    as_json, args = _flag(args, "--json")
+    tag, args = _opt(args, "--tag")
+    if tag is None and "--tag" in args:
+        # A dangling --tag must not silently list everything.
+        print("Usage: groundhog attempt list [--all] [--tag TAG] [--json]")
+        return 1
     run = _resolve_run()
     if run is None:
         return 1
     history, task = run.history, run.task
     scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
 
+    if as_json:
+        from groundhog.utils import queries
+        rows = queries.attempt_table(history, scorer, only_done=not show_all)
+        if tag is not None:
+            rows = [r for r in rows if tag in _read_tags(history, r["id"])]
+        print(_json_out(rows))
+        return 0
+
     attempts = history.list(only_done=not show_all)
+    if tag is not None:
+        attempts = [a for a in attempts if tag in _read_tags(history, a)]
     if not attempts:
-        print("No attempts yet.")
+        print("No attempts yet." if tag is None else f"No attempts tagged {tag!r}.")
         return 0
 
     print(f"{'id':<10} {'parent':<10} {'status':<12} {'score':<9} name")
@@ -597,8 +756,9 @@ def _attempt_list(args):
 
 def _attempt_show(args):
     file_arg, args = _opt(args, "--file")
+    as_json, args = _flag(args, "--json")
     if not args:
-        print("Usage: groundhog attempt show <id> [--file F]")
+        print("Usage: groundhog attempt show <id> [--file F] [--json]")
         return 1
     attempt_id = args[0]
 
@@ -612,12 +772,24 @@ def _attempt_show(args):
         print(f"No such attempt: {attempt_id}")
         return 1
 
+    if as_json and file_arg is None:
+        from groundhog.utils import queries
+        scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
+        detail = queries.attempt_detail(history, attempt_id, scorer)
+        print(_json_out(detail))
+        return 0
+
     if file_arg is not None:
         content = attempt.read_file(file_arg)
         if content is None:
             print(f"No such file in attempt {attempt_id}: {file_arg}")
             return 1
-        print(content)
+        if as_json:
+            # Both flags honored: the file, wrapped for machine consumers.
+            print(_json_out({"attempt": attempt.id, "file": file_arg,
+                             "content": content}))
+        else:
+            print(content)
         return 0
 
     scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
@@ -629,13 +801,18 @@ def _attempt_show(args):
     cached = history.get_note(attempt.id, "score")
     if cached is not None:
         print(f"note[score]: {cached}   (mutable cache — canonical score is read-side)")
+    tags = _read_tags(history, attempt)
+    if tags:
+        print(f"tags:    {', '.join(tags)}")
     print(f"metadata: {attempt.metadata}")
     print()
     print("stages:")
     try:
         result = attempt.result
+        per_stage = _stage_scorers(task)
         for name, stage in result.stages.items():
-            print(f"  {name}: score={scorer(stage):.4f} metrics={stage.metrics}")
+            stage_score = per_stage.get(name, scorer)(stage)
+            print(f"  {name}: score={stage_score:.4f} metrics={stage.metrics}")
         print(f"  overall: {_score_result(result, scorer):.4f} "
               f"({'completed' if result.completed else 'failed at ' + str(result.failed_stage)})")
     except Exception as e:  # noqa: BLE001
@@ -693,13 +870,20 @@ def _attempt_commit(args):
     through, args = _opt(args, "--through")
     strategy, args = _opt(args, "--strategy")
     strategy = strategy or "manual"
+    note_score, args = _opt(args, "--note-score")
     # A dangling option (e.g. `--strategy` with no value) or an unknown flag
     # must not silently commit mislabeled work.
     if not args or any(a.startswith("--") for a in args) or len(args) > 1:
         print("Usage: groundhog attempt commit <wsid> [--fail] [--eval] "
-              "[--through STAGE] [--strategy LABEL]")
+              "[--through STAGE] [--strategy LABEL] [--note-score FLOAT]")
         return 1
     wsid = args[0]
+    if note_score is not None:
+        try:
+            note_score = float(note_score)
+        except ValueError:
+            print(f"--note-score must be a float, got {note_score!r}")
+            return 1
 
     run = _resolve_run()
     if run is None:
@@ -725,7 +909,7 @@ def _attempt_commit(args):
 
             result = task.evaluate(ws.path, through=through)
             print("Evaluation:")
-            _print_stage_scores(result, scorer)
+            _print_stage_scores(result, scorer, task=task)
             if do_fail:
                 # The user's verdict: record real work as failed. Shape it
                 # like every other failed record (a failed stage with the
@@ -742,11 +926,13 @@ def _attempt_commit(args):
             # metadata apply to every commit. Composed from the same public
             # pieces the standard finish uses (result.json stays eval-only).
             from groundhog.utils.direction import (
-                inherit_direction_from_attempt,
                 promote_workspace_direction,
+                restore_inherited_direction,
                 workspace_name,
             )
-            from groundhog.utils.gates import evaluate_gates
+            from groundhog.utils.gates import (
+                DIRECTION_MODIFIED, evaluate_gates, gate_metadata,
+            )
             from groundhog.utils.results import write_metadata
 
             if prior is None:
@@ -759,18 +945,15 @@ def _attempt_commit(args):
                 "prior": prior.id if prior else None,
                 "cost": 0.0,
             }
-            success = not do_fail
-            for v in violations:
-                if v.severity == "fail":
-                    metadata["gate_failure"] = v.message
-                    success = False
-                elif v.gate == "direction-modified":
-                    metadata["direction_restored"] = True
-                elif v.gate == "solution-identical":
-                    metadata["non_promotable"] = True
-                    metadata["non_promotable_reason"] = v.message
-            if prior is not None:
-                inherit_direction_from_attempt(prior, ws.path)
+            if not (Path(ws.path) / "result.json").exists():
+                print("WARNING: committing with no recorded evaluation - "
+                      "best/scoring will treat this attempt as unscored")
+                metadata["no_recorded_result"] = True
+            metadata.update(gate_metadata(violations))
+            success = not do_fail and "gate_failure" not in metadata
+            if prior is not None and any(
+                    v.gate == DIRECTION_MODIFIED for v in violations):
+                restore_inherited_direction(ws.path, prior)
             write_metadata(ws.path, metadata)
             if not ws.name:
                 derived = workspace_name(ws.path)
@@ -779,11 +962,30 @@ def _attempt_commit(args):
             attempt = ws.commit(success=success)
             _print_gate_outcome(metadata)
 
-        print(f"Committed attempt {attempt.id} ({attempt.status})")
-        return 0
+        if note_score is not None:
+            # The display-only score NOTE cache, never read for decisions.
+            try:
+                history.set_note(attempt, "score", f"{note_score:.4f}")
+                print(f"note[score] = {note_score:.4f}")
+            except Exception as e:  # noqa: BLE001 — a cache miss never fails a commit
+                print(f"Could not write score note: {e}")
     except Exception as e:  # noqa: BLE001
         print(f"Commit failed: {e}")
         return 1
+
+    print(f"Committed attempt {attempt.id} ({attempt.status})")
+    # The folder backend renames the workspace dir at commit (suffix
+    # _done/_fail) — echo the new location so scripts don't chase a stale
+    # path. Outside the net above: the git backend's .path property can
+    # run git (materialize) and raise, and that must never turn a
+    # successful commit into "Commit failed" + exit 1.
+    try:
+        loc = getattr(attempt, "path", None)
+    except Exception:  # noqa: BLE001
+        loc = None
+    if loc:
+        print(f"  at: {loc}")
+    return 0
 
 
 def _print_gate_outcome(metadata):
@@ -843,6 +1045,136 @@ def _attempt_best(args):
     return 0
 
 
+def _note_errors():
+    """What a note read/write can raise across backends — the CLI reports
+    these as messages, never tracebacks (GitError covers a broken repo,
+    OSError a broken sidecar)."""
+    from groundhog.histories.git import GitError
+    return (GitError, OSError, ValueError, KeyError)
+
+
+def _read_tags(history, attempt_or_id):
+    """Tags, sorted. One note key per tag: ``tag-<name>`` = "1" (a "0" is an
+    untag tombstone). The legacy comma-joined "tags" note is still read; a
+    tombstone hides a legacy tag too."""
+    present = {}
+    legacy = history.get_note(attempt_or_id, "tags")
+    if legacy:
+        for part in legacy.split(","):
+            part = part.strip()
+            if part:
+                present[part] = True
+    for key, value in (history.list_notes(attempt_or_id) or {}).items():
+        if key.startswith("tag-") and len(key) > len("tag-"):
+            present[key[len("tag-"):]] = value == "1"
+    return sorted(tag for tag, on in present.items() if on)
+
+
+def _attempt_note(args):
+    if len(args) not in (2, 3):
+        print("Usage: groundhog attempt note <id> <key> [<value>]")
+        return 1
+    attempt_id, key = args[0], args[1]
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history = run.history
+
+    attempt = history.get(attempt_id)
+    if attempt is None:
+        print(f"No such attempt: {attempt_id}")
+        return 1
+
+    if len(args) == 2:
+        try:
+            value = history.get_note(attempt, key)
+        except _note_errors() as e:
+            print(f"Could not read note: {e}")
+            return 1
+        if value is None:
+            print(f"(no note {key!r} on attempt {attempt_id})")
+            return 1
+        print(value)
+        return 0
+
+    try:
+        history.set_note(attempt, key, args[2])
+    except _note_errors() as e:
+        print(f"Could not set note: {e}")
+        return 1
+    print(f"note[{key}] = {args[2]}")
+    return 0
+
+
+def _valid_tag(tag):
+    """A tag must fit its note key (``tag-<name>``): [a-z0-9_-], short."""
+    import re
+    return bool(re.match(r"^[a-z0-9_-]{1,60}$", tag or ""))
+
+
+def _attempt_tag(args):
+    if len(args) != 2:
+        print("Usage: groundhog attempt tag <id> <tag>")
+        return 1
+    attempt_id, tag = args
+    if not _valid_tag(tag):
+        print(f"Invalid tag {tag!r} (use lowercase [a-z0-9_-], max 60 chars)")
+        return 1
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history = run.history
+    attempt = history.get(attempt_id)
+    if attempt is None:
+        print(f"No such attempt: {attempt_id}")
+        return 1
+    try:
+        tags = _read_tags(history, attempt)
+        if tag in tags:
+            print(f"Attempt {attempt_id} already tagged {tag!r}")
+            return 0
+        # One key per tag — concurrent taggers touch different keys, so a
+        # lost update is impossible by construction.
+        history.set_note(attempt, f"tag-{tag}", "1")
+    except _note_errors() as e:
+        print(f"Could not tag: {e}")
+        return 1
+    print(f"tags: {', '.join(sorted(tags + [tag]))}")
+    return 0
+
+
+def _attempt_untag(args):
+    if len(args) != 2:
+        print("Usage: groundhog attempt untag <id> <tag>")
+        return 1
+    attempt_id, tag = args
+    if not _valid_tag(tag):
+        print(f"Invalid tag {tag!r} (use lowercase [a-z0-9_-], max 60 chars)")
+        return 1
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history = run.history
+    attempt = history.get(attempt_id)
+    if attempt is None:
+        print(f"No such attempt: {attempt_id}")
+        return 1
+    try:
+        tags = _read_tags(history, attempt)
+        if tag not in tags:
+            print(f"Attempt {attempt_id} is not tagged {tag!r}")
+            return 1
+        # Tombstone, not deletion: also hides the tag when it came from the
+        # legacy comma-joined note.
+        history.set_note(attempt, f"tag-{tag}", "0")
+    except _note_errors() as e:
+        print(f"Could not untag: {e}")
+        return 1
+    tags.remove(tag)
+    print(f"tags: {', '.join(tags) if tags else '(none)'}")
+    return 0
+
+
 def cmd_eval(args):
     """`groundhog eval <path-or-attempt-id> [--through STAGE] [--json]`."""
     as_json, args = _flag(args, "--json")
@@ -881,16 +1213,19 @@ def cmd_eval(args):
         print(f"Evaluation crashed: {e}")
         return 1
 
-    if as_json:
-        import json
+    per_stage = _stage_scorers(task)
 
+    def _stage_score(name, stage):
+        return per_stage.get(name, scorer)(stage)
+
+    if as_json:
         out = {
             "completed": result.completed,
             "failed_stage": result.failed_stage,
             "overall_score": _score_result(result, scorer),
             "stages": {
                 name: {
-                    "score": scorer(stage),
+                    "score": _stage_score(name, stage),
                     "metrics": stage.metrics,
                     "errors": stage.errors,
                     "warnings": stage.warnings,
@@ -899,10 +1234,10 @@ def cmd_eval(args):
                 for name, stage in result.stages.items()
             },
         }
-        print(json.dumps(out, indent=2, default=str))
+        print(_json_out(out))
     else:
         for name, stage in result.stages.items():
-            print(f"[{name}] score={scorer(stage):.4f}")
+            print(f"[{name}] score={_stage_score(name, stage):.4f}")
             if stage.metrics:
                 print(f"  metrics:   {stage.metrics}")
             if stage.errors:
@@ -918,6 +1253,189 @@ def cmd_eval(args):
             print(f"overall: {overall:.4f}  (FAILED at stage {result.failed_stage})")
 
     return 0 if result.completed else 2
+
+
+def cmd_summary(args):
+    """`groundhog summary [--json]` — run overview from the read layer
+    (utils/queries): totals, best, cost, and the family table."""
+    as_json, args = _flag(args, "--json")
+    if args and args[0] in ("-h", "--help"):
+        print("Usage: groundhog summary [--json]")
+        return 0
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history, task = run.history, run.task
+    scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
+
+    if as_json:
+        from groundhog.utils import queries
+        print(_json_out({"summary": queries.run_summary(history, scorer),
+                         "families": queries.families(history, scorer)}))
+        return 0
+
+    _print_run_overview(history, scorer)
+    return 0
+
+
+def _resolve_optimizer(run):
+    """Resolve a run dir's optimizer without executing task.py's __main__.
+
+    Preference order: a module-level ``optimizer``, then a
+    ``build_optimizer()`` hook (handed the loaded toolkit when it accepts an
+    argument), then the default ``SimpleOptimizer`` over the classic rotation.
+    Returns ``(optimizer, description)`` — the caller prints what was chosen.
+    """
+    module = run.module
+    opt = getattr(module, "optimizer", None)
+    if opt is not None:
+        if not callable(getattr(opt, "run", None)):
+            raise RuntimeError(
+                f"task.py's module-level `optimizer` is {type(opt).__name__}, "
+                f"expected an optimizer with .run(n)")
+        return opt, "module-level optimizer from task.py"
+
+    hook = getattr(module, "build_optimizer", None)
+    if callable(hook):
+        import inspect
+        try:
+            takes_toolkit = len(inspect.signature(hook).parameters) >= 1
+        except (TypeError, ValueError):
+            takes_toolkit = False
+        opt = hook(run.toolkit) if takes_toolkit else hook()
+        if not callable(getattr(opt, "run", None)):
+            raise RuntimeError(
+                f"build_optimizer() returned {type(opt).__name__}, "
+                f"expected an optimizer with .run(n)")
+        return opt, "build_optimizer() from task.py"
+
+    from groundhog.optimizers.simple import SimpleOptimizer
+    from groundhog.strategies.improve import Improve
+    from groundhog.strategies.cross_pollinate import CrossPollinate
+    from groundhog.strategies.fresh import FreshApproach
+    opt = SimpleOptimizer(
+        run.toolkit,
+        strategies=[
+            (Improve(), 14),
+            (CrossPollinate(), 5),
+            (FreshApproach(mode="different"), 1),
+        ],
+        seed_strategy=FreshApproach(mode="blank"),
+    )
+    return opt, ("default SimpleOptimizer (14x Improve + 5x CrossPollinate + "
+                 "1x FreshApproach) - task.py defines no optimizer")
+
+
+def cmd_run(args):
+    """`groundhog run [N]` — run the run dir's optimizer, no __main__ needed."""
+    if args and args[0] in ("-h", "--help"):
+        print("Usage: groundhog run [N]   Run N optimizer iterations (default 10)")
+        return 0
+    if len(args) > 1:
+        print("Usage: groundhog run [N]")
+        return 1
+    n = 10
+    if args:
+        try:
+            n = int(args[0])
+        except ValueError:
+            print(f"N must be an integer, got {args[0]!r}")
+            return 1
+        if n < 1:
+            print(f"N must be a positive integer, got {n}")
+            return 1
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+
+    import os
+    import traceback
+    saved = os.getcwd()
+    try:
+        # task.py __main__ runs from the run dir; give build_optimizer AND
+        # the optimizer the same footing (relative artifact paths,
+        # queue.json siblings) — user hooks that read the cwd must not see
+        # the invocation directory.
+        os.chdir(run.run_dir)
+        try:
+            optimizer, chosen = _resolve_optimizer(run)
+        except Exception as e:  # noqa: BLE001 — user code, keep the evidence
+            print(f"Could not resolve an optimizer: {e}")
+            traceback.print_exc()
+            return 1
+        print(f"Optimizer: {chosen}")
+        try:
+            optimizer.run(n=n)
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+            return 130
+        except Exception as e:  # noqa: BLE001 — user code, keep the evidence
+            print(f"Run failed: {e}")
+            traceback.print_exc()
+            return 1
+    finally:
+        os.chdir(saved)
+    return 0
+
+
+def _print_run_overview(history, scorer):
+    """The shared status/summary header: totals, best, families — all from
+    the read layer (utils/queries), which counts committed attempts only."""
+    from groundhog.utils import queries
+
+    summary = queries.run_summary(history, scorer)
+    fams = queries.families(history, scorer)
+
+    print(f"attempts: {summary['n_attempts']} "
+          f"({summary['n_done']} done, {summary['n_failed']} failed)")
+    best = summary["best"]
+    if best is not None:
+        print(f"best:     {_short(best['id'])} score={best['score']:.4f} "
+              f"{best['name']}")
+    print(f"families: {summary['n_families']}")
+    print(f"cost:     ${summary['total_cost']:.4f}")
+    if fams:
+        print()
+        print(f"{'family':<40} {'n':<4} {'best':<10} best score")
+        for f in fams:
+            score_str = (f"{f['best_score']:.4f}"
+                         if f["best_score"] is not None else "-")
+            print(f"{f['family_name']:<40} {len(f['members']):<4} "
+                  f"{_short(f['best_id']):<10} {score_str}")
+
+
+def cmd_status(args):
+    """`groundhog status` — run overview plus in-progress workspaces."""
+    import time
+
+    if args and args[0] in ("-h", "--help"):
+        print("Usage: groundhog status")
+        return 0
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history, task = run.history, run.task
+    scorer = _scorer_for(task, through=getattr(run.toolkit, "through", None))
+
+    _print_run_overview(history, scorer)
+
+    items = history.list_in_progress()
+    print()
+    if not items:
+        print("in-progress: none")
+        return 0
+    now = time.time()
+    print("in-progress:")
+    print(f"{'wsid':<10} {'parent':<10} {'age(s)':<8} {'state':<9} path")
+    for ip in items:
+        age = int(now - ip.started_at)
+        state = "live" if ip.live else "CRASHED"
+        print(f"{_short(ip.workspace_id):<10} {_short(ip.parent):<10} "
+              f"{age:<8} {state:<9} {ip.path}")
+    return 0
 
 
 def tool_group(args):
@@ -993,6 +1511,486 @@ def tool_group(args):
     return 1
 
 
+def strategy_group(args):
+    """`groundhog strategy list|show|run` — the strategy surface.
+
+    Discovery is a scan (``discover_strategies``): built-ins always, plus the
+    run dir's task.py strategies when the cwd resolves to a run. ``list`` and
+    ``show`` work outside a run dir; ``run`` requires one.
+    """
+    usage = (
+        "Usage: groundhog strategy <subcommand>\n"
+        "\n"
+        "  list                                 List discoverable strategies\n"
+        "  show <name> [--json]                 Show a strategy's parameters\n"
+        "  run <name> [--set k=v ...] [-n N]    Run a strategy N times in this run dir\n"
+    )
+    if not args or args[0] in ("-h", "--help"):
+        print(usage)
+        return 0
+    sub, rest = args[0], args[1:]
+    handlers = {
+        "list": _strategy_list,
+        "show": _strategy_show,
+        "run": _strategy_run,
+    }
+    handler = handlers.get(sub)
+    if handler is None:
+        print(f"Unknown strategy subcommand: {sub}")
+        print(usage)
+        return 1
+    return handler(rest)
+
+
+def _discover_strategies_here():
+    """Built-ins plus, when the cwd resolves to a run dir, the task module's
+    strategies. No task.py means "no task module", never an error —
+    list/show must work outside a run dir. A task.py that EXISTS but fails
+    to load gets a stderr note: silence here made users think their
+    strategies simply weren't discovered."""
+    from groundhog import rundir
+    from groundhog.strategies.discover import discover_strategies
+
+    module = None
+    try:
+        module = rundir.load_run().module
+    except FileNotFoundError:
+        pass
+    except (Exception, SystemExit) as e:
+        print(f"note: task.py found but failed to load ({e}); "
+              f"showing built-in strategies only", file=sys.stderr)
+    return discover_strategies(module=module)
+
+
+def _warn_broken_strategies(entries):
+    for e in entries:
+        if e.get("error"):
+            print(f"warning: strategy {e['name']!r} ({e['source']}) skipped: "
+                  f"Config broken ({e['error']})", file=sys.stderr)
+
+
+def _strategy_list(args):
+    entries = _discover_strategies_here()
+    _warn_broken_strategies(entries)
+    entries = [e for e in entries if not e.get("error")]
+    width = max(len(e["name"]) for e in entries)
+    for e in entries:
+        print(f"  {e['name']:<{width}}  {e['source']:<7}  {e['doc']}")
+    return 0
+
+
+def _type_name(t):
+    return t.__name__ if isinstance(t, type) else str(t)
+
+
+def _find_strategy_entry(entries, name):
+    """Resolve ``name`` among discovered entries. On a builtin/task-module
+    name collision the task-module entry wins — the more local definition,
+    the same rule agent-tool collisions follow — and a loud warning says
+    the shadowing happened."""
+    matches = [e for e in entries if e["name"] == name]
+    if not matches:
+        return None
+    task_matches = [e for e in matches if e["source"] == "task"]
+    chosen = task_matches[0] if task_matches else matches[0]
+    if task_matches and len(task_matches) < len(matches):
+        print(f"WARNING: strategy name {name!r} is defined by both a "
+              f"builtin and the task module; using the task module's "
+              f"{chosen['cls'].__name__}", file=sys.stderr)
+    return chosen
+
+
+def _strategy_show(args):
+    as_json, args = _flag(args, "--json")
+    if not args:
+        print("Usage: groundhog strategy show <name> [--json]")
+        return 1
+    name = args[0]
+    entry = _find_strategy_entry(_discover_strategies_here(), name)
+    if entry is None:
+        print(f"No strategy named {name!r}. Try: groundhog strategy list")
+        return 1
+    if entry.get("error"):
+        print(f"Strategy {name!r} ({entry['source']}) is unavailable: its "
+              f"Config could not be described ({entry['error']}).")
+        print("Every Config field needs a default: "
+              "field: type = param(default, \"description\")")
+        return 1
+    params = entry["params"]
+
+    if as_json:
+        import json
+        out = {
+            "name": entry["name"],
+            "source": entry["source"],
+            "doc": entry["doc"],
+            "params": {
+                k: {
+                    "type": _type_name(v["type"]),
+                    "default": v["default"],
+                    "description": v["description"],
+                }
+                for k, v in params.items()
+            },
+        }
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+
+    print(f"{entry['name']} ({entry['source']})  {entry['doc']}")
+    if not params:
+        print("  (no parameters)")
+        return 0
+    width = max(len(k) for k in params)
+    for k, v in params.items():
+        print(f"  {k:<{width}}  {_type_name(v['type']):<8}  "
+              f"default={v['default']!r}  {v['description']}")
+    return 0
+
+
+def _param_base_type(param_spec):
+    """Resolve a param's coercion type from its DECLARED type (describe()'s
+    f.type), stripping Optional/None from unions; falls back to the
+    default's type for undeclared/exotic annotations. Declared-type-first
+    matters: a ``param(None, ...)`` knob has no default type, and coercing
+    by ``type(None)`` left every ``--set timeout=600`` a string."""
+    import typing
+
+    declared = param_spec.get("type")
+    by_name = {"bool": bool, "int": int, "float": float, "str": str}
+
+    def resolve(t):
+        if t in (bool, int, float, str):
+            return t
+        if isinstance(t, str):
+            s = t.replace("typing.", "").strip()
+            m = re.fullmatch(r"Optional\[(.+)\]", s)
+            if m:
+                s = m.group(1).strip()
+            else:
+                parts = [p.strip() for p in s.split("|")
+                         if p.strip() not in ("None", "NoneType")]
+                if len(parts) == 1:
+                    s = parts[0]
+            return by_name.get(s)
+        args = [a for a in typing.get_args(t) if a is not type(None)]
+        if len(args) == 1:
+            return resolve(args[0])
+        return None
+
+    base = resolve(declared)
+    if base is None:
+        default = param_spec.get("default")
+        if isinstance(default, (bool, int, float, str)):
+            base = type(default)
+    return base
+
+
+def _coerce_param(value, param_spec):
+    """Coerce a --set string by the param's declared type (Optional[T]
+    coerces by T; bool checked before int since bool subclasses int).
+    Unresolvable types keep the string."""
+    base = _param_base_type(param_spec)
+    if base is bool:
+        low = value.lower()
+        if low in ("1", "true", "yes", "on"):
+            return True
+        if low in ("0", "false", "no", "off"):
+            return False
+        raise ValueError(f"expected a boolean, got {value!r}")
+    if base is int:
+        return int(value)
+    if base is float:
+        return float(value)
+    return value
+
+
+def _strategy_run(args):
+    n_str, args = _opt(args, "-n")
+    sets = []
+    while True:
+        item, args = _opt(args, "--set")
+        if item is None:
+            break
+        sets.append(item)
+    # A dangling option or unknown flag must not silently run misconfigured.
+    if not args or any(a.startswith("-") for a in args) or len(args) > 1:
+        print("Usage: groundhog strategy run <name> [--set k=v ...] [-n N]")
+        return 1
+    name = args[0]
+    try:
+        n = int(n_str) if n_str is not None else 1
+    except ValueError:
+        print(f"-n expects an integer, got {n_str!r}")
+        return 1
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    from groundhog.strategies.discover import discover_strategies
+    entry = _find_strategy_entry(discover_strategies(module=run.module), name)
+    if entry is None:
+        print(f"No strategy named {name!r}. Try: groundhog strategy list")
+        return 1
+    if entry.get("error"):
+        print(f"Strategy {name!r} ({entry['source']}) cannot run: its "
+              f"Config could not be described ({entry['error']}).")
+        print("Every Config field needs a default: "
+              "field: type = param(default, \"description\")")
+        return 1
+
+    config = {}
+    for item in sets:
+        if "=" not in item:
+            print(f"--set expects k=v, got {item!r}")
+            return 1
+        k, v = item.split("=", 1)
+        if k not in entry["params"]:
+            print(f"Unknown config key {k!r} for {name!r}. "
+                  f"See: groundhog strategy show {name}")
+            return 1
+        try:
+            config[k] = _coerce_param(v, entry["params"][k])
+        except ValueError as e:
+            print(f"--set {k}: {e}")
+            return 1
+
+    toolkit = run.toolkit
+    scorer = _scorer_for(run.task, through=getattr(toolkit, "through", None))
+    try:
+        strategy = entry["cls"](config)
+    except TypeError as e:
+        print(f"Could not construct {name!r}: {e}")
+        print("This strategy requires programmatic construction (constructor "
+              "arguments beyond config); run it from task.py or an optimizer "
+              "schedule instead.")
+        return 1
+    for _ in range(n):
+        count_before = len(run.history.list(only_done=False))
+        try:
+            out = strategy(toolkit) or {}
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+            break
+        except Exception as e:  # noqa: BLE001 — CLI surface, print and exit
+            print(f"[{name}] ERROR: {e}")
+            return 1
+        finally:
+            if hasattr(toolkit, "log"):
+                toolkit.log.end()
+        attempts = run.history.list(only_done=False)
+        if len(attempts) > count_before:
+            latest = attempts[-1]
+            result = latest.result
+            if result.completed:
+                print(f"  [{latest.id}] {_attempt_score(latest, scorer):.4f}")
+            else:
+                print(f"  [{latest.id}] FAIL ({result.failed_stage})")
+        elif out.get("skipped"):
+            print(f"  skipped: {out['skipped']}")
+    return 0
+
+
+def learnings_group(args):
+    """`groundhog learnings rebuild|list` — the learnings ledger + lens.
+
+    The attempts are the ledger (per-attempt learnings records); the
+    run-root learnings.md is a derived digest. ``rebuild`` regenerates it
+    from the ledger; ``list`` reads the ledger directly.
+    """
+    usage = (
+        "Usage: groundhog learnings <subcommand>\n"
+        "\n"
+        "  rebuild [--llm] [--max N]    Rebuild the run-root digest from the\n"
+        "                               per-attempt ledger (--llm: merge with\n"
+        "                               the default-tier LLM; default cap 50)\n"
+        "  list [--attempt ID]          List per-attempt learnings records\n"
+    )
+    if not args or args[0] in ("-h", "--help"):
+        print(usage)
+        return 0
+    sub, rest = args[0], args[1:]
+    handlers = {
+        "rebuild": _learnings_rebuild,
+        "list": _learnings_list,
+    }
+    handler = handlers.get(sub)
+    if handler is None:
+        print(f"Unknown learnings subcommand: {sub}")
+        print(usage)
+        return 1
+    return handler(rest)
+
+
+def _learnings_rebuild(args):
+    use_llm, args = _flag(args, "--llm")
+    max_str, args = _opt(args, "--max")
+    try:
+        max_entries = int(max_str) if max_str is not None else 50
+    except ValueError:
+        print(f"--max expects an integer, got {max_str!r}")
+        return 1
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    toolkit = run.toolkit
+
+    llm = None
+    if use_llm:
+        if not hasattr(toolkit, "llm"):
+            print("No LLM backends on this toolkit; run without --llm for "
+                  "the deterministic rebuild.")
+            return 1
+        llm = toolkit.llm.get("default")
+
+    # MarkdownLearnings keeps its file path on _path; other backends fall
+    # back to the run-root convention.
+    path = getattr(getattr(toolkit, "learnings", None), "_path", None)
+    if path is None:
+        path = Path(getattr(toolkit, "path", Path.cwd())) / "learnings.md"
+
+    from groundhog.utils.learnings_digest import SEPARATOR, rebuild_digest
+    try:
+        text = rebuild_digest(run.history, path, max_entries=max_entries, llm=llm)
+    except Exception as e:  # noqa: BLE001 — CLI surface, print and exit
+        print(f"Rebuild failed: {e}")
+        return 1
+    body = text.split("\n\n", 1)[1] if "\n\n" in text else ""
+    n = len([e for e in body.split(SEPARATOR) if e.strip()])
+    print(f"Rebuilt digest: {n} entries -> {path}")
+    return 0
+
+
+def _learnings_list(args):
+    attempt_id, args = _opt(args, "--attempt")
+    run = _resolve_run()
+    if run is None:
+        return 1
+    history = run.history
+
+    from groundhog.utils.learnings_digest import attempt_learnings
+
+    if attempt_id is not None:
+        attempt = history.get(attempt_id)
+        if attempt is None:
+            print(f"No such attempt: {attempt_id}")
+            return 1
+        entries = attempt_learnings(attempt)
+        if not entries:
+            print(f"No learnings recorded in attempt {attempt_id}.")
+            return 0
+        for i, entry in enumerate(entries):
+            if i:
+                print("---")
+            print(entry)
+        return 0
+
+    attempts = [a for a in history.list(only_done=False)
+                if a.status in ("done", "fail")]
+    attempts.sort(key=lambda a: a.created_at, reverse=True)
+    found = False
+    for a in attempts:
+        entries = attempt_learnings(a)
+        if not entries:
+            continue
+        found = True
+        first_line = entries[0].strip().splitlines()[0]
+        plural = "entries" if len(entries) != 1 else "entry"
+        print(f"{_short(a.id):<10} {len(entries)} {plural:<8} {first_line}")
+    if not found:
+        print("No per-attempt learnings recorded yet.")
+    return 0
+
+
+def queue_group(args):
+    """`groundhog queue add/list/clear` — the file-based strategy override.
+
+    Thin CLI over tools/queue.py: the optimizer pops ``queue.json`` before
+    each rotation step. Config values stay strings here — the queue item is
+    resolved by the optimizer when it is consumed.
+    """
+    usage = (
+        "Usage:\n"
+        "  groundhog queue add <strategy> [--set k=v ...]   Queue a strategy override\n"
+        "  groundhog queue list                             Show pending items\n"
+        "  groundhog queue clear                            Drop all pending items\n"
+    )
+    if not args or args[0] in ("-h", "--help"):
+        print(usage)
+        return 0
+    sub, rest = args[0], args[1:]
+    if sub not in ("add", "list", "clear"):
+        print(f"Unknown queue subcommand: {sub!r}")
+        print(usage)
+        return 1
+
+    from groundhog.tools.queue import QueueCorrupt
+    from groundhog.tools.queue import add as queue_add
+    from groundhog.tools.queue import clear as queue_clear
+    from groundhog.tools.queue import read_items
+
+    run = _resolve_run()
+    if run is None:
+        return 1
+    queue_root = Path(getattr(run.toolkit, "path", None) or run.run_dir)
+    queue_file = queue_root / "queue.json"
+
+    if sub == "add":
+        config = {}
+        positional = []
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--set":
+                if i + 1 >= len(rest) or "=" not in rest[i + 1]:
+                    print("Usage: groundhog queue add <strategy> [--set k=v ...]")
+                    return 1
+                k, v = rest[i + 1].split("=", 1)
+                config[k] = v
+                i += 2
+            else:
+                positional.append(rest[i])
+                i += 1
+        if len(positional) != 1 or positional[0].startswith("--"):
+            print("Usage: groundhog queue add <strategy> [--set k=v ...]")
+            return 1
+        strategy = positional[0]
+        try:
+            position = queue_add(queue_root, strategy, config, source="user")
+        except QueueCorrupt as e:
+            print(f"Cannot add: {e}")
+            print("Fix the file, or drop it with: groundhog queue clear")
+            return 1
+        config_str = f" config={config}" if config else ""
+        print(f"Queued {strategy} at position {position}{config_str}")
+        return 0
+
+    if sub == "list":
+        try:
+            items = read_items(queue_file)
+        except QueueCorrupt as e:
+            print(f"Queue file unreadable: {e}")
+            print("Fix the file, or drop it with: groundhog queue clear")
+            return 1
+        if not items:
+            print("Queue is empty.")
+            return 0
+        print(f"{'pos':<5} {'strategy':<24} {'source':<10} config")
+        for pos, item in enumerate(items, start=1):
+            config = item.get("config") or {}
+            config_str = " ".join(f"{k}={v}" for k, v in config.items()) or "-"
+            print(f"{pos:<5} {item.get('strategy', '?'):<24} "
+                  f"{item.get('source', '?'):<10} {config_str}")
+        return 0
+
+    # clear
+    n = queue_clear(queue_root)
+    if not n:
+        print("Queue is empty.")
+        return 0
+    print(f"Cleared {n} queued item{'s' if n != 1 else ''}.")
+    return 0
+
+
 def main():
     args = sys.argv[1:]
 
@@ -1015,11 +2013,22 @@ def main():
         print()
         print("  groundhog attempt <subcommand>    Manual attempt lifecycle (new/list/show/commit/...)")
         print("  groundhog eval <path-or-id>       Score a solution dir, .py file, or attempt")
+        print("  groundhog run [N]                 Run the run dir's optimizer for N iterations")
+        print("  groundhog status                  Run overview + in-progress workspaces")
+        print("  groundhog summary [--json]        Run overview: totals, best, families")
+        print("  groundhog strategy list|show|run  Discover and run strategies from the terminal")
         print("  groundhog tool list|run           Run any toolkit tool from the terminal")
+        print("  groundhog bench run|compare       Offline strategy benchmark (deterministic, no API)")
+        print("  groundhog learnings rebuild|list  Rebuild the derived learnings digest / list the ledger")
+        print("  groundhog queue add|list|clear    Queue strategy overrides for the optimizer")
         print("  groundhog skills install [dir]    Install the session skills into a run dir")
+        print("  groundhog report [--out PATH]     Write a run-state markdown report")
+        print()
+        print("  groundhog migrate-store <dest>    Copy this run with a git-backed attempt store")
         print()
         print("Options:")
         print("  --script    Script-only mode (no uv project, uses inline deps)")
+        print("  --git       Scaffold with the git attempt store (GitAttemptHistory)")
         print()
         print("Then:")
         print("  cd my_task")
@@ -1030,11 +2039,13 @@ def main():
     # Parse --script flag
     script_only = "--script" in args
     args = [a for a in args if a != "--script"]
+    use_git = "--git" in args
+    args = [a for a in args if a != "--git"]
 
     cmd = args[0] if args else "init"
     if cmd in TEMPLATES:
         target = args[1] if len(args) > 1 else None
-        sys.exit(init(cmd, target, script_only=script_only))
+        sys.exit(init(cmd, target, script_only=script_only, use_git=use_git))
     elif cmd == "new":
         sys.exit(new_component(args[1:]))
     elif cmd == "backends":
@@ -1043,14 +2054,33 @@ def main():
         sys.exit(set_prefer(args[1:]))
     elif cmd == "prefer-tier":
         sys.exit(set_prefer_tier(args[1:]))
+    elif cmd == "migrate-store":
+        sys.exit(cmd_migrate_store(args[1:]))
     elif cmd == "attempt":
         sys.exit(attempt_group(args[1:]))
     elif cmd == "eval":
         sys.exit(cmd_eval(args[1:]))
+    elif cmd == "run":
+        sys.exit(cmd_run(args[1:]))
+    elif cmd == "status":
+        sys.exit(cmd_status(args[1:]))
+    elif cmd == "summary":
+        sys.exit(cmd_summary(args[1:]))
+    elif cmd == "strategy":
+        sys.exit(strategy_group(args[1:]))
     elif cmd == "tool":
         sys.exit(tool_group(args[1:]))
+    elif cmd == "bench":
+        from groundhog.bench.cli import bench_group
+        sys.exit(bench_group(args[1:]))
+    elif cmd == "learnings":
+        sys.exit(learnings_group(args[1:]))
+    elif cmd == "queue":
+        sys.exit(queue_group(args[1:]))
     elif cmd == "skills":
         sys.exit(skills_group(args[1:]))
+    elif cmd == "report":
+        sys.exit(cmd_report(args[1:]))
     else:
         print(f"Unknown command: {cmd}")
         print("Try: groundhog --help")

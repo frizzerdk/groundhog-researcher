@@ -188,6 +188,17 @@ def inherited_direction_changed_from(ws_dir: Path | str, prior) -> bool:
     return normalize_direction(current or "") != normalize_direction(parent)
 
 
+def restore_inherited_direction(ws_dir: Path | str, prior) -> Optional[Path]:
+    """Restore the parent ATTEMPT's full direction into the workspace.
+
+    The commit-time soft-gate response: directions are IMMUTABLE on
+    inheritance — any mid-session edit (first line, body, or a deleted
+    file) is reverted to the parent's direction byte-for-byte. Returns
+    the written path, or ``None`` when the parent records no direction.
+    """
+    return inherit_direction_from_attempt(prior, ws_dir)
+
+
 def solution_matches_attempt(ws_dir: Path | str, other) -> bool:
     """True iff ``ws_dir/solution.py`` equals the ``other`` ATTEMPT's code.
 

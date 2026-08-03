@@ -11,7 +11,7 @@ Directory structure:
                 TASK_CONTEXT.md
             002_1/          ← second attempt (parent=1)
                 ...
-        learnings.md        ← accumulated learnings (managed separately)
+        learnings.md        ← derived learnings digest (ledger lives in attempts)
 """
 
 import json
@@ -24,6 +24,8 @@ from typing import Callable, Optional, List
 from groundhog.base.types import EvaluationResult, StageResult
 from groundhog.base.attempt_history import Attempt, Workspace, AttemptHistory
 from groundhog.utils.results import read_result, write_metadata, read_attempt_metadata
+from groundhog.utils.liveness import (
+    clear_heartbeat, pid_alive, read_heartbeat, write_heartbeat)
 
 
 # Stale claim sentinels (left behind by a crashed allocator) are reclaimed
@@ -104,18 +106,23 @@ class FolderAttempt(Attempt):
 class FolderWorkspace(Workspace):
     """A working directory for one attempt. Write files, then commit or abort."""
 
-    def __init__(self, display_id: str, parent: Optional[str], path: Path, name: str = ""):
+    def __init__(self, display_id: str, parent: Optional[str], path: Path,
+                 name: str = "", history: "Optional[FolderAttemptHistory]" = None):
         self.display_id = display_id
         self.parent = parent
         self.path = path
         self.name = name
+        self._history = history
         # exist_ok=True so FolderAttemptHistory.workspace can pre-create the
         # directory as part of its atomic-claim handshake.
         self.path.mkdir(parents=True, exist_ok=True)
         (self.path / "work").mkdir(exist_ok=True)
+        self.heartbeat()
 
     def commit(self, success: bool = True) -> FolderAttempt:
-        """Mark this workspace as done by renaming the folder.
+        """Record this workspace as an attempt by renaming the folder.
+        ``success=False`` records it as FAILED — recorded work, never
+        discarded (CLI: ``commit --fail``).
 
         Strategy must write all files (solution.py, result.json, etc.)
         before calling commit(). This just flips the visibility flag.
@@ -126,12 +133,25 @@ class FolderWorkspace(Workspace):
         new_path = self.path.parent / (self.path.name + suffix)
         self.path.rename(new_path)
         self.path = new_path
+        self._clear_heartbeat()
         return FolderAttempt(id=self.display_id, parent=self.parent, path=new_path)
 
     def abort(self):
-        """Delete the workspace folder entirely."""
+        """Discard: delete the workspace folder, leaving NO record. To
+        record failed work instead, use ``commit(success=False)``."""
         if self.path.exists():
             shutil.rmtree(self.path)
+        self._clear_heartbeat()
+
+    def heartbeat(self):
+        """Refresh the pid+timestamp liveness marker so ``reap`` can tell a
+        working session from a crashed one."""
+        if self._history is not None:
+            write_heartbeat(self._history._heartbeat(self.display_id))
+
+    def _clear_heartbeat(self):
+        if self._history is not None:
+            clear_heartbeat(self._history._heartbeat(self.display_id))
 
 
 class FolderAttemptHistory(AttemptHistory):
@@ -140,6 +160,13 @@ class FolderAttemptHistory(AttemptHistory):
     def __init__(self, base_path: Path):
         self.base_path = Path(base_path) / "attempts"
         self.base_path.mkdir(parents=True, exist_ok=True)
+        # Heartbeats for open workspaces — a hidden sibling of the attempt
+        # dirs, so it is never mistaken for one.
+        self._wip_dir = self.base_path / ".wip"
+        self._wip_dir.mkdir(exist_ok=True)
+
+    def _heartbeat(self, wsid: str) -> Path:
+        return self._wip_dir / str(wsid)
 
     def _used_numbers(self) -> set[int]:
         """Numbers currently held by attempts on disk. Cleans stale claim sentinels."""
@@ -212,7 +239,8 @@ class FolderAttemptHistory(AttemptHistory):
             except OSError:
                 pass  # Best-effort; TTL handles leftovers.
 
-            return FolderWorkspace(display_id=str(number), parent=parent, path=path)
+            return FolderWorkspace(display_id=str(number), parent=parent,
+                                   path=path, history=self)
 
         raise RuntimeError(
             f"Could not allocate a workspace number after {_ALLOC_MAX_RETRIES} retries"
@@ -235,7 +263,10 @@ class FolderAttemptHistory(AttemptHistory):
                     continue
                 base = name  # in-progress
             parts = base.split("_", 1)
-            id = str(int(parts[0]))
+            try:
+                id = str(int(parts[0]))
+            except ValueError:
+                continue  # .wip, .claim_ sentinels, foreign dirs
             parent = None if parts[1] == "none" else parts[1]
             attempts.append(FolderAttempt(id=id, parent=parent, path=d))
         return attempts
@@ -244,11 +275,17 @@ class FolderAttemptHistory(AttemptHistory):
         # Resolve any COMMITTED attempt — failed ones included (a child's
         # recorded parent may be failed; treating it as missing would
         # misclassify the child as fresh). Open workspaces stay invisible,
-        # matching the git backend, which rev-parses any commit.
-        for attempt in self.list(only_done=False):
-            if attempt.id == id and attempt.path.name.endswith(("_done", "_fail")):
+        # matching the git backend, which rev-parses any commit. An exact
+        # id wins; otherwise a UNIQUE prefix resolves (the git backend gets
+        # the same via rev-parse's abbreviated shas).
+        id = str(id)
+        committed = [a for a in self.list(only_done=False)
+                     if a.path.name.endswith(("_done", "_fail"))]
+        for attempt in committed:
+            if attempt.id == id:
                 return attempt
-        return None
+        matches = [a for a in committed if a.id.startswith(id)]
+        return matches[0] if len(matches) == 1 else None
 
     def set_note(self, attempt_or_id, key: str, value: str) -> None:
         """Mutable annotation in a ``notes.json`` sidecar beside the record.
@@ -261,24 +298,31 @@ class FolderAttemptHistory(AttemptHistory):
         a = self.get(attempt_or_id) if isinstance(attempt_or_id, str) else attempt_or_id
         if a is None:
             raise KeyError(f"unknown attempt {attempt_or_id!r}")
+        from groundhog.utils.fileio import atomic_write_text, locked
         notes_path = Path(a.path) / "notes.json"
-        try:
-            notes = json.loads(notes_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            notes = {}
-        notes[key] = str(value)
-        notes_path.write_text(json.dumps(notes, indent=2), encoding="utf-8")
+        # Locked read-modify-write: writes to DIFFERENT keys must never lose
+        # each other (the per-tag ``tag-<name>`` keys rely on it).
+        with locked(notes_path):
+            try:
+                notes = json.loads(notes_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                notes = {}
+            notes[key] = str(value)
+            atomic_write_text(notes_path, json.dumps(notes, indent=2))
 
     def get_note(self, attempt_or_id, key: str) -> Optional[str]:
+        v = self.list_notes(attempt_or_id).get(key)
+        return None if v is None else str(v)
+
+    def list_notes(self, attempt_or_id) -> dict:
         a = self.get(attempt_or_id) if isinstance(attempt_or_id, str) else attempt_or_id
         if a is None:
-            return None
+            return {}
         try:
             notes = json.loads((Path(a.path) / "notes.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return None
-        v = notes.get(key)
-        return None if v is None else str(v)
+            return {}
+        return notes if isinstance(notes, dict) else {}
 
     def best(self, scorer: Callable[[StageResult], float]) -> Optional[FolderAttempt]:
         attempts = self.list()
@@ -318,7 +362,7 @@ class FolderAttemptHistory(AttemptHistory):
 
     def _is_in_progress_dir(self, d) -> bool:
         name = d.name
-        return (d.is_dir() and not name.startswith(".claim_")
+        return (d.is_dir() and not name.startswith(".")
                 and not name.endswith("_done") and not name.endswith("_fail"))
 
     def list_in_progress(self):
@@ -333,35 +377,57 @@ class FolderAttemptHistory(AttemptHistory):
             except ValueError:
                 continue
             parent = None if (len(parts) < 2 or parts[1] == "none") else parts[1]
+            hb = read_heartbeat(self._heartbeat(wsid))
+            # No heartbeat at all (pre-heartbeat store): dir mtime stands in
+            # and the pid reads dead, so the ttl grace still applies.
+            started = float(hb.get("started_at", 0.0)) if hb else d.stat().st_mtime
             items.append(InProgress(
-                workspace_id=wsid, parent=parent,
-                started_at=d.stat().st_mtime, path=d, live=True))
+                workspace_id=wsid, parent=parent, started_at=started,
+                path=d, live=pid_alive(hb.get("pid"))))
         items.sort(key=lambda ip: ip.started_at)
         return items
 
     def resume(self, workspace_id: str) -> FolderWorkspace:
+        """Re-acquire an open workspace by exact id or any UNIQUE prefix."""
+        wanted = str(workspace_id)
+        open_dirs = {}
         for d in self.base_path.iterdir():
             if not self._is_in_progress_dir(d):
                 continue
             parts = d.name.split("_", 1)
             try:
-                if str(int(parts[0])) != str(workspace_id):
-                    continue
+                open_dirs[str(int(parts[0]))] = d
             except ValueError:
                 continue
-            parent = None if (len(parts) < 2 or parts[1] == "none") else parts[1]
-            return FolderWorkspace(display_id=str(workspace_id), parent=parent, path=d)
-        raise KeyError(f"no in-progress workspace {workspace_id!r}")
+        if wanted not in open_dirs:
+            matches = [i for i in open_dirs if i.startswith(wanted)]
+            if len(matches) > 1:
+                raise KeyError(f"ambiguous workspace id {wanted!r} "
+                               f"(matches {', '.join(sorted(matches))})")
+            if not matches:
+                raise KeyError(f"no in-progress workspace {wanted!r}")
+            wanted = matches[0]
+        d = open_dirs[wanted]
+        parts = d.name.split("_", 1)
+        parent = None if (len(parts) < 2 or parts[1] == "none") else parts[1]
+        return FolderWorkspace(display_id=wanted, parent=parent, path=d,
+                               history=self)
 
     def reap_in_progress(self, ttl_s: float = 300.0) -> int:
+        # Same contract as the git backend: LIVE sessions (heartbeat pid
+        # alive) are left alone regardless of age; the TTL is a grace period
+        # for dead pids (a missing heartbeat reads as dead).
         now = time.time()
         reaped = 0
         for ip in self.list_in_progress():
+            if ip.live:
+                continue
             if (now - ip.started_at) <= ttl_s:
                 continue
             try:
                 shutil.rmtree(ip.path)
-                reaped += 1
             except OSError:
-                pass
+                continue
+            clear_heartbeat(self._heartbeat(ip.workspace_id))
+            reaped += 1
         return reaped

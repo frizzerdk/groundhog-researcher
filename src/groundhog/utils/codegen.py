@@ -17,6 +17,38 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 
+class GenerationFailed(RuntimeError):
+    """A backend produced no usable text after every allowed attempt.
+
+    Raised by ``generate_text`` when each try either raised (e.g. the
+    empty-content RuntimeError an exhausted reasoning model triggers, a
+    timeout, or an HTTP error) or returned blank text. Strategies catch it
+    and record the attempt as a FAILURE rather than crash the worker and
+    orphan the workspace.
+    """
+
+
+def generate_text(backend, prompt, system_prompt="", *, retries=0):
+    """Call ``backend.generate`` with retries, guaranteeing usable text.
+
+    A single empty/None ``response.text`` or a raised backend RuntimeError
+    counts as a retryable failure. Returns the first LLMResponse whose text
+    is non-blank; raises ``GenerationFailed`` when all ``retries + 1``
+    attempts fail, carrying the last error so the caller can record it.
+    """
+    last_error = None
+    for _ in range(retries + 1):
+        try:
+            response = backend.generate(prompt=prompt, system_prompt=system_prompt)
+        except RuntimeError as e:
+            last_error = str(e)
+            continue
+        if response.text and response.text.strip():
+            return response
+        last_error = "backend returned empty content"
+    raise GenerationFailed(last_error or "backend returned empty content")
+
+
 @dataclass
 class Diff:
     """Metadata about how code was extracted from an LLM response."""
@@ -34,6 +66,7 @@ def extract_code(text: str, prior_code: str = None) -> Tuple[str, Diff]:
     Returns:
         (code, diff) — code is valid Python or "", diff has extraction metadata
     """
+    text = text or ""  # tolerate a None response.text; nothing extracts from it
     prior = prior_code or ""
 
     # 1. SEARCH/REPLACE diffs (only if we have prior code to apply them to)

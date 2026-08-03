@@ -11,6 +11,8 @@ Tools are provided by toolkit.agent_tools (built by optimizer).
 The strategy filters which tools are available per phase.
 """
 
+import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -21,6 +23,24 @@ from groundhog.tools.attempt_logger import (
     AssistantEvent, LogEvent, MarkdownAttemptLogger,
     ToolCallEvent, UserEvent, eval_event,
 )
+from groundhog.utils.learnings_digest import LEARNINGS_SEED
+
+
+# --- Preflight probe ---
+#
+# One trivial tool call issued through the SAME wrapper chain the agent will
+# use, before the explore phase spends any budget. Motivating incident: codex
+# ran three full attempts with every groundhog tool dead (a sandbox /
+# interpreter breakage) and committed unverified work — nothing caught it
+# until a manual read. The probe fails loudly first.
+
+PREFLIGHT_TOOL = "groundhog-preflight"
+PREFLIGHT_TOKEN = "groundhog-preflight-ok"
+
+
+def _preflight_ping() -> str:
+    """Preflight connectivity probe run before the explore phase."""
+    return PREFLIGHT_TOKEN
 
 
 # --- Config ---
@@ -45,6 +65,14 @@ class AgentConfig(StrategyConfig):
         "core direction at commit.",
     )
     tier: str = param("default", "Agent backend tier (default/high/budget)")
+    preflight: bool = param(
+        True,
+        "Before the explore phase, run a HOST-SIDE probe: one trivial tool "
+        "call through the same wrapper chain the agent's CLI resolves. "
+        "Catches a dead tool server or broken interpreter before any agent "
+        "budget is spent; a pass approximates but does not guarantee the "
+        "agent's own environment can reach the tools.",
+    )
     core_direction: str = param(
         "",
         "Optional initial core_direction.md text. Canonical name for fresh "
@@ -108,20 +136,6 @@ PHASE_TOOLS = {
 
 
 # --- Prompt templates ---
-
-LEARNINGS_SEED = """\
-# Learnings
-
-Notes from this attempt. Keep high signal-to-noise.
-Only add entries that would save time or prevent repeated mistakes.
-
-Good: confirmed dead-ends, key thresholds, techniques with measurable gains.
-Bad: speculative ideas, verbose explanations, anything obvious from the code.
-
-Prior attempts' notes are NOT auto-copied here. If you want context from
-earlier work, use the get-priors / list-prior / get-prior-file tools to
-read them on demand.
-"""
 
 
 # Human-readable sandbox contract injected into every phase prompt.
@@ -218,10 +232,12 @@ Fix the issue in work/solution.py and run `{eval_command}` to verify.
 {sandbox_rules}"""
 
 REFLECT_PROMPT = """\
-Update work/learnings.md with what you learned this session:
-- What approaches did you try and what scores did they get?
-- What worked well? What didn't?
-- What dead ends should future attempts avoid?
+Update work/learnings.md with what you learned this session.
+Write each learning as one directive line:
+[tried X] -> [because/observed Y] -> [next time do Z]
+Be specific about techniques and scores. One actionable line each, not paragraphs.
+
+Also: what would have made this easier? If anything, raise-insight it.
 
 Do not modify work/solution.py."""
 
@@ -413,6 +429,90 @@ class AgentStrategy(Strategy):
             [r for a, r in rules if a == "deny"],
         )
 
+    # --- Preflight ---
+
+    def _preflight_probe(self, backend):
+        """Round-trip one trivial tool call through the wrapper chain,
+        HOST-SIDE.
+
+        Serves a ping tool exactly as a real run does (same ToolServer +
+        generate_wrappers), then invokes the generated wrapper through the
+        backend-appropriate shell — mirroring, from the host process, the
+        path the agent's shell resolves. Returns ``(ok, wrapper_label,
+        detail)``; ``ok`` is False whenever the wrapper can't reach the
+        tool server or doesn't echo the token back. Because the probe runs
+        outside the agent's own sandbox, a pass is strong evidence, not
+        proof, that the agent can reach the tools.
+        """
+        import subprocess
+        import tempfile
+
+        from groundhog.base.agent import agent_tool
+        from groundhog.agents.tool_server import (
+            ToolServer, cleanup_wrappers, generate_wrappers,
+        )
+
+        ping = agent_tool(_preflight_ping, name=PREFLIGHT_TOOL)
+        server = ToolServer([ping])
+        bin_dir = Path(tempfile.mkdtemp(prefix="ghg_preflight_"))
+        try:
+            port = server.start()
+            generate_wrappers([ping], bin_dir, port)
+            argv, label = self._preflight_invocation(backend, bin_dir)
+            try:
+                proc = subprocess.run(
+                    argv, capture_output=True, text=True, timeout=30,
+                )
+            except Exception as e:
+                return False, label, str(e)
+            out = (proc.stdout or "").strip()
+            if proc.returncode != 0 or PREFLIGHT_TOKEN not in out:
+                detail = (proc.stderr or "").strip() or f"exit={proc.returncode} out={out!r}"
+                return False, label, detail
+            return True, label, out
+        finally:
+            server.stop()
+            cleanup_wrappers(bin_dir)
+
+    def _preflight_invocation(self, backend, bin_dir):
+        """Pick the wrapper variant + shell the backend's CLI resolves tools with.
+
+        Mirrors the per-platform outputs of tool_server.generate_wrappers and
+        each CLI's shell tool. Unknown/custom backends (and hosts missing the
+        expected shell) fall back to the portable Python wrapper, which still
+        exercises the HTTP tool server round-trip.
+        """
+        name = PREFLIGHT_TOOL
+        bname = type(backend).__name__
+        if sys.platform == "win32":
+            # pwsh-shell CLIs resolve the .ps1 wrapper.
+            if bname in ("CodexCliAgentBackend", "CopilotAgentBackend",
+                         "OpenCodeAgentBackend"):
+                shell = shutil.which("pwsh") or shutil.which("powershell")
+                if shell:
+                    return (
+                        [shell, "-NoProfile", "-File", str(bin_dir / f"{name}.ps1")],
+                        f"{name}.ps1",
+                    )
+            # git-bash CLIs (claude, gemini) resolve the extensionless wrapper.
+            if bname in ("ClaudeCodeAgentBackend", "GeminiCliAgentBackend"):
+                bash = shutil.which("bash")
+                if bash:
+                    return [bash, str(bin_dir / name)], name
+            return [sys.executable, str(bin_dir / f"{name}.py")], f"{name}.py"
+        # POSIX: every CLI resolves the extensionless executable wrapper.
+        return [str(bin_dir / name)], name
+
+    def _record_preflight_failure(self, toolkit, msg):
+        """Run-level trace of a preflight abort (loud console line + an
+        insights.md entry) — the aborted workspace keeps nothing."""
+        self.log.info(f"PREFLIGHT FAILED - skipping attempt: {msg}")
+        try:
+            from groundhog.agents.tools import raise_insight
+            raise_insight(toolkit, kind="blocker", text=msg)
+        except Exception:  # noqa: BLE001 — a diagnostics write never blocks the skip
+            pass
+
     def __call__(self, toolkit, config=None):
         self._init(toolkit, config)
 
@@ -446,9 +546,23 @@ class AgentStrategy(Strategy):
 
         try:
             with bracket:
+                backend = toolkit.agent.get(self.cfg.tier)
+                self._backend_cost_model = getattr(backend, "cost_model", "per_token")
+
+                if self.cfg.preflight:
+                    ok, wrapper, detail = self._preflight_probe(backend)
+                    if not ok:
+                        msg = (f"preflight failed: agent tools unreachable "
+                               f"via {wrapper}: {detail}")
+                        # Record at RUN level before aborting: the workspace
+                        # is discarded (no fake failed attempts), so nothing
+                        # written inside it survives.
+                        self._record_preflight_failure(toolkit, msg)
+                        ws.abort()
+                        return {"skipped": msg}
+
                 self._prepare_workspace(toolkit, ws, prior)
 
-                backend = toolkit.agent.get(self.cfg.tier)
                 if backend.cost_model == "per_request":
                     return self._run_per_request(toolkit, ws, prior)
                 else:
@@ -858,12 +972,18 @@ class AgentStrategy(Strategy):
             dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
     def _collect_learnings(self, toolkit, ws):
-        """Promote local learnings to task-level store."""
+        """Promote local learnings to task-level store.
+
+        The seed block is stripped first: an agent that appends below the
+        seed would otherwise promote the instruction text (and its
+        placeholder examples) as if they were observations.
+        """
+        from groundhog.utils.learnings_digest import strip_seed
         learnings_path = ws.path / "work" / "learnings.md"
         if not learnings_path.exists() or not hasattr(toolkit, 'learnings'):
             return
-        text = learnings_path.read_text(encoding="utf-8").strip()
-        if text and text != LEARNINGS_SEED.strip():
+        text = strip_seed(learnings_path.read_text(encoding="utf-8"))
+        if text:
             toolkit.learnings.add(text)
 
     def _evaluate(self, toolkit, ws):
@@ -986,9 +1106,10 @@ class AgentStrategy(Strategy):
 
     def _build_metadata(self, prior):
         return {
-            "strategy": "agent",
+            "strategy": self.name,
             "prior": prior.id if prior else None,
             "cost": round(self.logger.total_cost(), 6),
+            "cost_model": getattr(self, "_backend_cost_model", "per_token"),
         }
 
     def _build_log(self, attempt, prior, result, toolkit):
@@ -1000,7 +1121,7 @@ class AgentStrategy(Strategy):
             "attempt": attempt.id,
             "prior": prior.id if prior else None,
             "score": round(score, 4),
-            "strategy": "agent",
+            "strategy": self.name,
         }
 
     def _score_result(self, result, toolkit):

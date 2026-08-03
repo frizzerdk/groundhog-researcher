@@ -14,7 +14,7 @@ from contextlib import contextmanager
 import pytest
 
 from groundhog import rundir
-from groundhog.cli import attempt_group, cmd_eval
+from groundhog.cli import attempt_group, cmd_eval, cmd_summary
 
 
 # --- Minimal, dependency-free task.py contents -----------------------------
@@ -534,7 +534,8 @@ def test_tool_run_ws_relative_against_committed_attempt(tmp_path, capsys):
         assert attempt_group(["new"]) == 0
         wsid = capsys.readouterr().out.strip().splitlines()[0].split()[-1]
         # write a distinctive solution, commit it
-        ws_dirs = [p for p in (run_dir / "attempts").iterdir() if p.is_dir()]
+        ws_dirs = [p for p in (run_dir / "attempts").iterdir()
+                   if p.is_dir() and not p.name.startswith(".")]
         (ws_dirs[0] / "solution.py").write_text("def solve():\n    return 41.5\n",
                                                 encoding="utf-8")
         (ws_dirs[0] / "core_direction.md").write_text("constant baseline\n",
@@ -837,6 +838,32 @@ def test_eval_fail_records_shaped_failure(tmp_path, capsys):
         assert result.failed_stage == "manual"
 
 
+def test_commit_echo_survives_git_path_failure(tmp_path, capsys, monkeypatch):
+    """The at:-echo materializes the git attempt's worktree and can raise —
+    that must never turn a successful commit into 'Commit failed' + exit 1."""
+    if not _git_available():
+        pytest.skip("git not on PATH")
+    from groundhog.histories.git import GitAttempt, GitError
+
+    run_dir = _write_run_dir(tmp_path, git=True)
+    with _in_dir(run_dir):
+        wsid, ws_path = _open_ws(run_dir, capsys)
+        (ws_path / "solution.py").write_text("def solve():\n    return 50.0\n",
+                                             encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
+
+        def boom(self):
+            raise GitError(["git", "worktree", "move"], 128, b"boom")
+
+        monkeypatch.setattr(GitAttempt, "path", property(boom))
+        rc = attempt_group(["commit", wsid, "--eval"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "Committed attempt" in out
+    assert "Commit failed" not in out
+
+
 def test_folder_get_resolves_failed_attempts(tmp_path, capsys):
     run_dir = _write_run_dir(tmp_path)
     with _in_dir(run_dir):
@@ -851,3 +878,147 @@ def test_folder_get_resolves_failed_attempts(tmp_path, capsys):
         failed = history.get("1")
         assert failed is not None
         assert failed.status == "fail"
+
+
+# --- JSON read layer: attempt list/show --json + groundhog summary ----------
+#
+# Thin shims over utils/queries — these tests pin the CLI wiring (flags,
+# exit codes, parseable output); the query semantics live in test_queries.py.
+
+def _commit_one(run_dir, capsys, value="50.0", direction="constant baseline"):
+    wsid, ws_path = _open_ws(run_dir, capsys)
+    (ws_path / "solution.py").write_text(
+        f"def solve():\n    return {value}\n", encoding="utf-8")
+    (ws_path / "core_direction.md").write_text(direction + "\n",
+                                               encoding="utf-8")
+    attempt_group(["commit", wsid, "--eval"])
+    capsys.readouterr()
+    return wsid
+
+
+def test_attempt_list_json(tmp_path, capsys):
+    import json
+
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        _commit_one(run_dir, capsys)
+        rc = attempt_group(["list", "--json"])
+        assert rc == 0
+        rows = json.loads(capsys.readouterr().out)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["id"] == "1"
+        assert row["status"] == "done"
+        assert row["score"] == 1.0
+        assert row["strategy"] == "manual"
+        assert row["cost"] == 0.0
+        assert "created_at" in row and "parent" in row and "name" in row
+
+
+def test_attempt_list_json_empty(tmp_path, capsys):
+    import json
+
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        rc = attempt_group(["list", "--json"])
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == []
+
+
+def test_attempt_show_json(tmp_path, capsys):
+    import json
+
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        _commit_one(run_dir, capsys)
+        rc = attempt_group(["show", "1", "--json"])
+        assert rc == 0
+        detail = json.loads(capsys.readouterr().out)
+        assert detail["id"] == "1"
+        assert detail["stages"]["evaluate"]["score"] == 1.0
+        assert detail["metadata"]["strategy"] == "manual"
+        assert "solution.py" in detail["files"]
+        assert detail["lineage"] == ["1"]
+        assert detail["sub_results"] == {}
+
+        rc = attempt_group(["show", "999", "--json"])
+        assert rc == 1
+
+
+def test_summary_json(tmp_path, capsys):
+    import json
+
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        _commit_one(run_dir, capsys)
+        rc = cmd_summary(["--json"])
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        s = out["summary"]
+        assert s["n_attempts"] == 1
+        assert s["best"]["id"] == "1"
+        assert s["best"]["score"] == 1.0
+        assert s["n_families"] == 1
+        assert len(s["score_trajectory"]) == 1
+        fams = out["families"]
+        assert len(fams) == 1
+        assert fams[0]["family_name"] == "constant baseline"
+        assert fams[0]["members"] == ["1"]
+
+
+def test_summary_text(tmp_path, capsys):
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        _commit_one(run_dir, capsys)
+        rc = cmd_summary([])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "attempts: 1" in out
+        assert "best:" in out
+        assert "constant baseline" in out
+
+
+def test_json_out_is_nan_safe():
+    """A scorer can hand back NaN/Inf; the CLI's JSON must stay parseable
+    (json.dumps would otherwise emit bare NaN, which json.loads elsewhere
+    rejects)."""
+    import json as json_mod
+    from groundhog.cli import _json_out
+
+    text = _json_out({
+        "score": float("nan"),
+        "trajectory": [1.0, float("inf"), (float("-inf"),)],
+        "nested": {"ok": 0.5},
+    })
+    parsed = json_mod.loads(text)
+    assert parsed["score"] is None
+    assert parsed["trajectory"] == [1.0, None, [None]]
+    assert parsed["nested"]["ok"] == 0.5
+
+
+def test_show_json_with_file_returns_wrapped_json(tmp_path, capsys):
+    """--json + --file used to silently drop --json; now both are honored."""
+    import json as json_mod
+
+    run_dir = _write_run_dir(tmp_path)
+    with _in_dir(run_dir):
+        attempt_group(["new", "--fresh", "--no-seed"])
+        out = capsys.readouterr().out
+        wsid = [l for l in out.splitlines()
+                if l.startswith("Opened workspace")][0].split()[-1]
+        loaded = rundir.load_run(run_dir=run_dir)
+        ws_path = [ip.path for ip in loaded.history.list_in_progress()
+                   if ip.workspace_id == wsid][0]
+        (ws_path / "solution.py").write_text("def solve():\n    return 50.0\n",
+                                             encoding="utf-8")
+        (ws_path / "core_direction.md").write_text("constant baseline\n",
+                                                   encoding="utf-8")
+        attempt_group(["commit", wsid, "--eval"])
+        capsys.readouterr()
+        aid = rundir.load_run(run_dir=run_dir).history.list()[-1].id
+
+        rc = attempt_group(["show", aid, "--file", "solution.py", "--json"])
+        assert rc == 0
+        parsed = json_mod.loads(capsys.readouterr().out)
+        assert parsed["file"] == "solution.py"
+        assert "return 50.0" in parsed["content"]

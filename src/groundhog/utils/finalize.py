@@ -26,15 +26,15 @@ from __future__ import annotations
 from typing import Optional
 
 from groundhog.utils.direction import (
-    inherit_direction_from_attempt,
     mark_result_failed,
     promote_workspace_direction,
+    restore_inherited_direction,
     workspace_name,
 )
 from groundhog.utils.gates import (
     DIRECTION_MODIFIED,
-    SOLUTION_IDENTICAL,
     evaluate_gates,
+    gate_metadata,
 )
 
 
@@ -78,6 +78,14 @@ def finalize_attempt(
             "cost": round(cost, 6),
         }
 
+    # The metadata pass-through: a wrapping strategy (e.g. ABTest) sets
+    # toolkit._extra_attempt_metadata around an inner strategy's call to
+    # stamp attribution onto whatever it commits, without touching the
+    # inner strategy at all.
+    extra = getattr(toolkit, "_extra_attempt_metadata", None)
+    if extra:
+        metadata = {**metadata, **extra}
+
     # Mutation first (fresh only): surface the agent-written direction so
     # the gates judge the post-promote state.
     if prior is None:
@@ -86,20 +94,16 @@ def finalize_attempt(
     violations = evaluate_gates(
         ws.path, prior, history=history, exclude=[ws.display_id]
     )
+    metadata.update(gate_metadata(violations))
     for v in violations:
         if v.severity == "fail":
-            metadata["gate_failure"] = v.message
             mark_result_failed(result, "core_direction", v.message)
-        elif v.gate == DIRECTION_MODIFIED:
-            metadata["direction_restored"] = True
-        elif v.gate == SOLUTION_IDENTICAL:
-            metadata["non_promotable"] = True
-            metadata["non_promotable_reason"] = v.message
 
-    # Mutation second (inherited only): restore the parent's direction
-    # unconditionally — the soft-gate that keeps families from forking.
-    if prior is not None:
-        inherit_direction_from_attempt(prior, ws.path)
+    # Mutation second (inherited only): restore the parent's FULL
+    # direction whenever it differs — directions are immutable, and the
+    # restore keeps families from forking mid-session.
+    if prior is not None and any(v.gate == DIRECTION_MODIFIED for v in violations):
+        restore_inherited_direction(ws.path, prior)
 
     from groundhog.utils.results import write_result
     write_result(ws.path, result, metadata=metadata)
@@ -116,6 +120,33 @@ def finalize_attempt(
     _cache_score_note(toolkit, history, attempt, result)
 
     return attempt
+
+
+def finalize_failed(
+    toolkit,
+    ws,
+    reason,
+    prior=None,
+    *,
+    metadata: Optional[dict] = None,
+    stage: str = "generate",
+):
+    """Record a strategy that could not produce a candidate as a FAILURE.
+
+    When generation dies (empty content, backend error, timeout) the work so
+    far — the workspace, the cost already spent — must not be discarded into
+    an orphaned directory. This builds a minimal failed EvaluationResult (so
+    the family map remembers the failure and selection skips it) and runs the
+    standard finish, committing a real failed record instead of aborting.
+    """
+    from groundhog.base.types import EvaluationResult, StageResult
+
+    result = EvaluationResult(
+        stages={stage: StageResult(errors={stage: str(reason)})},
+        completed=False,
+        failed_stage=stage,
+    )
+    return finalize_attempt(toolkit, ws, result, prior, metadata=metadata)
 
 
 def _cache_score_note(toolkit, history, attempt, result) -> None:

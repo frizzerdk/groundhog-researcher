@@ -18,6 +18,7 @@ from groundhog.utils.gates import (
     SOLUTION_IDENTICAL,
     GateKit,
     evaluate_gates,
+    gate_metadata,
 )
 from groundhog.utils.results import write_result
 
@@ -125,6 +126,55 @@ def test_inherited_modified_direction_flags():
         violations = evaluate_gates(Path(tmp), parent)
         assert [v.gate for v in violations] == [DIRECTION_MODIFIED]
         assert violations[0].severity == "flag"
+
+
+def test_inherited_body_edit_flags_modified():
+    # Directions are immutable: even a body-only edit is a modification
+    # (the body-refinable premise was rejected — strict semantics).
+    with tempfile.TemporaryDirectory() as tmp:
+        parent = _fake_parent(direction="rollout\n\ngreedy lookahead")
+        write_direction(tmp, "rollout\n\ngreedy lookahead with deeper search")
+        (Path(tmp) / "solution.py").write_text("print(2)", encoding="utf-8")
+        violations = evaluate_gates(Path(tmp), parent)
+        assert [v.gate for v in violations] == [DIRECTION_MODIFIED]
+        assert violations[0].severity == "flag"
+
+
+def test_inherited_first_line_edit_flags_modified():
+    with tempfile.TemporaryDirectory() as tmp:
+        parent = _fake_parent(direction="rollout\n\ngreedy lookahead")
+        write_direction(tmp, "beam search\n\ngreedy lookahead")
+        (Path(tmp) / "solution.py").write_text("print(2)", encoding="utf-8")
+        violations = evaluate_gates(Path(tmp), parent)
+        assert [v.gate for v in violations] == [DIRECTION_MODIFIED]
+        assert violations[0].severity == "flag"
+
+
+def test_inherited_deleted_direction_flags_modified():
+    # A deleted inherited direction is a modification like any other.
+    with tempfile.TemporaryDirectory() as tmp:
+        parent = _fake_parent(direction="rollout\n\ngreedy lookahead")
+        (Path(tmp) / "solution.py").write_text("print(2)", encoding="utf-8")
+        violations = evaluate_gates(Path(tmp), parent)
+        assert [v.gate for v in violations] == [DIRECTION_MODIFIED]
+
+
+def test_gate_metadata_maps_violations_to_record_fields():
+    with tempfile.TemporaryDirectory() as tmp:
+        parent = _fake_parent(code="print(1)", direction="rollout")
+        write_direction(tmp, "something else")
+        (Path(tmp) / "solution.py").write_text("print(1)", encoding="utf-8")
+        metadata = gate_metadata(evaluate_gates(Path(tmp), parent))
+        assert metadata == {
+            "direction_restored": True,
+            "non_promotable": True,
+            "non_promotable_reason": "solution.py is byte-identical to parent",
+        }
+
+        fresh = gate_metadata(evaluate_gates(Path(tmp) / "empty", None))
+        assert fresh == {
+            "gate_failure": "fresh attempt did not create core_direction.md"
+        }
 
 
 def test_inherited_unchanged_direction_passes():

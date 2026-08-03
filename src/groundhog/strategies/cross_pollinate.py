@@ -10,9 +10,11 @@ from dataclasses import dataclass
 
 from groundhog.base.strategy import Strategy, StrategyConfig, param
 from groundhog.tools.attempt_logger import (
-    AssistantEvent, MarkdownAttemptLogger, SystemEvent, UserEvent, eval_event,
+    AssistantEvent, LogEvent, MarkdownAttemptLogger, SystemEvent, UserEvent, eval_event,
 )
-from groundhog.utils.codegen import extract_code, build_prompt
+from groundhog.utils.codegen import (
+    GenerationFailed, build_prompt, extract_code, generate_text,
+)
 from groundhog.utils.selection import get_trunk_leaders
 
 
@@ -28,7 +30,7 @@ class CrossPollinate(Strategy):
     """Improve one solution by drawing ideas from a different approach.
 
     Composed method pattern:
-        init → select parent + inspiration → workspace → generate → evaluate → commit
+        init → select parent + inspiration → workspace → generate → evaluate → finalize
     """
 
     Config = CrossPollinateConfig
@@ -43,39 +45,21 @@ class CrossPollinate(Strategy):
         self.log.start(f"--- CrossPollinate | parent=#{prior.id} ({prior_score:.3f}) | inspiration=#{inspiration.id} ({insp_score:.3f})")
         ws = self._start_workspace(toolkit, prior)
         self.logger.attempt_start(ws.path)
-        self._prepare_workspace(toolkit, ws, prior)
-        self.log.inline("generating... ")
-        self._do_work(toolkit, ws, prior, inspiration)
-        self.log.tock()
-        self.log.inline("evaluating... ")
-        result = self._evaluate_with_retries(toolkit, ws)
-        self.log.tock()
-        # Soft-gate: re-copy parent's core direction so the borrowed ideas
-        # don't drift the family identity. Backend-agnostic (works on git).
-        from groundhog.utils.direction import (
-            inherit_direction_from_attempt,
-            inherited_direction_changed_from,
-        )
-        direction_changed = inherited_direction_changed_from(ws.path, prior)
-        inherit_direction_from_attempt(prior, ws.path)
-        metadata = {
-            "strategy": "cross_pollinate",
-            "prior": prior.id,
-            "inspiration": inspiration.id,
-            "cost": round(self.logger.total_cost(), 6),
-        }
-        if direction_changed:
-            metadata["direction_restored"] = True
-        # Flag if we landed on byte-identical code to either source.
-        if self._is_duplicate_solution(ws, prior) or self._is_duplicate_solution(ws, inspiration):
-            metadata["non_promotable"] = True
-            metadata["non_promotable_reason"] = "solution.py is byte-identical to parent or inspiration"
-        from groundhog.utils.results import write_result
-        write_result(ws.path, result, metadata=metadata)
-        from groundhog.utils.direction import workspace_name
-        ws.name = workspace_name(ws.path)
-        attempt = ws.commit(success=result.completed)
-        return self._build_log(attempt, prior, result, toolkit)
+        try:
+            self._prepare_workspace(toolkit, ws, prior)
+            self.log.inline("generating... ")
+            self._do_work(toolkit, ws, prior, inspiration)
+            self.log.tock()
+            self.log.inline("evaluating... ")
+            result = self._evaluate_with_retries(toolkit, ws)
+            self.log.tock()
+            attempt = self._finalize(toolkit, ws, result, prior, inspiration)
+            return self._build_log(attempt, prior, result, toolkit)
+        except GenerationFailed as e:
+            self.log.inline("generation failed... ")
+            attempt = self._finalize_failed(toolkit, ws, prior, str(e))
+            return {"attempt": attempt.id, "prior": prior.id,
+                    "failed": str(e), "strategy": self.name}
 
     # --- Init ---
 
@@ -86,11 +70,32 @@ class CrossPollinate(Strategy):
         self.through = getattr(toolkit, 'through', None)
         self.log = toolkit.log if hasattr(toolkit, 'log') else StrategyLog()
 
-    @staticmethod
-    def _is_duplicate_solution(ws, other) -> bool:
-        """True iff ws/solution.py equals the other attempt's code (backend-agnostic)."""
+    # --- Finalization ---
+
+    def _finalize(self, toolkit, ws, result, prior, inspiration):
+        """The standard finish, plus the inspiration-duplicate flag the
+        parent-only gate can't see."""
         from groundhog.utils.direction import solution_matches_attempt
-        return solution_matches_attempt(ws.path, other)
+        from groundhog.utils.finalize import finalize_attempt
+        metadata = {
+            "strategy": self.name,
+            "prior": prior.id,
+            "inspiration": inspiration.id,
+            "cost": round(self.logger.total_cost(), 6),
+        }
+        if solution_matches_attempt(ws.path, inspiration):
+            metadata["non_promotable"] = True
+            metadata["non_promotable_reason"] = "solution.py is byte-identical to inspiration"
+        return finalize_attempt(toolkit, ws, result, prior, metadata=metadata)
+
+    def _finalize_failed(self, toolkit, ws, prior, reason):
+        """Generation died — record the attempt as a failure, never orphan it."""
+        from groundhog.utils.finalize import finalize_failed
+        self.logger.log(LogEvent(type="error", data={"error": reason}))
+        metadata = {"strategy": self.name, "prior": prior.id if prior else None,
+                    "cost": round(self.logger.total_cost(), 6),
+                    "generation_failed": reason}
+        return finalize_failed(toolkit, ws, reason, prior, metadata=metadata)
 
     # --- Selection ---
 
@@ -163,7 +168,8 @@ Output SEARCH/REPLACE blocks modifying the base approach."""
         self.logger.log(UserEvent(content=prompt))
         self.logger.log(SystemEvent(content=system_prompt))
 
-        response = toolkit.llm.get("high").generate(prompt=prompt, system_prompt=system_prompt)
+        response = generate_text(toolkit.llm.get("high"), prompt, system_prompt,
+                                 retries=self.cfg.max_retries)
         self.logger.log(AssistantEvent(content=response.text, role=response.model,
                                        cost=response.cost, usage=response.usage))
 
@@ -207,7 +213,10 @@ Output SEARCH/REPLACE blocks modifying the base approach."""
         self.logger.log(UserEvent(content=prompt, data={"label": f"Retry {retry_num}"}))
         self.logger.log(SystemEvent(content=system_prompt))
 
-        response = toolkit.llm.get("default").generate(prompt=prompt, system_prompt=system_prompt)
+        try:
+            response = generate_text(toolkit.llm.get("default"), prompt, system_prompt)
+        except GenerationFailed:
+            return  # leave the broken code; the eval loop records the failure
         self.logger.log(AssistantEvent(content=response.text, role=response.model,
                                        cost=response.cost, usage=response.usage, data={"label": f"Retry {retry_num}"}))
 
@@ -231,5 +240,5 @@ Output SEARCH/REPLACE blocks modifying the base approach."""
             "attempt": attempt.id,
             "prior": prior.id,
             "score": round(score, 4),
-            "strategy": "cross_pollinate",
+            "strategy": self.name,
         }

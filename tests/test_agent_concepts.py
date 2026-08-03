@@ -23,6 +23,8 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from groundhog.base.agent import (
@@ -328,6 +330,48 @@ def test_wrapper_generation_kwargs():
         cleanup_wrappers(bin_dir)
 
 
+def test_ps1_wrapper_path_resolution_is_ps51_safe():
+    """The .ps1 wrapper must not use the 2-arg [IO.Path]::GetFullPath
+    overload — it does not exist on Windows PowerShell 5.1 (copilot's
+    shell). Path params resolve via the session-state resolver instead."""
+    from groundhog.agents.tool_server import _build_ps1_wrapper
+
+    script = _build_ps1_wrapper("show-file", ["p"], 1, {}, {"p"}, 12345)
+    assert "GetUnresolvedProviderPathFromPSPath" in script
+    assert "[IO.Path]::GetFullPath(" not in script
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="ps1 wrappers are Windows-only")
+def test_ps1_wrapper_resolves_relative_path_params():
+    """End-to-end: the .ps1 wrapper turns a relative path param into an
+    absolute one before POSTing (run on whichever PowerShell is present)."""
+    import shutil as _shutil
+    from groundhog.agents.tool_server import ToolServer, generate_wrappers, cleanup_wrappers
+
+    exe = _shutil.which("powershell") or _shutil.which("pwsh")
+    if exe is None:
+        pytest.skip("no PowerShell on PATH")
+
+    tool = agent_tool("echo-path", "Echo the received path",
+                      func=lambda p: str(p),
+                      params={"p": {"type": "path"}})
+    server = ToolServer([tool])
+    bin_dir = Path(tempfile.mkdtemp(prefix="test_wrappers_"))
+    try:
+        port = server.start()
+        generate_wrappers([tool], bin_dir, port)
+        result = subprocess.run(
+            [exe, "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", str(bin_dir / "echo-path.ps1"), "sub\\file.txt"],
+            capture_output=True, text=True, cwd=str(bin_dir),
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == str(bin_dir / "sub" / "file.txt")
+    finally:
+        server.stop()
+        cleanup_wrappers(bin_dir)
+
+
 # === Tool docs ===
 
 def test_build_tool_docs():
@@ -567,6 +611,37 @@ def test_cost_model_claude():
     """ClaudeCodeAgentBackend keeps per_token default."""
     from groundhog.agents.claude_code import ClaudeCodeAgentBackend
     assert ClaudeCodeAgentBackend().cost_model == "per_token"
+
+
+def test_cost_model_codex_none():
+    """CodexCliAgentBackend reports nothing usable -> the 'none' model."""
+    from groundhog.agents.codex_cli import CodexCliAgentBackend
+    assert CodexCliAgentBackend().cost_model == "none"
+
+
+# === Honest cost display ===
+
+def test_format_cost_per_token_is_plain_dollars():
+    """API-billed backends show a plain dollar amount."""
+    from groundhog.tools.attempt_log import format_attempt_cost
+    assert format_attempt_cost(1.2345, "per_token") == "$1.2345"
+
+
+def test_format_cost_per_request_annotates_plan_value():
+    """Subscription per-request cost is plan value, not real dollars."""
+    from groundhog.tools.attempt_log import format_attempt_cost
+    assert format_attempt_cost(3.2, "per_request") == "$3.2000 (plan value)"
+
+
+def test_format_cost_none_says_unreported():
+    """A backend that reports nothing must not display a false $0.00."""
+    from groundhog.tools.attempt_log import format_attempt_cost
+    assert format_attempt_cost(0.0, "none") == "unreported (subscription)"
+
+
+def test_format_cost_default_model_is_per_token():
+    from groundhog.tools.attempt_log import format_attempt_cost
+    assert format_attempt_cost(0.5) == "$0.5000"
 
 
 # === Permission translation ===

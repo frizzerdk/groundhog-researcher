@@ -197,6 +197,13 @@ class AttemptHistory(ABC):
         """Read a note set by :meth:`set_note`; ``None`` when absent."""
         return None
 
+    def list_notes(self, attempt_or_id) -> dict:
+        """All notes on an attempt as ``{key: value}``; ``{}`` when none.
+
+        Lets consumers discover key families they cannot enumerate a
+        priori (e.g. the per-tag ``tag-<name>`` keys)."""
+        return {}
+
     def materialize(self, attempt_or_id) -> Path:
         """Ensure the attempt's files exist as a folder on disk; return it.
 
