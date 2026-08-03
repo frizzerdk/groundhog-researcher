@@ -141,6 +141,9 @@ class Improve(Strategy):
         if not hasattr(toolkit, 'llm'):
             return
 
+        from groundhog.utils.learnings_digest import record_learnings_used
+        record_learnings_used(ws.path, learnings)
+
         # System prompt for single-call code improvement.
         # Keep generic — task-specific guidance belongs in the task context,
         # run-specific observations belong in learnings.

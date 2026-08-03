@@ -153,6 +153,8 @@ class CrossPollinate(Strategy):
 
         if learnings:
             prompt_parts.append(f"\n## Learnings\n{learnings}")
+            from groundhog.utils.learnings_digest import record_learnings_used
+            record_learnings_used(ws.path, learnings)
 
         prompt_parts.append(f"\n## Base approach (keep this core algorithm)\n```python\n{prior.code}\n```")
         prompt_parts.append(f"\n## Inspiration (draw useful ideas from this)\n```python\n{inspiration.code}\n```")

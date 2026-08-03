@@ -150,6 +150,71 @@ def test_improve_records_learning_in_attempt_and_digest():
         assert "- learned: smaller is better" in toolkit.learnings.get()
 
 
+def test_improve_records_learnings_used_ledger():
+    from groundhog.backends.mock import MockBackend
+    from groundhog.base.backend import BackendRegistry
+    from groundhog.strategies.improve import Improve
+    from groundhog.utils.learnings_digest import learnings_used
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        _commit(history, direction="rollout")
+
+        toolkit = Toolkit(task=_task(), history=history)
+        toolkit.llm = BackendRegistry(default=MockBackend(["no changes"]))
+        toolkit.learnings = MarkdownLearnings(Path(tmp))
+        toolkit.learnings.add("prefer small kernels")
+
+        Improve()(toolkit)
+
+        attempt = history.list()[-1]
+        assert learnings_used(attempt) == ["prefer small kernels"]
+
+
+def test_fresh_records_learnings_used_ledger():
+    from groundhog.backends.mock import MockBackend
+    from groundhog.base.backend import BackendRegistry
+    from groundhog.strategies.fresh import FreshApproach
+    from groundhog.utils.learnings_digest import learnings_used
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+
+        toolkit = Toolkit(task=_task(), history=history)
+        toolkit.llm = BackendRegistry(default=MockBackend(
+            ["```python\nprint(1)\n```", "greedy heuristic"]))
+        toolkit.learnings = MarkdownLearnings(Path(tmp))
+        toolkit.learnings.add("avoid deep nets")
+
+        FreshApproach()(toolkit, {"mode": "different"})
+
+        attempt = history.list()[-1]
+        assert learnings_used(attempt) == ["avoid deep nets"]
+
+
+def test_no_learnings_consumed_leaves_ledger_absent():
+    from groundhog.backends.mock import MockBackend
+    from groundhog.base.backend import BackendRegistry
+    from groundhog.strategies.improve import Improve
+    from groundhog.utils.learnings_digest import (
+        LEARNINGS_USED_FILENAME, learnings_used,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        history = FolderAttemptHistory(Path(tmp))
+        _commit(history, direction="rollout")
+
+        toolkit = Toolkit(task=_task(), history=history)
+        toolkit.llm = BackendRegistry(default=MockBackend(["no changes"]))
+        toolkit.learnings = MarkdownLearnings(Path(tmp))
+
+        Improve()(toolkit)
+
+        attempt = history.list()[-1]
+        assert attempt.read_file(LEARNINGS_USED_FILENAME) is None
+        assert learnings_used(attempt) == []
+
+
 def test_seed_carries_no_fabricated_observations():
     """The seed's examples used to embed concrete fake metrics (0.90->0.86,
     lr 1e-2 -> NaN) that promotion surfaced as real observations

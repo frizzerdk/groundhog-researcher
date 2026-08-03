@@ -126,6 +126,8 @@ class FreshApproach(Strategy):
 
         if learnings:
             prompt_parts.append(f"\n## Learnings\n{learnings}")
+            from groundhog.utils.learnings_digest import record_learnings_used
+            record_learnings_used(ws.path, learnings)
 
         if leaders:
             prompt_parts.append("\n## Existing approaches (DO NOT reuse these core algorithms)")

@@ -31,6 +31,8 @@ DIGEST_HEADER = "<!-- derived digest — rebuild with: groundhog learnings rebui
 
 ATTEMPT_LEARNINGS_FILENAME = "learnings.md"
 
+LEARNINGS_USED_FILENAME = "learnings_used.md"
+
 # The scratchpad seed agent strategies write into work/learnings.md. It
 # lives here (not in strategies/) because the ledger readers below must
 # strip it — utils importing strategies inverted the layering.
@@ -84,7 +86,31 @@ def record_attempt_learning(attempt_dir: Path | str, text: str) -> Optional[Path
     text = (text or "").strip()
     if not text:
         return None
-    target = Path(attempt_dir) / ATTEMPT_LEARNINGS_FILENAME
+    return _append_entry(Path(attempt_dir) / ATTEMPT_LEARNINGS_FILENAME, text)
+
+
+def record_learnings_used(attempt_dir: Path | str, learnings: Optional[str]) -> Optional[Path]:
+    """Record the learnings a strategy fed into this attempt's prompt.
+
+    Call on the open workspace, at the point the prompt is sent. An
+    attempt that consumed no learnings records nothing — the file stays
+    absent, not an empty placeholder.
+    """
+    text = (learnings or "").strip()
+    if not text:
+        return None
+    return _append_entry(Path(attempt_dir) / LEARNINGS_USED_FILENAME, text)
+
+
+def learnings_used(attempt) -> List[str]:
+    """Learning entries a committed attempt consumed (the usage-ledger read)."""
+    text = attempt.read_file(LEARNINGS_USED_FILENAME)
+    if not text or text.startswith("[binary file"):
+        return []
+    return [e.strip() for e in text.split(SEPARATOR) if e.strip()]
+
+
+def _append_entry(target: Path, text: str) -> Path:
     existing = target.read_text(encoding="utf-8") if target.exists() else ""
     if existing.strip():
         target.write_text(existing.rstrip() + SEPARATOR + text + "\n", encoding="utf-8")

@@ -77,7 +77,7 @@ class Challenge(Strategy):
         try:
             self.logger.attempt_start(ws.path)
             self.log.inline("diagnosing... ")
-            diagnosis = self._extract_assumption(toolkit, target)
+            diagnosis = self._extract_assumption(toolkit, ws, target)
             self.log.tock()
             self._prepare_workspace(toolkit, ws, diagnosis)
             self.log.inline("attacking... ")
@@ -231,7 +231,7 @@ class Challenge(Strategy):
 
     # --- Assumption extraction ---
 
-    def _extract_assumption(self, toolkit, target):
+    def _extract_assumption(self, toolkit, ws, target):
         learnings = toolkit.learnings.get(last=self.cfg.learnings_last, random=self.cfg.learnings_random) if hasattr(toolkit, 'learnings') else None
 
         parts = [
@@ -248,6 +248,8 @@ class Challenge(Strategy):
         parts.append(f"## Target code\n```python\n{target.code}\n```")
         if learnings:
             parts.append(f"## Learnings\n{learnings}")
+            from groundhog.utils.learnings_digest import record_learnings_used
+            record_learnings_used(ws.path, learnings)
         parts.append(
             "Answer in exactly this format:\n"
             "BLOCKER: <the claimed blocker, one line>\n"
@@ -340,6 +342,8 @@ class Challenge(Strategy):
         parts.append(f"## Code that hit the blocker\n```python\n{target.code}\n```")
         if learnings:
             parts.append(f"## Learnings\n{learnings}")
+            from groundhog.utils.learnings_digest import record_learnings_used
+            record_learnings_used(ws.path, learnings)
         prompt = "\n\n".join(parts)
 
         system_prompt = (
