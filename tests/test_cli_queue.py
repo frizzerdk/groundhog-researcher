@@ -229,3 +229,119 @@ def test_concurrent_adders_and_consumer_lose_nothing(tmp_path):
 def test_add_returns_position_under_the_lock(tmp_path):
     assert queue_add(tmp_path, "first") == 1
     assert queue_add(tmp_path, "second") == 2
+
+
+# --- Queue provenance in attempt metadata -------------------------------
+# A queue-dispatched attempt is stamped with its queue origin at finalize;
+# a rotation-dispatched attempt carries no queue key at all.
+
+from types import SimpleNamespace
+
+from groundhog import SimpleOptimizer, Strategy, Task
+from groundhog.base.types import (
+    Context,
+    Data,
+    EvalStage,
+    EvaluationResult,
+    Evaluator,
+    StageResult,
+)
+from groundhog.histories.folder import FolderAttemptHistory
+
+
+class _Data(Data):
+    def get_train(self):
+        return None
+
+    def get_test(self):
+        return None
+
+
+class _Ctx(Context):
+    def get_brief(self):
+        return "b"
+
+    def get_extended(self):
+        return "e"
+
+
+class _Eval(Evaluator):
+    def evaluate(self, code_or_path, data):
+        return StageResult()
+
+    def get_stages(self, data):
+        return [
+            EvalStage("eval", "eval", lambda cp: StageResult(),
+                      scorer=lambda r: r.metrics.get("score", 0.0))
+        ]
+
+
+class _Log:
+    def info(self, text):
+        pass
+
+    def end(self):
+        pass
+
+
+class Committing(Strategy):
+    """Minimal committing strategy: workspace -> result -> standard finish."""
+
+    def __init__(self, direction):
+        super().__init__()
+        self.direction = direction
+
+    def __call__(self, toolkit, config=None):
+        from groundhog.utils.direction import write_direction
+        from groundhog.utils.finalize import finalize_attempt
+        ws = toolkit.history.workspace()
+        (ws.path / "solution.py").write_text("print(1)", encoding="utf-8")
+        write_direction(ws.path, self.direction)
+        result = EvaluationResult(
+            stages={"eval": StageResult(metrics={"score": 0.5})})
+        attempt = finalize_attempt(toolkit, ws, result, None)
+        return {"attempt": attempt}
+
+
+def _provenance_toolkit(tmp_path):
+    task = Task(data=_Data(), context=_Ctx(), evaluator=_Eval(), name="t")
+    history = FolderAttemptHistory(tmp_path / "store")
+    return SimpleNamespace(task=task, history=history, log=_Log(),
+                           path=tmp_path)
+
+
+def test_queue_dispatch_stamps_provenance(tmp_path):
+    tk = _provenance_toolkit(tmp_path)
+    queued = Committing("queued approach")
+    queued.name = "queued"
+    opt = SimpleOptimizer(
+        tk,
+        strategies=[(Committing("rotation approach"), 1)],
+        extras=[queued],
+        seed_strategy=None,
+    )
+    queue_add(tmp_path, "queued", source="planner")
+    opt.run(n=2)
+
+    attempts = tk.history.list()
+    assert len(attempts) == 2
+    from_queue, from_rotation = attempts
+    assert from_queue.metadata["queue"] == {
+        "label": "queued from planner",
+        "source": "planner",
+        "strategy": "queued",
+    }
+    assert "queue" not in from_rotation.metadata
+
+
+def test_rotation_dispatch_has_no_queue_key(tmp_path):
+    tk = _provenance_toolkit(tmp_path)
+    opt = SimpleOptimizer(
+        tk,
+        strategies=[(Committing("rotation only"), 1)],
+        seed_strategy=None,
+    )
+    opt.run(n=1)
+
+    (attempt,) = tk.history.list()
+    assert "queue" not in attempt.metadata

@@ -86,6 +86,10 @@ def finalize_attempt(
     if extra:
         metadata = {**metadata, **extra}
 
+    queue = getattr(toolkit, "_current_queue_item", None)
+    if queue:
+        metadata = {**metadata, "queue": dict(queue)}
+
     # Mutation first (fresh only): surface the agent-written direction so
     # the gates judge the post-promote state.
     if prior is None:

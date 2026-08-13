@@ -596,20 +596,24 @@ class SimpleOptimizer(Optimizer):
     ROTATION_STATE_FILENAME = "rotation_state.json"
 
     def _next_dispatch(self, rotation):
-        """Pick the next (strategy, config, queue_label) — queue overrides rotation."""
+        """Pick the next (strategy, config, queue_label, queue_provenance)
+        — queue overrides rotation. Provenance is None for rotation."""
         queue_item = read_queue(self.path)
         if queue_item:
             strategy_name = queue_item.get("strategy", "")
             strategy = self._strategy_registry.get(strategy_name)
             if strategy:
-                queue_label = f"{strategy_name} from {queue_item.get('source', '?')}"
+                source = queue_item.get("source", "?")
+                queue_label = f"{strategy_name} from {source}"
                 with self._print_lock:
                     self.toolkit.log.info(f"[queue] {queue_label}")
-                return strategy, queue_item.get("config"), queue_label
+                provenance = {"label": queue_label, "source": source,
+                              "strategy": strategy_name}
+                return strategy, queue_item.get("config"), queue_label, provenance
             with self._print_lock:
                 self.toolkit.log.info(
                     f"[queue] unknown strategy: {strategy_name}, skipping")
-        return self._next_rotation(rotation), None, ""
+        return self._next_rotation(rotation), None, "", None
 
     def _next_rotation(self, rotation):
         """Advance the rotation with the schedule position PERSISTED in the
@@ -645,10 +649,11 @@ class SimpleOptimizer(Optimizer):
         rotation = cycle(self._schedule)
 
         for _ in range(n):
-            strategy, config, queue_label = self._next_dispatch(rotation)
+            strategy, config, queue_label, provenance = self._next_dispatch(rotation)
             # Stash the queue label so AgentStrategy can pass it to
             # attempt_log.attempt_start. Empty string when not from queue.
             self.toolkit._current_queue_label = queue_label
+            self.toolkit._current_queue_item = provenance
 
             count_before = len(self.history.list())
             out = {}
@@ -719,8 +724,8 @@ class SimpleOptimizer(Optimizer):
         rotation = cycle(self._schedule)
         seen = {a.id for a in self.history.list()}
 
-        def run_one(strategy, config, queue_label):
-            view = self._worker_view(lock, print_lock, queue_label)
+        def run_one(strategy, config, queue_label, provenance):
+            view = self._worker_view(lock, print_lock, queue_label, provenance)
             # Shallow-copy per dispatch: strategies stash per-call state on self.
             strat = copy.copy(strategy)
             try:
@@ -777,10 +782,10 @@ class SimpleOptimizer(Optimizer):
                 # First iteration serial: an empty history gets its root
                 # attempt before workers fan out and all pick priors at once.
                 if n > 0:
-                    strategy, config, queue_label = self._next_dispatch(rotation)
+                    strategy, config, queue_label, provenance = self._next_dispatch(rotation)
                     dispatched = 1
                     try:
-                        out = run_one(strategy, config, queue_label)
+                        out = run_one(strategy, config, queue_label, provenance)
                         account_attemptless(out, strategy.__class__.__name__)
                     except Exception as e:
                         print(f"\n  [{strategy.__class__.__name__}] ERROR: {e}")
@@ -788,8 +793,9 @@ class SimpleOptimizer(Optimizer):
 
                 while dispatched < n or pending:
                     while dispatched < n and len(pending) < self.concurrency:
-                        strategy, config, queue_label = self._next_dispatch(rotation)
-                        future = pool.submit(run_one, strategy, config, queue_label)
+                        strategy, config, queue_label, provenance = self._next_dispatch(rotation)
+                        future = pool.submit(run_one, strategy, config,
+                                             queue_label, provenance)
                         pending[future] = strategy.__class__.__name__
                         dispatched += 1
                     done, _ = wait(pending, return_when=FIRST_COMPLETED)
@@ -812,7 +818,7 @@ class SimpleOptimizer(Optimizer):
             account()
         return best_score, total_cost
 
-    def _worker_view(self, lock, print_lock, queue_label):
+    def _worker_view(self, lock, print_lock, queue_label, provenance=None):
         """A shallow per-worker toolkit view: shared capabilities, private
         per-attempt surfaces (history proxy, workspace handle, logs)."""
         from groundhog.base.workspace_handle import WorkspaceHandle
@@ -836,6 +842,7 @@ class SimpleOptimizer(Optimizer):
         # Event streams still land in each attempt's attemptlog.jsonl/.md.
         d["attempt_logger"] = MarkdownAttemptLogger()
         d["_current_queue_label"] = queue_label
+        d["_current_queue_item"] = provenance
         d["_ws_lock"] = lock
 
         def locked_finalize(*args, **kwargs):
